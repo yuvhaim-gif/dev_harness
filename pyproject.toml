@@ -1,0 +1,20 @@
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.mypy]
+python_version = "3.12"
+mypy_path = ["scripts/hooks", "src/billing", "src/db"]
+explicit_package_bases = true
+namespace_packages = true
+warn_unused_ignores = false
+
+[[tool.mypy.overrides]]
+module = ["git", "git.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
