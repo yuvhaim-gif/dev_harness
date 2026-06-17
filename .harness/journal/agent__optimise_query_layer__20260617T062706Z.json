@@ -1,0 +1,10 @@
+{
+  "attempts": [],
+  "base_commit": "aa7a85b5679b665fccbf69ca4d83dc55bfbfe336",
+  "branch": "agent/optimise_query_layer/20260617T062706Z",
+  "finished_at": "2026-06-17T06:27:07Z",
+  "notes": "Work committed and pushed; PR requested.",
+  "outcome": "pushed",
+  "started_at": "2026-06-17T06:27:06Z",
+  "task_id": "optimise_query_layer"
+}
