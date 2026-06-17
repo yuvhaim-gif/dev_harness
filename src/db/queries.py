@@ -38,3 +38,5 @@ def fetch_users_batched(db: FakeDB, user_ids: list[int]) -> list[Row]:
     """A single batched query, preserving request order, skipping misses."""
     found = db.fetch_many(user_ids)
     return [found[uid] for uid in user_ids if uid in found]
+
+# touched by fake_llm during mutate
