@@ -18,10 +18,18 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 HOOK = REPO_ROOT / "scripts" / "hooks" / "enforce_file_locks.py"
+BINDING_HOOK = REPO_ROOT / "scripts" / "hooks" / "enforce_contract_binding.py"
 VALIDATOR = REPO_ROOT / "scripts" / "hooks" / "validate_agents_ledger.py"
 RUNNER = REPO_ROOT / "agent_runner.py"
 
 sys.path.insert(0, str(REPO_ROOT))
+sys.path.insert(0, str(REPO_ROOT / "scripts" / "hooks"))
+
+import contract_manifest  # noqa: E402
+import journal  # noqa: E402
+import leases  # noqa: E402
+import staleness  # noqa: E402
+import state_sync  # noqa: E402
 
 from agent_runner import compute_branch_name  # noqa: E402
 
@@ -189,3 +197,173 @@ def test_f4b_validator_fails_on_corrupt_ledger(harness_repo: Path) -> None:
         text=True,
     )
     assert res.returncode == 1
+
+
+# --------------------------------------------------------------------------- #
+# F5. Coordination paths (leases/journal) are always commit-allowed
+# --------------------------------------------------------------------------- #
+def test_f5_coordination_paths_bypass_allowlist(harness_repo: Path) -> None:
+    _write(harness_repo, ".harness/leases/optimise_query_layer.json", "{}\n")
+    _git(harness_repo, "add", ".harness/leases/optimise_query_layer.json")
+    res = _run_hook(harness_repo, {"AGENT_TASK_ID": "optimise_query_layer"})
+    assert res.returncode == 0, res.stdout + res.stderr
+
+
+# --------------------------------------------------------------------------- #
+# F6. Contract<->test binding (manifest + bound-test co-touch)
+# --------------------------------------------------------------------------- #
+def _run_binding(repo: Path, task_id: str) -> subprocess.CompletedProcess[str]:
+    env = os.environ.copy()
+    env["AGENT_TASK_ID"] = task_id
+    return subprocess.run(
+        [sys.executable, str(BINDING_HOOK)],
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+
+def test_f6a_contract_change_without_manifest_is_blocked(harness_repo: Path) -> None:
+    _stage(harness_repo, "docs/API_SCHEMA.md")
+    res = _run_binding(harness_repo, "add_payments_endpoint")
+    assert res.returncode == 1
+    assert "contracts.lock" in res.stdout
+
+
+def test_f6b_contract_change_without_bound_test_is_blocked(harness_repo: Path) -> None:
+    _stage(harness_repo, "docs/API_SCHEMA.md")
+    _write(harness_repo, ".harness/contracts.lock", '{"version": 1, "contracts": {}}\n')
+    _git(harness_repo, "add", ".harness/contracts.lock")
+    res = _run_binding(harness_repo, "add_payments_endpoint")
+    assert res.returncode == 1
+    assert "contract_tests" in res.stdout
+
+
+def test_f6c_contract_change_with_manifest_and_test_passes(harness_repo: Path) -> None:
+    _stage(harness_repo, "docs/API_SCHEMA.md")
+    _stage(harness_repo, "tests/test_payments.py")
+    _write(harness_repo, ".harness/contracts.lock", '{"version": 1, "contracts": {}}\n')
+    _git(harness_repo, "add", ".harness/contracts.lock")
+    res = _run_binding(harness_repo, "add_payments_endpoint")
+    assert res.returncode == 0, res.stdout + res.stderr
+
+
+def test_f6d_non_contract_change_is_not_gated(harness_repo: Path) -> None:
+    _stage(harness_repo, "src/billing/routes.py")
+    res = _run_binding(harness_repo, "add_payments_endpoint")
+    assert res.returncode == 0, res.stdout + res.stderr
+
+
+# --------------------------------------------------------------------------- #
+# F7. Hashed contract manifest verification
+# --------------------------------------------------------------------------- #
+def test_f7_manifest_detects_drift(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "AGENTS.md").write_text(
+        "schema_version: 1\ntasks:\n  t:\n    mutation_mode: evolve\n"
+        "    spec_docs: [c.md]\n    contracts: [c.md]\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "c.md").write_text("v1\n", encoding="utf-8")
+
+    contract_manifest.update()
+    assert contract_manifest.verify() == []
+
+    (tmp_path / "c.md").write_text("v2 changed\n", encoding="utf-8")
+    problems = contract_manifest.verify()
+    assert any("drift" in p for p in problems)
+
+
+# --------------------------------------------------------------------------- #
+# F8. Lightweight lease claim
+# --------------------------------------------------------------------------- #
+def test_f8_lease_blocks_second_agent_then_releases(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    ok, _ = leases.acquire("t", "agent/t/1", "agent-a", "base", ["src/x.py"])
+    assert ok
+
+    ok2, holder = leases.acquire("t", "agent/t/2", "agent-b", "base", ["src/x.py"])
+    assert not ok2
+    assert holder is not None
+    assert holder["agent_id"] == "agent-a"
+
+    assert leases.release("t")
+    ok3, _ = leases.acquire("t", "agent/t/3", "agent-b", "base", ["src/x.py"])
+    assert ok3
+
+
+# --------------------------------------------------------------------------- #
+# F9. Handover journal continuity
+# --------------------------------------------------------------------------- #
+def test_f9_journal_records_unresolved_for_next_agent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    entry = journal.start_session("t", "agent/t/1", "base")
+    journal.record_attempt(entry, "enforce", "semantic", "mypy: incompatible type")
+    journal.finalize(entry, "escalated", notes="cap exceeded")
+    journal.write(entry)
+
+    recovered = journal.latest_unresolved("t")
+    assert recovered is not None
+    assert recovered["outcome"] == "escalated"
+    assert recovered["attempts"][0]["status"] == "semantic"
+    assert journal.latest_unresolved("other_task") is None
+
+
+# --------------------------------------------------------------------------- #
+# F10. Optimistic staleness guard
+# --------------------------------------------------------------------------- #
+def test_f10_staleness_detects_moved_contract(harness_repo: Path) -> None:
+    base = _git(harness_repo, "rev-parse", "HEAD").stdout.strip()
+    _git(harness_repo, "checkout", "-b", "other")
+    with (harness_repo / "docs/API_SCHEMA.md").open("a", encoding="utf-8") as fh:
+        fh.write("# moved on shared ref\n")
+    _git(harness_repo, "add", "docs/API_SCHEMA.md")
+    _git(harness_repo, "commit", "-m", "move contract")
+
+    task = {"contracts": ["docs/API_SCHEMA.md"]}
+    moved = staleness.check(str(harness_repo), base, "other", task)
+    assert "docs/API_SCHEMA.md" in moved
+
+    unchanged = staleness.check(str(harness_repo), base, base, task)
+    assert unchanged == []
+
+
+# --------------------------------------------------------------------------- #
+# F11. Shared-ref state sync survives a fresh clone
+# --------------------------------------------------------------------------- #
+def test_f11_state_sync_round_trips_across_clones(tmp_path: Path) -> None:
+    bare = tmp_path / "remote.git"
+    _git(tmp_path, "init", "--bare", "-b", "main", str(bare))
+
+    clone_a = tmp_path / "a"
+    _git(tmp_path, "clone", str(bare), str(clone_a))
+    _git(clone_a, "config", "user.email", "a@example.com")
+    _git(clone_a, "config", "user.name", "Agent A")
+    _write(clone_a, "README.md", "seed\n")
+    _git(clone_a, "add", "-A")
+    _git(clone_a, "commit", "-m", "seed")
+    _git(clone_a, "push", "origin", "main")
+
+    entry = journal.start_session("t", "agent/t/1", "base")
+    journal.finalize(entry, "stale", notes="cross-clone handover")
+    rel = journal.session_path("agent/t/1").replace("\\", "/")
+    (clone_a / rel).parent.mkdir(parents=True, exist_ok=True)
+    (clone_a / rel).write_text("placeholder", encoding="utf-8")
+    journal.write(entry, journal_dir=str(clone_a / journal.JOURNAL_DIR))
+
+    published = state_sync.publish_files(
+        str(clone_a), {rel: rel}, message="harness: journal stale t"
+    )
+    assert published
+
+    clone_b = tmp_path / "b"
+    _git(tmp_path, "clone", str(bare), str(clone_b))
+    recovered = state_sync.read_json(str(clone_b), rel)
+    assert recovered is not None
+    assert recovered["outcome"] == "stale"
+    assert rel in state_sync.list_files(str(clone_b), journal.JOURNAL_DIR)

@@ -49,6 +49,24 @@ def validate(path: str = "AGENTS.md") -> int:
             )
             ok = False
 
+        contracts = set(task.get("contracts") or [])
+        spec_docs = set(task.get("spec_docs") or [])
+        if contracts - spec_docs:
+            print(
+                f"ERROR: task '{task_id}' lists contracts not in spec_docs: "
+                f"{sorted(contracts - spec_docs)}."
+            )
+            ok = False
+
+        contract_tests = set(task.get("contract_tests") or [])
+        declared_tests = set(task.get("tests") or [])
+        if contract_tests - declared_tests:
+            print(
+                f"ERROR: task '{task_id}' lists contract_tests not in tests: "
+                f"{sorted(contract_tests - declared_tests)}."
+            )
+            ok = False
+
     if not ok:
         return 1
 

@@ -49,3 +49,19 @@ repos:
         additional_dependencies: ["pyyaml>=6.0"]
         pass_filenames: false
         always_run: true
+
+      - id: verify-contract-manifest
+        name: "Verify hashed contract manifest matches contracts"
+        language: python
+        entry: python scripts/hooks/contract_manifest.py
+        additional_dependencies: ["pyyaml>=6.0"]
+        pass_filenames: false
+        always_run: true
+
+      - id: enforce-contract-binding
+        name: "Require contract changes to carry manifest + bound tests"
+        language: python
+        entry: python scripts/hooks/enforce_contract_binding.py
+        additional_dependencies: ["pyyaml>=6.0"]
+        pass_filenames: false
+        always_run: true

@@ -12,7 +12,12 @@ import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from lock_policy import UnknownMutationModeError, compute_allowlist  # noqa: E402
+from lock_policy import (  # noqa: E402
+    UnknownMutationModeError,
+    compute_allowlist,
+    human_override_active,
+    is_coordination_path,
+)
 
 
 def _staged_files() -> list[str]:
@@ -29,6 +34,11 @@ def _staged_files() -> list[str]:
 
 
 def main() -> None:
+    # Explicit human override: a developer disabling the gates for sweeping work.
+    if human_override_active():
+        print("SKIP_AGENT_HARNESS set: human override -- file-lock gate bypassed.")
+        sys.exit(0)
+
     # Humans committing normally (no agent context) are not gated.
     task_id = os.getenv("AGENT_TASK_ID")
     if not task_id:
@@ -57,7 +67,9 @@ def main() -> None:
         sys.exit(1)
 
     mode = task.get("mutation_mode")
-    violations = sorted(f for f in _staged_files() if f not in allowed)
+    violations = sorted(
+        f for f in _staged_files() if f not in allowed and not is_coordination_path(f)
+    )
     if violations:
         print(f"ERROR: task '{task_id}' ({mode}) staged files outside its allowlist:")
         for v in violations:
