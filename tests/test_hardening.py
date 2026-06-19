@@ -16,11 +16,11 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-HOOK = REPO_ROOT / "scripts" / "hooks" / "enforce_file_locks.py"
-BINDING_HOOK = REPO_ROOT / "scripts" / "hooks" / "enforce_contract_binding.py"
+HOOK = REPO_ROOT / "harness" / "enforce_file_locks.py"
+BINDING_HOOK = REPO_ROOT / "harness" / "enforce_contract_binding.py"
 
 sys.path.insert(0, str(REPO_ROOT))
-sys.path.insert(0, str(REPO_ROOT / "scripts" / "hooks"))
+sys.path.insert(0, str(REPO_ROOT / "harness"))
 
 import command_guard  # noqa: E402
 import forensic  # noqa: E402
@@ -247,10 +247,10 @@ def seeded_repo(tmp_path: Path) -> Path:
     (tmp_path / "AGENTS.md").write_text(
         (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8"), encoding="utf-8"
     )
-    for rel in ("tests", "src/db"):
+    for rel in ("example/tests", "example/src/db"):
         (tmp_path / rel).mkdir(parents=True, exist_ok=True)
-    (tmp_path / "tests" / "test_queries.py").write_text("# t\n", encoding="utf-8")
-    (tmp_path / "src" / "db" / "queries.py").write_text("# q\n", encoding="utf-8")
+    (tmp_path / "example" / "tests" / "test_queries.py").write_text("# t\n", encoding="utf-8")
+    (tmp_path / "example" / "src" / "db" / "queries.py").write_text("# q\n", encoding="utf-8")
     _git(tmp_path, "add", "-A")
     _git(tmp_path, "commit", "-m", "seed")
     return tmp_path
@@ -303,9 +303,9 @@ def test_h7_financial_abort_writes_forensic_and_rolls_back(seeded_repo: Path) ->
 
 
 def test_h6_skip_agent_harness_bypasses_lock_hook(seeded_repo: Path) -> None:
-    with (seeded_repo / "tests" / "test_queries.py").open("a", encoding="utf-8") as fh:
+    with (seeded_repo / "example" / "tests" / "test_queries.py").open("a", encoding="utf-8") as fh:
         fh.write("# locked edit\n")
-    _git(seeded_repo, "add", "tests/test_queries.py")
+    _git(seeded_repo, "add", "example/tests/test_queries.py")
 
     env = os.environ.copy()
     env["AGENT_TASK_ID"] = "optimise_query_layer"  # would normally block this path

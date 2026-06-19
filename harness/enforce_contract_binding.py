@@ -74,7 +74,7 @@ def main() -> None:
     if CONTRACT_LOCK_PATH not in staged:
         problems.append(
             f"contract changed but {CONTRACT_LOCK_PATH} was not updated "
-            "(run: python scripts/hooks/contract_manifest.py --update)"
+            "(run: python harness/contract_manifest.py --update)"
         )
     if contract_tests and not (staged & contract_tests):
         problems.append(

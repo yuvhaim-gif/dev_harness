@@ -25,7 +25,7 @@ from typing import Any
 import git
 import yaml
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts", "hooks"))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "harness"))
 
 import command_guard  # noqa: E402
 import forensic  # noqa: E402
@@ -507,7 +507,7 @@ def _rollback(ctx: RunContext) -> None:
         # Clear any uncommitted/staged mutation the blocked commit left behind
         # so the working tree is pristine before we leave the work branch.
         ctx.repo.git.reset("--hard")
-        ctx.repo.git.clean("-fd", "--", "src", "tests", "docs")
+        ctx.repo.git.clean("-fd", "--", "example")
         reset_ok = True
     except git.exc.GitCommandError as exc:
         log(f"WARNING: hard reset during rollback failed: {exc}")

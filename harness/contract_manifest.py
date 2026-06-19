@@ -109,7 +109,7 @@ def main() -> int:
         print("ERROR: contract manifest is out of date:")
         for p in problems:
             print(f"  - {p}")
-        print("Run: python scripts/hooks/contract_manifest.py --update")
+        print("Run: python harness/contract_manifest.py --update")
         return 1
     print(f"OK: {CONTRACT_LOCK_PATH} matches all declared contracts.")
     return 0

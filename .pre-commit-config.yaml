@@ -37,7 +37,7 @@ repos:
       - id: validate-agents-ledger
         name: "Validate AGENTS.md is loadable YAML with required keys"
         language: python
-        entry: python scripts/hooks/validate_agents_ledger.py
+        entry: python harness/validate_agents_ledger.py
         additional_dependencies: ["pyyaml>=6.0"]
         files: ^AGENTS\.md$
         pass_filenames: false
@@ -45,7 +45,7 @@ repos:
       - id: enforce-file-locks
         name: "Enforce agent file locks"
         language: python
-        entry: python scripts/hooks/enforce_file_locks.py
+        entry: python harness/enforce_file_locks.py
         additional_dependencies: ["pyyaml>=6.0"]
         pass_filenames: false
         always_run: true
@@ -53,7 +53,7 @@ repos:
       - id: verify-contract-manifest
         name: "Verify hashed contract manifest matches contracts"
         language: python
-        entry: python scripts/hooks/contract_manifest.py
+        entry: python harness/contract_manifest.py
         additional_dependencies: ["pyyaml>=6.0"]
         pass_filenames: false
         always_run: true
@@ -61,7 +61,7 @@ repos:
       - id: enforce-contract-binding
         name: "Require contract changes to carry manifest + bound tests"
         language: python
-        entry: python scripts/hooks/enforce_contract_binding.py
+        entry: python harness/enforce_contract_binding.py
         additional_dependencies: ["pyyaml>=6.0"]
         pass_filenames: false
         always_run: true

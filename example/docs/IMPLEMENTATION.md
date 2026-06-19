@@ -1,13 +1,13 @@
 # Implementation Notes
 
-## Billing service (`src/billing/`)
+## Billing service (`example/src/billing/`)
 
 - `models.py` defines `PaymentRequest` (with `validate()`) and `PaymentResult`.
 - `routes.py` exposes `create_payment(payload) -> (status_code, body)`, a
   framework-agnostic handler for `POST /payments`. It parses + validates the
   payload, then mints a unique `transaction_id`.
 
-## Query layer (`src/db/`)
+## Query layer (`example/src/db/`)
 
 - `queries.py` provides a `FakeDB` that counts queries, plus two access
   patterns: `fetch_users_n_plus_one` (one query per id) and

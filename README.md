@@ -47,56 +47,65 @@ flowchart TD
 
 ## Repository layout
 
+The repository root is deliberately minimal: the only things you run or edit by
+hand are `agent_runner.py` and `AGENTS.md`, plus this `README.md`. Everything
+the framework needs at the root (tool configs and the pre-commit manifest) stays
+there because the tooling requires it; everything else is collected into folders.
+
 ```
 dev_process/
-├── AGENTS.md                          # Operational ledger (YAML): task definitions
-├── agent_runner.py                    # Orchestrator: the 5-state loop
-├── .pre-commit-config.yaml            # Syntax/lint/type + ledger + lock + contract hooks
-├── pyproject.toml                     # ruff / mypy / pytest configuration
-├── requirements.txt                   # Pinned runtime dependencies
-├── conftest.py                        # Puts the flat sample-app modules on sys.path
+├── agent_runner.py                    # ← RUN THIS. Orchestrator: the 5-state loop
+├── AGENTS.md                          # ← EDIT THIS. Operational ledger (YAML): task definitions
+├── README.md                          # This document
+├── requirements.txt                   # Pinned runtime dependencies (pip install)
+├── pyproject.toml                     # ruff / mypy / pytest configuration (root-discovered)
+├── .pre-commit-config.yaml            # Syntax/lint/type + ledger + lock + contract hooks (root-required)
+├── .gitignore
 ├── .harness/                          # Harness-managed coordination + run state
 │   ├── contracts.lock                 # Hashed manifest of every declared contract
 │   ├── leases/                        # <task_id>.json — active task leases (TTL'd)
 │   ├── journal/                       # Append-only handover records per session
 │   ├── telemetry/                     # Per-step usage.json + cache-ordered repair_prompt.txt (gitignored)
 │   └── logs/                          # FAILED_AGENT_RUN.md forensic post-mortems (gitignored)
-├── scripts/
-│   └── hooks/
-│       ├── lock_policy.py             # Shared compute_allowlist() + coordination bypass + human override
-│       ├── enforce_file_locks.py      # Pre-commit gate: aborts out-of-allowlist commits
-│       ├── validate_agents_ledger.py  # Validates AGENTS.md (incl. contracts ⊆ spec_docs)
-│       ├── contract_manifest.py       # verify() / update() the hashed contracts manifest
-│       ├── enforce_contract_binding.py# Contract change ⇒ manifest + bound-test co-touch
-│       ├── leases.py                  # acquire/release/is_active task leases
-│       ├── journal.py                 # Start/record/finalize/write handover entries
-│       ├── staleness.py               # Critical-path diff vs the shared ref
-│       ├── state_sync.py              # Publish coordination state to harness-state ref
-│       ├── telemetry.py               # Token/cost ledger + budget ceilings (financial abort)
-│       ├── log_condenser.py           # Distil tool output to failing assertions + 3-line context
-│       ├── prompt_builder.py          # Cache-ordered (static→dynamic) repair prompts
-│       ├── command_guard.py           # Strip --no-verify/-n bypass flags from AGENT_LLM_CMD
-│       └── forensic.py                # Write FAILED_AGENT_RUN.md audit + terminal badge
-├── src/
-│   ├── billing/
-│   │   ├── models.py                  # PaymentRequest / PaymentResult + validation
-│   │   └── routes.py                  # POST /payments handler (framework-agnostic)
-│   └── db/
-│       └── queries.py                 # N+1 vs. batched query demo
-├── tests/
-│   ├── test_payments.py               # Contract tests for the payments endpoint
-│   ├── test_queries.py                # N+1 vs. batched behaviour tests
-│   ├── test_contracts.py              # Asserts contracts.lock matches every contract
-│   ├── test_harness.py                # F2–F11: framework self-tests
-│   └── test_hardening.py              # Telemetry, condenser, prompt, guard, forensic, override
-└── docs/
-    ├── API_SCHEMA.md                  # POST /payments contract (example)
-    └── IMPLEMENTATION.md              # Sample-app implementation notes (example)
+├── harness/                           # THE FRAMEWORK: orchestrator hooks + shared policy
+│   ├── lock_policy.py                 # Shared compute_allowlist() + coordination bypass + human override
+│   ├── enforce_file_locks.py          # Pre-commit gate: aborts out-of-allowlist commits
+│   ├── validate_agents_ledger.py      # Validates AGENTS.md (incl. contracts ⊆ spec_docs)
+│   ├── contract_manifest.py           # verify() / update() the hashed contracts manifest
+│   ├── enforce_contract_binding.py    # Contract change ⇒ manifest + bound-test co-touch
+│   ├── leases.py                      # acquire/release/is_active task leases
+│   ├── journal.py                     # Start/record/finalize/write handover entries
+│   ├── staleness.py                   # Critical-path diff vs the shared ref
+│   ├── state_sync.py                  # Publish coordination state to harness-state ref
+│   ├── telemetry.py                   # Token/cost ledger + budget ceilings (financial abort)
+│   ├── log_condenser.py               # Distil tool output to failing assertions + 3-line context
+│   ├── prompt_builder.py              # Cache-ordered (static→dynamic) repair prompts
+│   ├── command_guard.py               # Strip --no-verify/-n bypass flags from AGENT_LLM_CMD
+│   └── forensic.py                    # Write FAILED_AGENT_RUN.md audit + terminal badge
+├── example/                           # SAMPLE WORKLOAD the framework drives & verifies
+│   ├── src/
+│   │   ├── billing/
+│   │   │   ├── models.py              # PaymentRequest / PaymentResult + validation
+│   │   │   └── routes.py             # POST /payments handler (framework-agnostic)
+│   │   └── db/
+│   │       └── queries.py            # N+1 vs. batched query demo
+│   ├── docs/
+│   │   ├── API_SCHEMA.md             # POST /payments contract (example)
+│   │   └── IMPLEMENTATION.md         # Sample-app implementation notes (example)
+│   └── tests/
+│       ├── conftest.py               # Puts the flat sample-app modules on sys.path
+│       ├── test_payments.py          # Contract tests for the payments endpoint
+│       └── test_queries.py           # N+1 vs. batched behaviour tests
+└── tests/                             # FRAMEWORK SELF-TESTS
+    ├── test_contracts.py              # Asserts contracts.lock matches every contract
+    ├── test_harness.py                # F2–F11: framework self-tests
+    └── test_hardening.py              # Telemetry, condenser, prompt, guard, forensic, override
 ```
 
-> The `src/billing`, `src/db`, and `tests` modules are a **sample workload** used
-> to exercise and verify the framework. The framework itself is the orchestrator
-> plus the hooks.
+> Everything under `example/` is a **sample workload** used to exercise and
+> verify the framework. The framework itself is `agent_runner.py` plus the hooks
+> in `harness/`. To use the harness on your own project, point the tasks in
+> `AGENTS.md` at your real files and delete (or ignore) the `example/` tree.
 
 ---
 
@@ -113,11 +122,11 @@ tasks:
     description: >
       Add a POST /payments endpoint to the billing service.
     mutation_mode: evolve          # evolve = may edit spec_docs, tests, targets
-    spec_docs:    [docs/IMPLEMENTATION.md, docs/API_SCHEMA.md]
-    contracts:    [docs/API_SCHEMA.md]          # stable, hash-pinned (⊆ spec_docs)
-    tests:        [tests/test_payments.py]
-    contract_tests: [tests/test_payments.py]    # tests that pin the contract (⊆ tests)
-    targets:      [src/billing/routes.py, src/billing/models.py]
+    spec_docs:    [example/docs/IMPLEMENTATION.md, example/docs/API_SCHEMA.md]
+    contracts:    [example/docs/API_SCHEMA.md]          # stable, hash-pinned (⊆ spec_docs)
+    tests:        [example/tests/test_payments.py]
+    contract_tests: [example/tests/test_payments.py]    # tests that pin the contract (⊆ tests)
+    targets:      [example/src/billing/routes.py, example/src/billing/models.py]
     locked_files: []                            # AGENTS.md is ALWAYS locked implicitly
     commit_prefix: "feat"
     max_autorepair_attempts: 3
@@ -127,10 +136,10 @@ tasks:
     description: >
       Replace N+1 patterns with batch fetches. No API contract changes.
     mutation_mode: isolated        # isolated = ONLY files in targets may change
-    spec_docs:    [docs/IMPLEMENTATION.md]
-    tests:        [tests/test_queries.py]
-    targets:      [src/db/queries.py]
-    locked_files: [docs/IMPLEMENTATION.md, tests/test_queries.py]
+    spec_docs:    [example/docs/IMPLEMENTATION.md]
+    tests:        [example/tests/test_queries.py]
+    targets:      [example/src/db/queries.py]
+    locked_files: [example/docs/IMPLEMENTATION.md, example/tests/test_queries.py]
     commit_prefix: "perf"
     max_autorepair_attempts: 3
     pr_labels:    ["performance"]
@@ -143,7 +152,7 @@ requires `contracts ⊆ spec_docs` and `contract_tests ⊆ tests`.
 
 ### Lock model
 
-The allowlist is computed once, in `scripts/hooks/lock_policy.py`
+The allowlist is computed once, in `harness/lock_policy.py`
 (`compute_allowlist`), and imported by **both** the hook and the runner so they
 can never drift:
 
@@ -180,13 +189,13 @@ A task's `contracts` are the subset of its `spec_docs` that are treated as
 **stable surface area**. Their content is hash-pinned in
 `.harness/contracts.lock`, and two pre-commit hooks keep the binding honest:
 
-- **`verify-contract-manifest`** (`scripts/hooks/contract_manifest.py`) — for
+- **`verify-contract-manifest`** (`harness/contract_manifest.py`) — for
   every contract declared anywhere in the ledger, the file's sha256 must match
   the manifest. A missing entry, a drifted hash, or a manifest entry for an
   undeclared contract is reported and aborts the commit. Run
-  `python scripts/hooks/contract_manifest.py --update` to record an intentional
+  `python harness/contract_manifest.py --update` to record an intentional
   contract change.
-- **`enforce-contract-binding`** (`scripts/hooks/enforce_contract_binding.py`)
+- **`enforce-contract-binding`** (`harness/enforce_contract_binding.py`)
   — if a commit stages any contract file, the **same commit** must also stage
   `.harness/contracts.lock` and (when the task declares any) at least one of
   its `contract_tests`. This prevents a silent contract revision: the rules
@@ -197,7 +206,7 @@ contract fails CI even when commits are bypassed.
 
 ## How enforcement works
 
-`scripts/hooks/enforce_file_locks.py` runs as a `pre-commit` hook:
+`harness/enforce_file_locks.py` runs as a `pre-commit` hook:
 
 1. If `AGENT_TASK_ID` is **not** set → exit 0. Humans committing normally are
    never gated.
@@ -219,26 +228,26 @@ When two or more agents may run the same harness in parallel (or on different
 clones), four lightweight mechanisms keep them from colliding or losing
 context:
 
-- **Leases** (`scripts/hooks/leases.py`) — Isolate writes
+- **Leases** (`harness/leases.py`) — Isolate writes
   `.harness/leases/<task_id>.json` with the owning `agent_id`, branch, base
   commit, declared targets, and a 3600s TTL. A second agent that finds a live
   lease held by someone else aborts cleanly; an expired lease may be
   reclaimed. Reconcile (and rollback) releases the lease.
-- **Handover journal** (`scripts/hooks/journal.py`) — every session writes an
+- **Handover journal** (`harness/journal.py`) — every session writes an
   append-only JSON record to `.harness/journal/` containing each attempt's
   state, status, and hook-log excerpt, plus a terminal outcome
   (`in_progress` / `pushed` / `local` / `stale` / `escalated` / `error`).
   Initialize calls `latest_unresolved()` for the task and surfaces the
   previous session's context to the LLM via `AGENT_HANDOVER_FILE`, so a
   rolled-back or escalated run is never lost.
-- **Shared state ref** (`scripts/hooks/state_sync.py`) — leases and journal
+- **Shared state ref** (`harness/state_sync.py`) — leases and journal
   entries committed only on an abandoned work branch are invisible to a fresh
   clone of `main`. The orchestrator mirrors them onto a dedicated ref
   (`AGENT_STATE_REF`, default `harness-state`) via pure git plumbing
   (`read-tree` / `update-index` / `commit-tree` / `push`). The working tree
   and current branch are untouched, so it is safe to call from any state. A
   fresh clone can read coordination state directly off the ref.
-- **Optimistic staleness guard** (`scripts/hooks/staleness.py`) — before
+- **Optimistic staleness guard** (`harness/staleness.py`) — before
   pushing, Reconcile diffs the **critical paths** (contracts, spec docs,
   `locked_files`, the always-locked set, and `.harness/contracts.lock`) at
   the agent's base commit against `AGENT_SHARED_REF` (default `origin/main`).
@@ -272,13 +281,13 @@ context to it so the model can edit only permitted files:
 When `AGENT_LLM_CMD` is unset the seam is a no-op and logs that fact —
 useful for dry runs and for the framework's own tests. Before every invocation
 the command string is run through the **escape-hatch guard**
-(`scripts/hooks/command_guard.py`): any `--no-verify` / `-n` appended to a
+(`harness/command_guard.py`): any `--no-verify` / `-n` appended to a
 `git commit` / `git push` segment is stripped, the run continues with the
 sanitized command, and the agent's repair counter takes a penalty.
 
 ### Token & cost budgeting
 
-`scripts/hooks/telemetry.py` keeps a running `TokenLedger`. After each LLM step
+`harness/telemetry.py` keeps a running `TokenLedger`. After each LLM step
 the runner reads the JSON payload the command wrote to `AGENT_TOKEN_USAGE_FILE`,
 normalises the many provider field spellings (`input_tokens` / `prompt_tokens`,
 `output_tokens` / `completion_tokens`, nested `usage` / `tool_token_usage`, …)
@@ -301,7 +310,7 @@ yields zero usage and no abort, so dry runs and tests stay green.
 
 ### Context truncation & error condensation
 
-`scripts/hooks/log_condenser.py` never feeds a raw multi-thousand-line dump back
+`harness/log_condenser.py` never feeds a raw multi-thousand-line dump back
 to the model. It parses tool output with structural regex anchors (mypy, ruff,
 pytest `E   ` assertions, `FAILED` / `ERROR` lines), strips package-manager and
 summary noise, keeps the exact `file:line` references with a **3-line source
@@ -310,7 +319,7 @@ deterministic, which also makes it cache-friendly.
 
 ### Deterministic prompt caching
 
-`scripts/hooks/prompt_builder.py` assembles each repair prompt strictly
+`harness/prompt_builder.py` assembles each repair prompt strictly
 most-static → most-dynamic so provider prompt caches reuse the unchanging head
 across recursive repair cycles:
 
@@ -331,7 +340,7 @@ them. The agent orchestrator never sets it.
 
 ### Forensic post-mortem diagnostics
 
-When a run is escalated, financially aborted, or crashes, `scripts/hooks/forensic.py`
+When a run is escalated, financially aborted, or crashes, `harness/forensic.py`
 writes `.harness/logs/FAILED_AGENT_RUN.md` and prints a terminal status badge.
 The report has four sections: (1) allowed scope vs. paths actually modified
 (the containment proof), (2) terminal error codes, the condensed failing
@@ -401,7 +410,7 @@ Example dry-run output (remote-less repo):
 [agent_runner] initialized for task 'optimise_query_layer' (mode=isolated).
 [agent_runner] [dry-run] computed work branch 'agent/optimise_query_layer/20260616T131752Z' (not created).
 [agent_runner] [mutate] isolated: source-in-targets only (LLM integration seam).
-[agent_runner] [dry-run] would stage exactly: ['src/db/queries.py']
+[agent_runner] [dry-run] would stage exactly: ['example/src/db/queries.py']
 [agent_runner] [dry-run] skipping commit to keep 'no commits created' honest.
 [agent_runner] [dry-run] would run: git push -u origin agent/optimise_query_layer/20260616T131752Z
 [agent_runner] [dry-run] no 'origin' remote; manual push: git push -u origin agent/optimise_query_layer/20260616T131752Z
@@ -413,7 +422,7 @@ Example dry-run output (remote-less repo):
 
 ### Billing — `POST /payments`
 
-`src/billing/routes.py` exposes a framework-agnostic handler:
+`example/src/billing/routes.py` exposes a framework-agnostic handler:
 
 ```python
 from routes import create_payment
@@ -423,7 +432,7 @@ status, body = create_payment({"amount": 1000, "currency": "USD", "user_id": "u_
 #          "user_id": "u_1", "status": "created"}
 ```
 
-Contract (full details in `docs/API_SCHEMA.md`):
+Contract (full details in `example/docs/API_SCHEMA.md`):
 
 - `amount` — positive integer in **minor units** (e.g. cents).
 - `currency` — one of `USD`, `EUR`, `GBP`, `ILS`.
@@ -433,7 +442,7 @@ Contract (full details in `docs/API_SCHEMA.md`):
 
 ### Query layer — N+1 vs. batched
 
-`src/db/queries.py` contrasts `fetch_users_n_plus_one` (one query per id) with
+`example/src/db/queries.py` contrasts `fetch_users_n_plus_one` (one query per id) with
 `fetch_users_batched` (a single query). Both return the same rows in request
 order; the batched form is the optimisation target.
 
@@ -446,7 +455,7 @@ Run everything:
 ```bash
 ruff check .
 ruff format --check .
-mypy --strict agent_runner.py scripts
+mypy --strict agent_runner.py harness
 pytest -q
 ```
 

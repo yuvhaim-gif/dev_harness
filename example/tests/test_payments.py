@@ -1,4 +1,4 @@
-"""Contract tests for the POST /payments handler (docs/API_SCHEMA.md)."""
+"""Contract tests for the POST /payments handler (example/docs/API_SCHEMA.md)."""
 
 from __future__ import annotations
 
