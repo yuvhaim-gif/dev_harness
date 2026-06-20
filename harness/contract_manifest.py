@@ -42,12 +42,18 @@ def compute_hashes(paths: Iterable[str]) -> dict[str, str]:
     return {p: sha256_of(p) for p in sorted(paths)}
 
 
+class CorruptLockError(ValueError):
+    """Raised when ``contracts.lock`` exists but is not parseable JSON."""
+
+
 def load_lock(path: str = CONTRACT_LOCK_PATH) -> dict[str, str]:
     try:
         with open(path, encoding="utf-8") as fh:
             data: Any = json.load(fh)
     except FileNotFoundError:
         return {}
+    except (json.JSONDecodeError, UnicodeDecodeError, OSError) as exc:
+        raise CorruptLockError(str(exc)) from exc
     contracts = data.get("contracts") if isinstance(data, dict) else None
     return dict(contracts) if isinstance(contracts, dict) else {}
 
@@ -72,7 +78,13 @@ def verify(ledger_path: str = "AGENTS.md", lock_path: str = CONTRACT_LOCK_PATH) 
     """Return a list of human-readable mismatch messages (empty == OK)."""
     ledger = _load_ledger(ledger_path)
     declared = contract_paths_from_ledger(ledger)
-    recorded = load_lock(lock_path)
+    try:
+        recorded = load_lock(lock_path)
+    except CorruptLockError as exc:
+        return [
+            f"manifest file is not valid JSON: {lock_path} ({exc}). "
+            "Run: python harness/contract_manifest.py --update"
+        ]
     problems: list[str] = []
 
     for path in sorted(declared):

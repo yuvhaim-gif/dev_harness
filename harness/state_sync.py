@@ -14,8 +14,10 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import subprocess
 import tempfile
+import time
 from typing import Any
 
 STATE_REF = os.getenv("AGENT_STATE_REF", "harness-state")
@@ -93,19 +95,28 @@ def publish_files(
     ref: str = STATE_REF,
     remote: str = "origin",
     attempts: int = 3,
+    backoff_base: float = 0.5,
+    backoff_cap: float = 8.0,
 ) -> bool:
     """Add/remove files on the shared ``ref`` and push.
 
     ``updates`` maps a repo-relative POSIX path to a local source file to add,
-    or ``None`` to remove that path. Retries on a racing non-fast-forward push.
+    or ``None`` to remove that path. Retries on a racing non-fast-forward push
+    with bounded exponential backoff and jitter. Returns ``False`` when every
+    attempt is exhausted; callers MUST treat that as a coordination failure
+    (e.g. a lease release that did not propagate) rather than ignore it.
     """
     fd, index_path = tempfile.mkstemp(prefix="harness-index-")
     os.close(fd)
     os.remove(index_path)
     env = {**os.environ, "GIT_INDEX_FILE": index_path}
 
+    total = max(1, attempts)
     try:
-        for _ in range(max(1, attempts)):
+        for attempt in range(total):
+            if attempt > 0 and backoff_base > 0:
+                delay = min(backoff_cap, backoff_base * (2 ** (attempt - 1)))
+                time.sleep(delay + random.uniform(0, backoff_base))
             fetched = fetch_ref(repo_dir, ref, remote)
             base = _tracking_ref(remote, ref) if fetched else None
 

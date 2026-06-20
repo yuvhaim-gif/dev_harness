@@ -16,11 +16,13 @@ from pathlib import Path
 
 import pytest
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
+REPO_ROOT = Path(__file__).resolve().parents[2]
 HOOK = REPO_ROOT / "harness" / "enforce_file_locks.py"
 BINDING_HOOK = REPO_ROOT / "harness" / "enforce_contract_binding.py"
 VALIDATOR = REPO_ROOT / "harness" / "validate_agents_ledger.py"
-RUNNER = REPO_ROOT / "agent_runner.py"
+RUNNER = REPO_ROOT / "harness" / "agent_runner.py"
+CI_ENFORCE = REPO_ROOT / "harness" / "ci_enforce.py"
+MANIFEST = REPO_ROOT / "harness" / "contract_manifest.py"
 
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "harness"))
@@ -30,17 +32,16 @@ import journal  # noqa: E402
 import leases  # noqa: E402
 import staleness  # noqa: E402
 import state_sync  # noqa: E402
-
 from agent_runner import compute_branch_name  # noqa: E402
 
 REFERENCED_PATHS = [
-    "example/docs/IMPLEMENTATION.md",
-    "example/docs/API_SCHEMA.md",
-    "example/tests/test_payments.py",
-    "example/tests/test_queries.py",
-    "example/src/billing/routes.py",
-    "example/src/billing/models.py",
-    "example/src/db/queries.py",
+    "harness/example/docs/IMPLEMENTATION.md",
+    "harness/example/docs/API_SCHEMA.md",
+    "harness/example/tests/test_payments.py",
+    "harness/example/tests/test_queries.py",
+    "harness/example/src/billing/routes.py",
+    "harness/example/src/billing/models.py",
+    "harness/example/src/db/queries.py",
 ]
 
 
@@ -98,7 +99,7 @@ def _stage(repo: Path, rel: str) -> None:
 # F2. Lock-hook behaviour
 # --------------------------------------------------------------------------- #
 def test_f2a_blocks_locked_file_in_isolated_mode(harness_repo: Path) -> None:
-    _stage(harness_repo, "example/tests/test_queries.py")
+    _stage(harness_repo, "harness/example/tests/test_queries.py")
     res = _run_hook(harness_repo, {"AGENT_TASK_ID": "optimise_query_layer"})
     assert res.returncode == 1
     assert "outside its allowlist" in res.stdout
@@ -106,13 +107,13 @@ def test_f2a_blocks_locked_file_in_isolated_mode(harness_repo: Path) -> None:
 
 
 def test_f2b_allows_target_file(harness_repo: Path) -> None:
-    _stage(harness_repo, "example/src/db/queries.py")
+    _stage(harness_repo, "harness/example/src/db/queries.py")
     res = _run_hook(harness_repo, {"AGENT_TASK_ID": "optimise_query_layer"})
     assert res.returncode == 0, res.stdout + res.stderr
 
 
 def test_f2c_human_bypass_without_task(harness_repo: Path) -> None:
-    _stage(harness_repo, "example/tests/test_queries.py")
+    _stage(harness_repo, "harness/example/tests/test_queries.py")
     env = os.environ.copy()
     env.pop("AGENT_TASK_ID", None)
     res = subprocess.run(
@@ -127,7 +128,7 @@ def test_f2c_human_bypass_without_task(harness_repo: Path) -> None:
 
 def test_f2d_corrupt_ledger_aborts_cleanly(harness_repo: Path) -> None:
     _write(harness_repo, "AGENTS.md", "tasks: [unclosed\n  : : :\n")
-    _stage(harness_repo, "example/src/db/queries.py")
+    _stage(harness_repo, "harness/example/src/db/queries.py")
     res = _run_hook(harness_repo, {"AGENT_TASK_ID": "optimise_query_layer"})
     assert res.returncode == 1
     assert "not valid YAML" in res.stdout
@@ -225,14 +226,14 @@ def _run_binding(repo: Path, task_id: str) -> subprocess.CompletedProcess[str]:
 
 
 def test_f6a_contract_change_without_manifest_is_blocked(harness_repo: Path) -> None:
-    _stage(harness_repo, "example/docs/API_SCHEMA.md")
+    _stage(harness_repo, "harness/example/docs/API_SCHEMA.md")
     res = _run_binding(harness_repo, "add_payments_endpoint")
     assert res.returncode == 1
     assert "contracts.lock" in res.stdout
 
 
 def test_f6b_contract_change_without_bound_test_is_blocked(harness_repo: Path) -> None:
-    _stage(harness_repo, "example/docs/API_SCHEMA.md")
+    _stage(harness_repo, "harness/example/docs/API_SCHEMA.md")
     _write(harness_repo, ".harness/contracts.lock", '{"version": 1, "contracts": {}}\n')
     _git(harness_repo, "add", ".harness/contracts.lock")
     res = _run_binding(harness_repo, "add_payments_endpoint")
@@ -241,8 +242,8 @@ def test_f6b_contract_change_without_bound_test_is_blocked(harness_repo: Path) -
 
 
 def test_f6c_contract_change_with_manifest_and_test_passes(harness_repo: Path) -> None:
-    _stage(harness_repo, "example/docs/API_SCHEMA.md")
-    _stage(harness_repo, "example/tests/test_payments.py")
+    _stage(harness_repo, "harness/example/docs/API_SCHEMA.md")
+    _stage(harness_repo, "harness/example/tests/test_payments.py")
     _write(harness_repo, ".harness/contracts.lock", '{"version": 1, "contracts": {}}\n')
     _git(harness_repo, "add", ".harness/contracts.lock")
     res = _run_binding(harness_repo, "add_payments_endpoint")
@@ -250,7 +251,7 @@ def test_f6c_contract_change_with_manifest_and_test_passes(harness_repo: Path) -
 
 
 def test_f6d_non_contract_change_is_not_gated(harness_repo: Path) -> None:
-    _stage(harness_repo, "example/src/billing/routes.py")
+    _stage(harness_repo, "harness/example/src/billing/routes.py")
     res = _run_binding(harness_repo, "add_payments_endpoint")
     assert res.returncode == 0, res.stdout + res.stderr
 
@@ -320,14 +321,14 @@ def test_f9_journal_records_unresolved_for_next_agent(
 def test_f10_staleness_detects_moved_contract(harness_repo: Path) -> None:
     base = _git(harness_repo, "rev-parse", "HEAD").stdout.strip()
     _git(harness_repo, "checkout", "-b", "other")
-    with (harness_repo / "example/docs/API_SCHEMA.md").open("a", encoding="utf-8") as fh:
+    with (harness_repo / "harness/example/docs/API_SCHEMA.md").open("a", encoding="utf-8") as fh:
         fh.write("# moved on shared ref\n")
-    _git(harness_repo, "add", "example/docs/API_SCHEMA.md")
+    _git(harness_repo, "add", "harness/example/docs/API_SCHEMA.md")
     _git(harness_repo, "commit", "-m", "move contract")
 
-    task = {"contracts": ["example/docs/API_SCHEMA.md"]}
+    task = {"contracts": ["harness/example/docs/API_SCHEMA.md"]}
     moved = staleness.check(str(harness_repo), base, "other", task)
-    assert "example/docs/API_SCHEMA.md" in moved
+    assert "harness/example/docs/API_SCHEMA.md" in moved
 
     unchanged = staleness.check(str(harness_repo), base, base, task)
     assert unchanged == []
@@ -367,3 +368,169 @@ def test_f11_state_sync_round_trips_across_clones(tmp_path: Path) -> None:
     assert recovered is not None
     assert recovered["outcome"] == "stale"
     assert rel in state_sync.list_files(str(clone_b), journal.JOURNAL_DIR)
+
+
+# --------------------------------------------------------------------------- #
+# F12. state_sync.publish_files surfaces a hard coordination failure
+# --------------------------------------------------------------------------- #
+def test_f12_publish_files_returns_false_on_unreachable_remote(tmp_path: Path) -> None:
+    _git(tmp_path, "init", "-b", "main")
+    _git(tmp_path, "config", "user.email", "x@example.com")
+    _git(tmp_path, "config", "user.name", "X")
+    _write(tmp_path, "f.txt", "hi\n")
+
+    # No 'origin' remote exists, so every push attempt must fail. With
+    # backoff_base=0 the retries are instantaneous. The contract is that callers
+    # learn about the failure via a False return rather than a silent swallow.
+    ok = state_sync.publish_files(
+        str(tmp_path),
+        {"f.txt": "f.txt"},
+        message="m",
+        remote="origin",
+        attempts=2,
+        backoff_base=0,
+    )
+    assert ok is False
+
+
+# --------------------------------------------------------------------------- #
+# F13. Corrupt contracts.lock is reported, not crashed on
+# --------------------------------------------------------------------------- #
+def test_f13_corrupt_lock_reports_cleanly(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    _write(
+        tmp_path,
+        "AGENTS.md",
+        "schema_version: 1\n"
+        "tasks:\n"
+        "  t:\n"
+        "    mutation_mode: evolve\n"
+        "    spec_docs: [c.md]\n"
+        "    contracts: [c.md]\n",
+    )
+    _write(tmp_path, "c.md", "v1\n")
+    _write(tmp_path, ".harness/contracts.lock", "{ this is not valid json")
+
+    problems = contract_manifest.verify()
+    assert any("not valid JSON" in p for p in problems)
+    # The actionable remediation command is surfaced rather than a traceback.
+    assert any("--update" in p for p in problems)
+
+
+# --------------------------------------------------------------------------- #
+# F14. Server-side CI re-check is authoritative for agent branches
+# --------------------------------------------------------------------------- #
+def _seed_contract_lock(repo: Path) -> str:
+    """Generate + commit a valid manifest on main, returning the base commit."""
+    subprocess.run([sys.executable, str(MANIFEST), "--update"], cwd=str(repo), check=True)
+    _git(repo, "add", ".harness/contracts.lock")
+    _git(repo, "commit", "-m", "lock")
+    return _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+
+def _run_ci_enforce(repo: Path, base: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, str(CI_ENFORCE), "--base", base, "--head", "HEAD"],
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_f14a_ci_enforce_blocks_out_of_scope_agent_branch(harness_repo: Path) -> None:
+    base = _seed_contract_lock(harness_repo)
+    _git(harness_repo, "checkout", "-b", "agent/optimise_query_layer/20260101T000000Z")
+    # 'optimise_query_layer' is isolated: only harness/example/src/db/queries.py is allowed.
+    with (harness_repo / "harness/example/src/billing/routes.py").open("a", encoding="utf-8") as fh:
+        fh.write("# sneaky out-of-scope edit\n")
+    _git(harness_repo, "add", "-A")
+    _git(harness_repo, "commit", "-m", "sneaky")
+
+    res = _run_ci_enforce(harness_repo, base)
+    assert res.returncode == 1, res.stdout + res.stderr
+    assert "outside its allowlist" in res.stdout
+    assert "harness/example/src/billing/routes.py" in res.stdout
+
+
+def test_f14b_ci_enforce_allows_in_scope_agent_branch(harness_repo: Path) -> None:
+    base = _seed_contract_lock(harness_repo)
+    _git(harness_repo, "checkout", "-b", "agent/optimise_query_layer/20260101T000000Z")
+    with (harness_repo / "harness/example/src/db/queries.py").open("a", encoding="utf-8") as fh:
+        fh.write("# in-scope optimisation\n")
+    _git(harness_repo, "add", "-A")
+    _git(harness_repo, "commit", "-m", "optimise")
+
+    res = _run_ci_enforce(harness_repo, base)
+    assert res.returncode == 0, res.stdout + res.stderr
+
+
+# --------------------------------------------------------------------------- #
+# F15. Bootstrap (--init) and the doctor README sentinel
+# --------------------------------------------------------------------------- #
+@pytest.fixture()
+def empty_repo(tmp_path: Path) -> Path:
+    _git(tmp_path, "init", "-b", "main")
+    _git(tmp_path, "config", "user.email", "h@example.com")
+    _git(tmp_path, "config", "user.name", "H")
+    return tmp_path
+
+
+def _run_module(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(REPO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
+    return subprocess.run(
+        [sys.executable, "-m", "harness", *args],
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+
+def test_f15a_init_writes_empty_skeleton_that_validates(empty_repo: Path) -> None:
+    res = _run_module(empty_repo, "--init")
+    assert res.returncode == 0, res.stdout + res.stderr
+
+    agents = empty_repo / "AGENTS.md"
+    readme = empty_repo / "README.md"
+    assert agents.exists()
+    assert "tasks: {}" in agents.read_text(encoding="utf-8")
+    assert readme.exists()
+    assert "<!-- HARNESS_TEMPLATE_README" not in readme.read_text(encoding="utf-8")
+
+    validated = subprocess.run(
+        [sys.executable, str(VALIDATOR), "AGENTS.md"],
+        cwd=str(empty_repo),
+        capture_output=True,
+        text=True,
+    )
+    assert validated.returncode == 0, validated.stdout + validated.stderr
+
+
+def test_f15b_init_example_recreates_shipped_ledger(empty_repo: Path) -> None:
+    res = _run_module(empty_repo, "--init", "--example", "--force")
+    assert res.returncode == 0, res.stdout + res.stderr
+
+    produced = (empty_repo / "AGENTS.md").read_text(encoding="utf-8")
+    shipped = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
+    example = (REPO_ROOT / "harness" / "example" / "AGENTS.example.md").read_text(encoding="utf-8")
+    assert produced == example
+    assert produced == shipped, "the example ledger must match the harness's own AGENTS.md"
+
+
+def test_f15c_doctor_flags_template_readme_then_init_clears_it(empty_repo: Path) -> None:
+    (empty_repo / "README.md").write_text(
+        "<!-- HARNESS_TEMPLATE_README -->\n# template\n", encoding="utf-8"
+    )
+    (empty_repo / "AGENTS.md").write_text("schema_version: 1\n\ntasks: {}\n", encoding="utf-8")
+
+    before = _run_module(empty_repo, "--doctor")
+    assert before.returncode == 0, before.stdout + before.stderr
+    assert "still the harness template" in before.stdout
+
+    init = _run_module(empty_repo, "--init")
+    assert init.returncode == 0, init.stdout + init.stderr
+
+    after = _run_module(empty_repo, "--doctor")
+    assert after.returncode == 0, after.stdout + after.stderr
+    assert "project-owned" in after.stdout

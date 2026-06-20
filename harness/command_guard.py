@@ -7,6 +7,16 @@ module scans the command string, strips those bypass flags *only* where they
 apply to a git commit/push segment, and reports what it removed so the caller can
 apply a penalty. Commands that do not tamper are returned untouched, byte for
 byte, so normal behaviour (and shell quoting) is preserved.
+
+Stripping two literal flags only raises the cost of an *accidental* bypass; it
+is not a security boundary. A determined agent can still skip the hooks with
+``git -c core.hooksPath=...`` or by writing a commit through low-level plumbing
+(``commit-tree``/``update-ref``). Those patterns cannot be safely rewritten out
+of an arbitrary shell string, so instead of stripping them this module *flags*
+them: the orchestrator logs the policy event, penalises the repair counter, and
+the post-hoc containment gate (see ``agent_runner._containment_breach``) plus the
+server-side CI re-check (see ``harness/ci_enforce.py``) are the authoritative
+defences.
 """
 
 from __future__ import annotations
@@ -20,16 +30,28 @@ _SEPARATORS = frozenset({"&&", "||", "|", ";", "&"})
 _GIT_SUBCOMMANDS = frozenset({"commit", "push"})
 _GIT_NAMES = frozenset({"git", "git.exe"})
 
+# Low-level git that writes history without firing the pre-commit hooks.
+_FLAGGED_SUBCOMMANDS = frozenset(
+    {"commit-tree", "update-ref", "fast-import", "hash-object", "update-index"}
+)
+_HOOKSPATH_NEEDLE = "hookspath"
+
 
 @dataclass
 class GuardResult:
     original: str
     sanitized: str
     stripped: list[str] = field(default_factory=list)
+    flagged: list[str] = field(default_factory=list)
 
     @property
     def tampered(self) -> bool:
         return bool(self.stripped)
+
+    @property
+    def suspicious(self) -> bool:
+        """True when an unstrippable hook-evasion pattern was detected."""
+        return bool(self.flagged)
 
 
 def _tokenize(cmd: str) -> list[str] | None:
@@ -39,24 +61,41 @@ def _tokenize(cmd: str) -> list[str] | None:
         return None
 
 
+def _literal_flagged(cmd: str) -> list[str]:
+    low = cmd.lower()
+    flagged: list[str] = []
+    if _HOOKSPATH_NEEDLE in low:
+        flagged.append("core.hooksPath override")
+    for sub in sorted(_FLAGGED_SUBCOMMANDS):
+        if f" {sub}" in f" {low}":
+            flagged.append(f"low-level git: {sub}")
+    return sorted(set(flagged))
+
+
 def sanitize_command(cmd: str | None) -> GuardResult:
-    """Strip git bypass flags from ``cmd``; report any that were removed."""
+    """Strip git bypass flags from ``cmd`` and flag unstrippable evasion."""
     if not cmd:
         return GuardResult(original=cmd or "", sanitized=cmd or "")
 
     tokens = _tokenize(cmd)
     if tokens is None:
         # Unparseable (e.g. unbalanced quotes): fall back to a literal scan so a
-        # naked bypass flag is still caught rather than silently passing.
+        # naked bypass flag or evasion pattern is still caught rather than
+        # silently passing.
         literal = sorted({flag for flag in _BYPASS_FLAGS if f" {flag}" in f" {cmd}"})
-        return GuardResult(original=cmd, sanitized=cmd, stripped=literal)
+        return GuardResult(
+            original=cmd, sanitized=cmd, stripped=literal, flagged=_literal_flagged(cmd)
+        )
 
     out: list[str] = []
     stripped: list[str] = []
+    flagged: list[str] = []
     in_git = False
     git_sub = ""
 
     for tok in tokens:
+        if _HOOKSPATH_NEEDLE in tok.lower():
+            flagged.append("core.hooksPath override")
         if tok in _SEPARATORS:
             in_git = False
             git_sub = ""
@@ -70,6 +109,8 @@ def sanitize_command(cmd: str | None) -> GuardResult:
             continue
         if in_git and not git_sub and not tok.startswith("-"):
             git_sub = tok.lower()
+            if git_sub in _FLAGGED_SUBCOMMANDS:
+                flagged.append(f"low-level git: {git_sub}")
             out.append(tok)
             continue
         if in_git and git_sub in _GIT_SUBCOMMANDS and tok in _BYPASS_FLAGS:
@@ -77,8 +118,9 @@ def sanitize_command(cmd: str | None) -> GuardResult:
             continue
         out.append(tok)
 
+    flagged = sorted(set(flagged))
     if not stripped:
-        return GuardResult(original=cmd, sanitized=cmd)
+        return GuardResult(original=cmd, sanitized=cmd, flagged=flagged)
 
     sanitized = " ".join(tok if tok in _SEPARATORS else shlex.quote(tok) for tok in out)
-    return GuardResult(original=cmd, sanitized=sanitized, stripped=stripped)
+    return GuardResult(original=cmd, sanitized=sanitized, stripped=stripped, flagged=flagged)

@@ -31,9 +31,14 @@ def validate(path: str = "AGENTS.md") -> int:
         return 1
 
     tasks = ledger.get("tasks")
-    if not isinstance(tasks, dict) or not tasks:
-        print(f"ERROR: {path} must define a non-empty 'tasks' mapping.")
+    if not isinstance(tasks, dict):
+        print(f"ERROR: {path} must define a 'tasks' mapping.")
         return 1
+    if not tasks:
+        # Empty skeleton produced by 'python -m harness --init'; valid but
+        # not yet runnable. Operators fill in tasks before invoking the loop.
+        print(f"OK: {path} parsed; empty 'tasks' skeleton (no tasks defined yet).")
+        return 0
 
     ok = True
     for task_id, task in tasks.items():

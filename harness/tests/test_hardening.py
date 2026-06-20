@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
+REPO_ROOT = Path(__file__).resolve().parents[2]
 HOOK = REPO_ROOT / "harness" / "enforce_file_locks.py"
 BINDING_HOOK = REPO_ROOT / "harness" / "enforce_contract_binding.py"
 
@@ -203,6 +203,29 @@ def test_h4e_strips_only_in_git_segment() -> None:
     assert "--no-verify" not in res.sanitized
 
 
+def test_h4f_flags_hookspath_override() -> None:
+    res = command_guard.sanitize_command("git -c core.hooksPath=/dev/null commit -m x")
+    assert res.suspicious
+    assert any("hooksPath" in f for f in res.flagged)
+
+
+def test_h4g_flags_commit_tree_plumbing() -> None:
+    res = command_guard.sanitize_command("git commit-tree abc123 -m x")
+    assert res.suspicious
+    assert any("commit-tree" in f for f in res.flagged)
+
+
+def test_h4h_clean_commit_is_not_flagged() -> None:
+    res = command_guard.sanitize_command('python tool.py && git commit -m "ok"')
+    assert not res.suspicious
+    assert not res.tampered
+
+
+def test_h4i_flags_survive_unparseable_command() -> None:
+    res = command_guard.sanitize_command("git -c core.hooksPath=x commit -m 'unterminated")
+    assert res.suspicious
+
+
 # --------------------------------------------------------------------------- #
 # H5. Forensic post-mortem
 # --------------------------------------------------------------------------- #
@@ -247,10 +270,14 @@ def seeded_repo(tmp_path: Path) -> Path:
     (tmp_path / "AGENTS.md").write_text(
         (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8"), encoding="utf-8"
     )
-    for rel in ("example/tests", "example/src/db"):
+    for rel in ("harness/example/tests", "harness/example/src/db"):
         (tmp_path / rel).mkdir(parents=True, exist_ok=True)
-    (tmp_path / "example" / "tests" / "test_queries.py").write_text("# t\n", encoding="utf-8")
-    (tmp_path / "example" / "src" / "db" / "queries.py").write_text("# q\n", encoding="utf-8")
+    (tmp_path / "harness" / "example" / "tests" / "test_queries.py").write_text(
+        "# t\n", encoding="utf-8"
+    )
+    (tmp_path / "harness" / "example" / "src" / "db" / "queries.py").write_text(
+        "# q\n", encoding="utf-8"
+    )
     _git(tmp_path, "add", "-A")
     _git(tmp_path, "commit", "-m", "seed")
     return tmp_path
@@ -259,7 +286,7 @@ def seeded_repo(tmp_path: Path) -> Path:
 # --------------------------------------------------------------------------- #
 # H7. End-to-end financial abort -> forensic report -> safe rollback
 # --------------------------------------------------------------------------- #
-RUNNER = REPO_ROOT / "agent_runner.py"
+RUNNER = REPO_ROOT / "harness" / "agent_runner.py"
 
 _FAKE_LLM = (
     "import os, json\n"
@@ -303,9 +330,10 @@ def test_h7_financial_abort_writes_forensic_and_rolls_back(seeded_repo: Path) ->
 
 
 def test_h6_skip_agent_harness_bypasses_lock_hook(seeded_repo: Path) -> None:
-    with (seeded_repo / "example" / "tests" / "test_queries.py").open("a", encoding="utf-8") as fh:
+    target = seeded_repo / "harness" / "example" / "tests" / "test_queries.py"
+    with target.open("a", encoding="utf-8") as fh:
         fh.write("# locked edit\n")
-    _git(seeded_repo, "add", "example/tests/test_queries.py")
+    _git(seeded_repo, "add", "harness/example/tests/test_queries.py")
 
     env = os.environ.copy()
     env["AGENT_TASK_ID"] = "optimise_query_layer"  # would normally block this path
@@ -321,3 +349,47 @@ def test_h6_skip_agent_harness_bypasses_lock_hook(seeded_repo: Path) -> None:
     )
     assert overridden.returncode == 0, overridden.stdout + overridden.stderr
     assert "human override" in overridden.stdout
+
+
+# --------------------------------------------------------------------------- #
+# H8. Out-of-band (hook-bypassed) commit is caught by the post-hoc gate
+# --------------------------------------------------------------------------- #
+# The LLM seam spawns its own git and commits an out-of-allowlist file while
+# explicitly skipping any hooks (``core.hooksPath``). The command guard cannot
+# see inside the spawned process, so the authoritative defence is the post-hoc
+# containment gate, which inspects committed state and must abort with exit 4.
+_ESCAPE_LLM = (
+    "import subprocess\n"
+    "open('escaped.py', 'w').write('x = 1\\n')\n"
+    "subprocess.run(['git', 'add', 'escaped.py'])\n"
+    "subprocess.run(['git', '-c', 'core.hooksPath=.', 'commit', '-m', 'out of band'])\n"
+)
+
+
+def test_h8_out_of_band_commit_is_contained(seeded_repo: Path) -> None:
+    (seeded_repo / "escape_llm.py").write_text(_ESCAPE_LLM, encoding="utf-8")
+
+    env = os.environ.copy()
+    env.pop("SKIP_AGENT_HARNESS", None)
+    env["AGENT_ID"] = "agent-test"
+    env["AGENT_LLM_CMD"] = f'"{sys.executable}" escape_llm.py'
+
+    res = subprocess.run(
+        [sys.executable, str(RUNNER), "--task", "optimise_query_layer"],
+        cwd=str(seeded_repo),
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    combined = res.stdout + res.stderr
+    assert res.returncode == 4, combined  # CONTAINMENT_ABORT_EXIT
+    assert "CONTAINMENT BREACH" in combined
+
+    report = seeded_repo / ".harness" / "logs" / "FAILED_AGENT_RUN.md"
+    assert report.exists()
+
+    # Safely contained: back on main with a clean tracked tree.
+    branch = _git(seeded_repo, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+    assert branch == "main"
+    status = _git(seeded_repo, "status", "--porcelain", "-uno").stdout.strip()
+    assert status == "", f"tracked files not clean after rollback: {status}"

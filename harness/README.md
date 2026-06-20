@@ -1,12 +1,3 @@
-<!-- HARNESS_TEMPLATE_README
-This landing page is the harness's own documentation, shown on the repo's
-GitHub page. If you are adopting the harness for your own project, replace
-this file with your project's README -- either delete it and write your own,
-or run `python -m harness --init`, which stamps a project stub and an empty
-AGENTS.md ledger. `python -m harness --doctor` warns while this marker is
-present. The full framework docs always live under `harness/README.md`.
--->
-
 # Agent Workflow Harness
 
 A hardened framework that keeps automated / LLM coding agents **on the rails**

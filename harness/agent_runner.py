@@ -25,9 +25,10 @@ from typing import Any
 import git
 import yaml
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "harness"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import command_guard  # noqa: E402
+import contract_manifest  # noqa: E402
 import forensic  # noqa: E402
 import journal  # noqa: E402
 import leases  # noqa: E402
@@ -45,6 +46,46 @@ SHARED_REF = os.getenv("AGENT_SHARED_REF", "origin/main")
 REPAIR_PROMPT_FILE = ".harness/telemetry/repair_prompt.txt"
 
 BUDGET_ABORT_EXIT = 3
+CONTAINMENT_ABORT_EXIT = 4
+
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
+
+# Marker stamped into the template README the harness ships at the repo root.
+# ``--doctor`` warns while it is still present so an operator replaces the
+# framework's landing page with their own project README before starting.
+README_SENTINEL = "<!-- HARNESS_TEMPLATE_README"
+
+_EMPTY_LEDGER = "schema_version: 1\n\ntasks: {}\n"
+
+_EXAMPLE_LEDGER_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "example", "AGENTS.example.md"
+)
+
+_PROJECT_README_TEMPLATE = """# Your Project
+
+Built on the agent workflow harness. The framework and its full documentation
+live under `harness/` (see `harness/README.md`). Define your tasks in
+`AGENTS.md` and run them with:
+
+```bash
+python -m harness --task <task_id>
+```
+"""
+
+
+def _env_flag(name: str) -> bool:
+    return (os.getenv(name) or "").strip().lower() in _TRUTHY
+
+
+def _minimal_mode() -> bool:
+    """Tier the optional coordination layer off for simple single-agent runs.
+
+    ``AGENT_MINIMAL=1`` (or ``AGENT_DISABLE_STATE_SYNC=1``) keeps the core
+    file-lock guarantee but skips the shared ``harness-state`` ref entirely, so
+    operators who only want local locking are not exposed to the cross-clone
+    git-plumbing machinery.
+    """
+    return _env_flag("AGENT_MINIMAL") or _env_flag("AGENT_DISABLE_STATE_SYNC")
 
 
 def log(msg: str) -> None:
@@ -90,6 +131,7 @@ class RunContext:
     git_warnings: list[str] = field(default_factory=list)
     rollback_ok: bool = False
     forensic_written: bool = False
+    runner_commits: set[str] = field(default_factory=set)
 
 
 # --------------------------------------------------------------------------- #
@@ -146,7 +188,25 @@ def _posix(path: str) -> str:
 
 def _state_enabled(ctx: RunContext) -> bool:
     """Shared-ref coordination is live only for real runs against an origin."""
-    return not ctx.dry_run and _has_origin(ctx.repo)
+    return not ctx.dry_run and _has_origin(ctx.repo) and not _minimal_mode()
+
+
+def _shared_state_enabled(ctx: RunContext) -> bool:
+    """Whether shared-ref publishing/reading should run for this context."""
+    return _has_origin(ctx.repo) and not _minimal_mode()
+
+
+def _record_runner_commit(ctx: RunContext) -> None:
+    """Remember a commit the orchestrator itself created on the work branch.
+
+    Anything on ``base..HEAD`` that is *not* in this set was authored out of
+    band by the agent (e.g. via a hook-skipping commit) and is a containment
+    breach -- the orchestrator is the only component permitted to write history.
+    """
+    try:
+        ctx.runner_commits.add(ctx.repo.head.commit.hexsha)
+    except (ValueError, git.exc.GitError):
+        return
 
 
 def _shared_latest_unresolved(ctx: RunContext) -> dict[str, Any] | None:
@@ -173,7 +233,7 @@ def _recover_handover(ctx: RunContext) -> None:
     journal is mirrored there, so a different machine can resume its context.
     """
     local = journal.latest_unresolved(ctx.task.task_id)
-    shared = _shared_latest_unresolved(ctx) if _has_origin(ctx.repo) else None
+    shared = _shared_latest_unresolved(ctx) if _shared_state_enabled(ctx) else None
 
     chosen = local
     use_shared = shared is not None and (
@@ -264,12 +324,27 @@ def _commit_coordination(ctx: RunContext, path: str, what: str) -> None:
         ctx.repo.git.add("--", posix)
     else:
         ctx.repo.git.rm("--cached", "--ignore-unmatch", "--", posix)
-    subprocess.run(
+    res = subprocess.run(
         ["git", "commit", "-m", f"chore(harness): {what} [{ctx.task.task_id}]"],
         capture_output=True,
         text=True,
         env=env,
     )
+    if res.returncode == 0:
+        _record_runner_commit(ctx)
+
+
+def _harden_git_env(env: dict[str, str]) -> None:
+    """Pin git config for the seam so the inherited environment cannot weaken it.
+
+    This is defence-in-depth, not a sandbox: a command-line ``-c
+    core.hooksPath=...`` still wins over configuration, which is exactly why the
+    command guard flags it and the post-hoc containment gate + CI re-check are
+    the authoritative boundaries. True isolation (no network, read-only ``.git``)
+    requires running the seam in a container; see the README threat model.
+    """
+    env["GIT_CONFIG_NOSYSTEM"] = "1"
+    env.pop("GIT_CONFIG_GLOBAL", None)
 
 
 def _llm_env(
@@ -277,6 +352,7 @@ def _llm_env(
 ) -> dict[str, str]:
     allow = sorted(compute_allowlist(ctx.task.raw))
     env = os.environ.copy()
+    _harden_git_env(env)
     env.update(
         {
             "AGENT_TASK_ID": ctx.task.task_id,
@@ -319,6 +395,15 @@ def _run_llm(ctx: RunContext, phase: str, repair_log: str = "", prompt_file: str
         warning = (
             f"escape-hatch attempt in AGENT_LLM_CMD: stripped {guard.stripped} "
             f"(git bypass flags). Penalising repair counter."
+        )
+        log(f"[{phase}] PENALTY: {warning}")
+        ctx.git_warnings.append(warning)
+        ctx.autorepair_attempts += 1
+    if guard.suspicious:
+        warning = (
+            f"hook-evasion pattern in AGENT_LLM_CMD: {guard.flagged}. These cannot "
+            "be stripped from an arbitrary shell command; the post-hoc containment "
+            "gate and CI re-check are the backstop. Penalising repair counter."
         )
         log(f"[{phase}] PENALTY: {warning}")
         ctx.git_warnings.append(warning)
@@ -398,11 +483,18 @@ def isolate(ctx: RunContext) -> None:
     _commit_coordination(ctx, lease_path, "claim lease")
     if _state_enabled(ctx):
         posix_lease = _posix(lease_path)
-        state_sync.publish_files(
+        ok_pub = state_sync.publish_files(
             _repo_dir(ctx),
             {posix_lease: posix_lease},
             message=f"harness: claim lease {ctx.task.task_id} [{ctx.agent_id}]",
         )
+        if not ok_pub:
+            warning = (
+                f"could not publish lease for '{ctx.task.task_id}' to the shared "
+                "ref; other clones may not see this claim until it is retried."
+            )
+            log(f"WARNING: {warning}")
+            ctx.git_warnings.append(warning)
 
     ctx.journal_entry = journal.start_session(ctx.task.task_id, name, ctx.base_commit)
 
@@ -457,6 +549,7 @@ def enforce(ctx: RunContext) -> tuple[str, str]:
     out = (res.stdout or "") + (res.stderr or "")
 
     if res.returncode == 0:
+        _record_runner_commit(ctx)
         return ("passed", out)
     if "files were modified by this hook" in out.lower():
         return ("mechanical", out)
@@ -474,12 +567,23 @@ def _release_lease(ctx: RunContext, commit: bool) -> None:
     ctx.lease_acquired = False
     if commit:
         _commit_coordination(ctx, path, "release lease")
-    if _has_origin(ctx.repo):
-        state_sync.publish_files(
+    if _shared_state_enabled(ctx):
+        ok_pub = state_sync.publish_files(
             _repo_dir(ctx),
             {_posix(path): None},
             message=f"harness: release lease {ctx.task.task_id} [{ctx.agent_id}]",
         )
+        if not ok_pub:
+            # A dropped release is the worst silent failure: it can strand the
+            # task behind a live lease until the TTL expires. Make it loud.
+            warning = (
+                f"FAILED to publish lease RELEASE for '{ctx.task.task_id}' to the "
+                "shared ref; the task may appear leased to other agents until the "
+                f"{leases.DEFAULT_TTL_SECONDS}s TTL expires. Re-run or clear the "
+                "shared lease manually."
+            )
+            log(f"WARNING: {warning}")
+            ctx.git_warnings.append(warning)
 
 
 def _persist_journal(ctx: RunContext, outcome: str, notes: str = "") -> None:
@@ -489,13 +593,20 @@ def _persist_journal(ctx: RunContext, outcome: str, notes: str = "") -> None:
     path = journal.write(ctx.journal_entry)
     _commit_coordination(ctx, path, f"journal {outcome}")
     log(f"handover journal written ({outcome}): {path}")
-    if _has_origin(ctx.repo):
+    if _shared_state_enabled(ctx):
         posix_path = _posix(path)
-        state_sync.publish_files(
+        ok_pub = state_sync.publish_files(
             _repo_dir(ctx),
             {posix_path: posix_path},
             message=f"harness: journal {outcome} {ctx.task.task_id} [{ctx.agent_id}]",
         )
+        if not ok_pub:
+            warning = (
+                f"could not publish '{outcome}' handover journal to the shared ref; "
+                "a fresh clone may not recover this session's context."
+            )
+            log(f"WARNING: {warning}")
+            ctx.git_warnings.append(warning)
 
 
 def _rollback(ctx: RunContext) -> None:
@@ -637,6 +748,73 @@ def _budget_abort(ctx: RunContext) -> bool:
     return True
 
 
+def _unexpected_commits(ctx: RunContext) -> list[str]:
+    """Commits on ``base..HEAD`` the orchestrator did not author itself.
+
+    The pre-commit hook can be skipped by an agent that runs its own git
+    (``-c core.hooksPath=...`` or plumbing), but any commit it creates still
+    lands on the work branch. Anything here that is not in ``runner_commits``
+    was written out of band -- a containment breach.
+    """
+    if ctx.dry_run or not ctx.base_commit:
+        return []
+    try:
+        out = ctx.repo.git.rev_list(f"{ctx.base_commit}..HEAD")
+    except git.exc.GitCommandError:
+        return []
+    shas = [s for s in out.splitlines() if s]
+    return [s for s in shas if s not in ctx.runner_commits]
+
+
+def _committed_paths(ctx: RunContext) -> list[str]:
+    """Paths committed on ``base..HEAD`` (i.e. what a push would publish)."""
+    if ctx.dry_run or not ctx.base_commit:
+        return []
+    try:
+        out = ctx.repo.git.diff("--name-only", f"{ctx.base_commit}..HEAD")
+    except git.exc.GitCommandError:
+        return []
+    return [p for p in out.splitlines() if p]
+
+
+def _containment_breach(ctx: RunContext) -> list[str]:
+    """Authoritative post-hoc check that the agent stayed inside its scope.
+
+    Returns a list of human-readable violations (empty == contained). Inspects
+    only *committed* state -- the history a push would publish -- so it catches
+    out-of-allowlist commits and out-of-band (hook-bypassed) commits while
+    ignoring benign uncommitted scratch files. This holds regardless of whether
+    the pre-commit hook was skipped during the run.
+    """
+    if ctx.dry_run:
+        return []
+    allow = sorted(compute_allowlist(ctx.task.raw))
+    out_of_scope = sorted(
+        p for p in _committed_paths(ctx) if p not in allow and not is_coordination_path(p)
+    )
+    violations = [f"out-of-allowlist committed change: {p}" for p in out_of_scope]
+    violations += [
+        f"out-of-band commit (hook-bypassed): {sha[:12]}" for sha in _unexpected_commits(ctx)
+    ]
+    return violations
+
+
+def _containment_abort(ctx: RunContext) -> bool:
+    """Hard-stop if the agent escaped its declared scope despite the gates."""
+    violations = _containment_breach(ctx)
+    if not violations:
+        return False
+    log("CONTAINMENT BREACH: agent modified state outside its allowlist:")
+    for v in violations:
+        log(f"  - {v}")
+    reason = "containment breach -- " + "; ".join(violations)
+    ctx.git_warnings.append(reason)
+    _write_forensics(ctx, "escalated", reason, exit_code=CONTAINMENT_ABORT_EXIT)
+    _persist_journal(ctx, "escalated", notes=reason)
+    _rollback(ctx)
+    return True
+
+
 # --------------------------------------------------------------------------- #
 # E7. State 5B — Reconcile
 # --------------------------------------------------------------------------- #
@@ -650,16 +828,54 @@ def _ref_exists(repo: git.Repo, ref: str) -> bool:
     return res.returncode == 0
 
 
+def _is_shallow(repo: git.Repo) -> bool:
+    res = subprocess.run(
+        ["git", "rev-parse", "--is-shallow-repository"],
+        cwd=repo.working_tree_dir,
+        capture_output=True,
+        text=True,
+    )
+    return res.stdout.strip() == "true"
+
+
+def _unshallow(repo: git.Repo) -> None:
+    """Best-effort: a shallow clone lacks the base-commit objects the staleness
+    guard must read, so deepen it before the critical-path comparison."""
+    log("shallow clone detected; deepening history so staleness can be evaluated.")
+    res = subprocess.run(
+        ["git", "fetch", "--unshallow"],
+        cwd=repo.working_tree_dir,
+        capture_output=True,
+        text=True,
+    )
+    if res.returncode != 0:
+        log(f"WARNING: 'git fetch --unshallow' failed: {res.stderr.strip()}")
+
+
 def _staleness_guard(ctx: RunContext) -> list[str]:
-    """Fetch the shared ref and report critical files that moved since branch."""
+    """Fetch the shared ref and report critical files that moved since branch.
+
+    On a shallow clone (common in CI) the base-commit objects may be absent,
+    which would make a naive comparison silently pass. We deepen first, and when
+    the shared ref still cannot be resolved we honour ``AGENT_STALENESS_STRICT``:
+    strict mode blocks the push (fail-safe) rather than skipping the guard.
+    """
     if not ctx.base_commit:
         return []
+    if _is_shallow(ctx.repo):
+        _unshallow(ctx.repo)
     try:
         ctx.repo.remotes.origin.fetch()
     except git.exc.GitError as exc:
         log(f"WARNING: fetch before staleness check failed: {exc}")
     working_dir = str(ctx.repo.working_tree_dir or ".")
     if not _ref_exists(ctx.repo, SHARED_REF):
+        if _env_flag("AGENT_STALENESS_STRICT"):
+            log(
+                f"shared ref '{SHARED_REF}' does not resolve and "
+                "AGENT_STALENESS_STRICT is set; refusing to push (fail-safe)."
+            )
+            return [f"{SHARED_REF} (unresolvable; strict staleness)"]
         log(f"shared ref '{SHARED_REF}' does not resolve; skipping staleness check.")
         return []
     return staleness.check(working_dir, ctx.base_commit, SHARED_REF, ctx.task.raw)
@@ -731,6 +947,8 @@ def _drive(ctx: RunContext) -> int:
         mutate(ctx)
         if _budget_abort(ctx):
             return BUDGET_ABORT_EXIT
+        if _containment_abort(ctx):
+            return CONTAINMENT_ABORT_EXIT
         status, log_text = enforce(ctx)
 
         if status == "dry-run":
@@ -741,6 +959,8 @@ def _drive(ctx: RunContext) -> int:
             status, log_text = enforce(ctx)
 
         if status == "passed":
+            if _containment_abort(ctx):
+                return CONTAINMENT_ABORT_EXIT
             return reconcile(ctx)
 
         # semantic (or still mechanical after the single retry) -> autorepair
@@ -749,6 +969,168 @@ def _drive(ctx: RunContext) -> int:
             return 1
         if _budget_abort(ctx):
             return BUDGET_ABORT_EXIT
+
+
+# --------------------------------------------------------------------------- #
+# Bootstrap (--init)
+# --------------------------------------------------------------------------- #
+def _readme_has_sentinel(path: str) -> bool:
+    """True when ``path`` is the harness's shipped template README.
+
+    Detected by the ``README_SENTINEL`` marker the template carries; absence
+    means an operator has replaced it with their own project README.
+    """
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return README_SENTINEL in fh.read()
+    except OSError:
+        return False
+
+
+def init(*, from_example: bool = False, force: bool = False) -> int:
+    """Prime a fresh project: wipe the template README and seed an AGENTS.md.
+
+    By default the ledger is an empty skeleton (``tasks: {}``) ready for the
+    operator's own tasks. ``from_example`` instead stamps the shipped example
+    ledger so the bundled demo tasks can be reproduced and self-checked.
+    Existing files are preserved unless ``force`` is given.
+    """
+    try:
+        repo = git.Repo(search_parent_directories=True)
+        repo_dir = str(repo.working_tree_dir or ".")
+    except git.exc.GitError as exc:
+        print(f"ERROR: not a usable git repository: {exc}")
+        return 1
+
+    print("== harness init ==")
+
+    if from_example:
+        try:
+            with open(_EXAMPLE_LEDGER_FILE, encoding="utf-8") as fh:
+                ledger_body = fh.read()
+        except OSError as exc:
+            print(f"ERROR: cannot read example ledger {_EXAMPLE_LEDGER_FILE}: {exc}")
+            return 1
+    else:
+        ledger_body = _EMPTY_LEDGER
+
+    agents_path = os.path.join(repo_dir, "AGENTS.md")
+    if os.path.exists(agents_path) and not force:
+        print("  skip: AGENTS.md already exists (use --force to overwrite).")
+    else:
+        with open(agents_path, "w", encoding="utf-8") as fh:
+            fh.write(ledger_body)
+        print(f"  wrote: AGENTS.md ({'example' if from_example else 'empty skeleton'}).")
+
+    readme_path = os.path.join(repo_dir, "README.md")
+    if os.path.exists(readme_path) and not _readme_has_sentinel(readme_path) and not force:
+        print("  skip: README.md is already project-owned (use --force to overwrite).")
+    else:
+        with open(readme_path, "w", encoding="utf-8") as fh:
+            fh.write(_PROJECT_README_TEMPLATE)
+        print("  wrote: README.md (project stub).")
+
+    print("== init complete ==")
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# Diagnostics
+# --------------------------------------------------------------------------- #
+def doctor() -> int:
+    """One-pass health report of every coordination subsystem.
+
+    Surfaces the failure modes that are otherwise painful to debug in CI -- a
+    stale lease, a corrupt ``contracts.lock``, an unresolved handover, or a
+    missing shared ref -- so an operator can diagnose without git archaeology.
+    Returns non-zero when a hard problem (corrupt/drifted manifest) is found.
+    """
+    problems = 0
+    print("== harness doctor ==")
+
+    try:
+        repo = git.Repo(search_parent_directories=True)
+        repo_dir = str(repo.working_tree_dir or ".")
+        has_origin = _has_origin(repo)
+    except git.exc.GitError as exc:
+        print(f"  git: ERROR -- not a usable repository: {exc}")
+        return 1
+    print(f"  repo: {repo_dir}")
+    print(f"  origin remote: {'yes' if has_origin else 'no'}")
+    print(f"  minimal mode (shared-ref off): {'yes' if _minimal_mode() else 'no'}")
+
+    print("-- contract manifest --")
+    manifest_problems = contract_manifest.verify()
+    if manifest_problems:
+        problems += 1
+        for p in manifest_problems:
+            print(f"  PROBLEM: {p}")
+    else:
+        print("  OK: contracts.lock matches every declared contract.")
+
+    print("-- leases --")
+    leases_dir = leases.LEASES_DIR
+    found = False
+    if os.path.isdir(leases_dir):
+        for name in sorted(os.listdir(leases_dir)):
+            if not name.endswith(".json"):
+                continue
+            found = True
+            task_id = name[: -len(".json")]
+            lease = leases.read_lease(task_id)
+            if lease is None:
+                problems += 1
+                print(f"  PROBLEM: {name} is unreadable/corrupt.")
+                continue
+            state = "ACTIVE" if leases.is_active(lease) else "expired (reclaimable)"
+            print(
+                f"  {task_id}: {state} -- agent={lease.get('agent_id')} "
+                f"branch={lease.get('branch')} created={lease.get('created_at')}"
+            )
+    if not found:
+        print("  (no local leases)")
+
+    print("-- handover journals (unresolved) --")
+    try:
+        ledger = _load_ledger()
+        task_ids = list((ledger.get("tasks") or {}).keys())
+    except SystemExit:
+        task_ids = []
+    any_unresolved = False
+    for task_id in task_ids:
+        entry = journal.latest_unresolved(task_id)
+        if entry is not None:
+            any_unresolved = True
+            print(
+                f"  {task_id}: unresolved ({entry.get('outcome')}) on "
+                f"'{entry.get('branch')}' at {entry.get('finished_at')}"
+            )
+    if not any_unresolved:
+        print("  (none)")
+
+    print("-- shared state ref --")
+    if not has_origin:
+        print("  (no origin remote; shared-ref coordination inactive)")
+    elif _minimal_mode():
+        print("  (minimal mode; shared-ref coordination disabled)")
+    else:
+        files = state_sync.list_files(repo_dir, journal.JOURNAL_DIR)
+        if files:
+            print(f"  ref '{state_sync.STATE_REF}' carries {len(files)} journal file(s).")
+        else:
+            print(f"  ref '{state_sync.STATE_REF}' is empty or does not resolve.")
+
+    print("-- project readme --")
+    if _readme_has_sentinel(os.path.join(repo_dir, "README.md")):
+        print(
+            "  WARNING: README.md is still the harness template. Replace it with "
+            "your project's README (or run 'python -m harness --init') before starting."
+        )
+    else:
+        print("  OK: root README is project-owned (no template sentinel).")
+
+    print("== doctor complete ==")
+    return 1 if problems else 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -763,11 +1145,35 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Plan only: compute branch/staging, never commit or push.",
     )
+    parser.add_argument(
+        "--doctor",
+        action="store_true",
+        help="Print a health report of leases, manifest, journals, and shared ref, then exit.",
+    )
+    parser.add_argument(
+        "--init",
+        action="store_true",
+        help="Prime a fresh project: replace the template README and seed AGENTS.md, then exit.",
+    )
+    parser.add_argument(
+        "--example",
+        action="store_true",
+        help="With --init, seed the bundled example ledger instead of an empty skeleton.",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="With --init, overwrite existing AGENTS.md / project README.",
+    )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.init:
+        return init(from_example=args.example, force=args.force)
+    if args.doctor:
+        return doctor()
     if not args.task:
         print("ERROR: no task specified (use --task or set AGENT_TASK_ID).")
         return 2
