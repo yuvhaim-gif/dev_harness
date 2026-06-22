@@ -7,3 +7,5 @@ __pycache__/
 .pytest_cache/
 .harness/telemetry/
 .harness/logs/
+build/
+*.egg-info/

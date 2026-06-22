@@ -50,9 +50,9 @@ flowchart TD
 | State | What it does |
 |-------|--------------|
 | **Initialize** | Open the repo, refuse a dirty tree, pull only if a tracking `origin` exists, parse `AGENTS.md`, reject an unsupported `schema_version`, generate / reuse an `AGENT_ID`, and recover the latest unresolved handover journal (locally and from the shared state ref). |
-| **Isolate** | Record the current branch, compute a colon-free work-branch name, validate it with `git check-ref-format`, verify declared paths exist, create the branch, and **acquire a TTL'd lease** for the task (locally and on the shared state ref). A live lease held by a different agent aborts the run. |
-| **Mutate** | Dispatch on `mutation_mode` (`evolve` / `isolated`) and invoke `AGENT_LLM_CMD` — a provider-agnostic shell command — with the task context and allowlist exported as environment variables. The command string is first scanned by the command guard: git bypass flags (`--no-verify` / `-n`) are **stripped**, and unstrippable hook-evasion patterns (`core.hooksPath`, plumbing such as `commit-tree`/`update-ref`) are **flagged** and penalised. The git environment is also hardened (`GIT_CONFIG_NOSYSTEM`, dropped `GIT_CONFIG_GLOBAL`). After the run the per-step token/cost payload is read and accumulated. A no-op when `AGENT_LLM_CMD` is unset (the seam is honest about being inactive). |
-| **Enforce** | Stage **only** the task's allowlist (POSIX-normalized), commit with `AGENT_TASK_ID` set so the lock / contract-binding hooks gate it, then classify the result as `passed` / `mechanical` / `semantic`. Every attempt is appended to the journal. After each step the **token/cost budget** is checked; a breach triggers an immediate financial abort (forensic report + hard rollback + exit 3). |
+| **Isolate** | Record the current branch, compute a colon-free work-branch name, validate it with `git check-ref-format`, verify declared paths exist, then **acquire a TTL'd lease** for the task (locally and on the shared state ref) **before** creating the branch — so a lost race never leaves an orphan work branch — and only then create it. A live lease held by a different agent aborts the run. |
+| **Mutate** | Dispatch on `mutation_mode` (`evolve` / `isolated`) and invoke `AGENT_LLM_CMD` — a provider-agnostic shell command — with the task context and allowlist exported as environment variables. The subprocess environment is **scoped by `AGENT_ENV_ALLOWLIST`** (comma/newline-separated names); when it is unset the seam falls back to a full copy of the parent environment and logs a one-time warning, and the active scope is recorded as an `env_scope` (`allowlisted` / `full_copy`) audit field in the forensic report and `--doctor`. The command string is then scanned by the command guard: git bypass flags (`--no-verify` / `-n`) are **stripped**, and unstrippable hook-evasion patterns (`core.hooksPath`, plumbing such as `commit-tree`/`update-ref`) are **flagged**; each guard hit charges a separate `guard_penalties` budget (its own exit-4 ceiling), not the autorepair counter. The git environment is also hardened (`GIT_CONFIG_NOSYSTEM`, dropped `GIT_CONFIG_GLOBAL`). After the run the per-step token/cost payload is read and accumulated. A no-op when `AGENT_LLM_CMD` is unset (the seam is honest about being inactive). |
+| **Enforce** | Stage **only** the task's allowlist (POSIX-normalized), commit with `AGENT_TASK_ID` set so the lock / contract-binding hooks gate it, then classify the result as `passed` / `mechanical` / `semantic`. Every attempt is appended to the journal. After each step the **token/cost budget** is checked; a breach triggers an immediate financial abort (forensic report + hard rollback + exit 3). The same checkpoint enforces **time ceilings** — a per-step `AGENT_STEP_TIMEOUT_SECONDS` and a wall-clock `MAX_RUN_SECONDS` — which also exit 3 but stamp a *timeout* reason distinct from a financial/budget abort. |
 | **Autorepair** | On a semantic failure, **condense** the hook log to its load-bearing assertions and build a **cache-ordered** repair prompt (static rules → task contracts → dynamic diff/log/ledger), fed to the LLM via `AGENT_REPAIR_LOG` / `AGENT_REPAIR_PROMPT_FILE`. When `max_autorepair_attempts` is exceeded, journal `escalated`, write a forensic report, **roll back** to the original branch, release the lease, and exit non-zero. |
 | **Reconcile** | Run the optimistic **staleness guard** against `AGENT_SHARED_REF` (default `origin/main`); if any critical file moved since the base commit, journal `stale`, refuse the push, and exit 1. Otherwise push (when `origin` exists), open a PR via `gh` if available (or print the exact manual command), release the lease, and journal `pushed` / `local`. |
 
@@ -119,7 +119,7 @@ dev_process/
     │       └── test_queries.py        # N+1 vs. batched behaviour tests
     └── tests/                         # FRAMEWORK SELF-TESTS
         ├── test_contracts.py          # Asserts contracts.lock matches every contract
-        ├── test_harness.py            # F2–F15: framework self-tests (incl. --init/doctor)
+        ├── test_harness.py            # F2–F18: framework self-tests (incl. --init/doctor, drive machine, packaging)
         └── test_hardening.py          # Telemetry, condenser, prompt, guard, forensic, override
 ```
 
@@ -253,9 +253,11 @@ context:
 
 - **Leases** (`harness/leases.py`) — Isolate writes
   `.harness/leases/<task_id>.json` with the owning `agent_id`, branch, base
-  commit, declared targets, and a 3600s TTL. A second agent that finds a live
-  lease held by someone else aborts cleanly; an expired lease may be
-  reclaimed. Reconcile (and rollback) releases the lease.
+  commit, declared targets, and a 3600s TTL. The file is written **atomically**
+  (a sibling temp file `os.replace`d into place), so a crash mid-write never
+  leaves a half-written lease. A second agent that finds a live lease held by
+  someone else aborts cleanly; an expired lease may be reclaimed. Reconcile (and
+  rollback) releases the lease.
 - **Handover journal** (`harness/journal.py`) — every session writes an
   append-only JSON record to `.harness/journal/` containing each attempt's
   state, status, and hook-log excerpt, plus a terminal outcome
@@ -313,11 +315,17 @@ context to it so the model can edit only permitted files:
 | `AGENT_TOKEN_USAGE_FILE`  | Path the command should write its per-step token/cost JSON payload to, for the budget ledger. |
 
 When `AGENT_LLM_CMD` is unset the seam is a no-op and logs that fact —
-useful for dry runs and for the framework's own tests. Before every invocation
-the command string is run through the **escape-hatch guard**
-(`harness/command_guard.py`): any `--no-verify` / `-n` appended to a
-`git commit` / `git push` segment is stripped, the run continues with the
-sanitized command, and the agent's repair counter takes a penalty.
+useful for dry runs and for the framework's own tests. The subprocess
+environment is scoped by **`AGENT_ENV_ALLOWLIST`** (comma/newline-separated
+names); unset means a full copy of the parent environment plus a one-time
+warning, and the resulting `env_scope` (`allowlisted` / `full_copy`) is surfaced
+in the forensic report and `--doctor`. Before every invocation the command
+string is run through the **escape-hatch guard** (`harness/command_guard.py`):
+any `--no-verify` / `-n` appended to a `git commit` / `git push` segment is
+stripped, the run continues with the sanitized command, and a **separate
+`guard_penalties` counter** takes a penalty — it has its own exit-4 ceiling and
+leaves the autorepair budget untouched, so a tamper-once agent keeps its full
+repair allowance while a persistent escape attempt is still contained.
 
 The guard is explicitly **not a security boundary**. Stripping two literal flags
 only raises the cost of an *accidental* bypass; a determined agent can still skip
@@ -378,9 +386,14 @@ configured ceiling is breached the run performs an **immediate financial abort**
 | `AGENT_COST_PER_1K_INPUT` | Per-1K input-token price used to derive cost when a payload omits it. |
 | `AGENT_COST_PER_1K_OUTPUT`| Per-1K output-token price used to derive cost when a payload omits it. |
 | `AGENT_TOKEN_USAGE_FILE`  | Override the default `.harness/telemetry/usage.json` sink path. |
+| `AGENT_STEP_TIMEOUT_SECONDS` | Per-step ceiling on a single `AGENT_LLM_CMD` invocation; an overrun aborts with a *timeout* reason and **exit 3**. |
+| `MAX_RUN_SECONDS`         | Wall-clock ceiling on the whole run; an overrun aborts with a *timeout* reason and **exit 3**. |
 
-Everything degrades gracefully: a missing file, malformed JSON, or unset budgets
-yields zero usage and no abort, so dry runs and tests stay green.
+The same circuit-breaker also enforces the two **time** ceilings above; a
+timeout shares the financial abort's exit code (3) but stamps a distinct
+*timeout* reason in the forensic report. Everything degrades gracefully: a
+missing file, malformed JSON, or unset budgets/timeouts yields zero usage and no
+abort, so dry runs and tests stay green.
 
 ### Context truncation & error condensation
 
@@ -553,7 +566,11 @@ python -m harness --init
 ## Running the orchestrator
 
 The framework is invoked as a module — `python -m harness` — which works both
-in-place and once installed (`pip install .`).
+in-place and once installed (`pip install .`). An install also exposes console
+entry points — `agent-harness` (the orchestrator) and `agent-ci-enforce` (the
+server-side re-check) — so `agent-harness --task …` is equivalent to
+`python -m harness --task …`. The pre-commit hooks still invoke the modules by
+path (`python harness/…`), so both invocation styles stay valid.
 
 ```bash
 # Prime a fresh project (replace template README, seed empty AGENTS.md)
@@ -582,6 +599,11 @@ CLI:
 | `--example`   | With `--init`, seed the bundled example ledger (`harness/example/AGENTS.example.md`) instead of an empty skeleton. |
 | `--force`     | With `--init`, overwrite an existing `AGENTS.md` / project `README.md`. |
 | `--doctor`    | Print a one-pass [health report](#diagnostics---doctor) (manifest, leases, journals, shared ref, minimal mode, README sentinel) and exit; non-zero when a hard problem is found. |
+| `--version`   | Print the harness version and exit. |
+| `--list`      | List the tasks declared in `AGENTS.md` (id, mutation mode, target count) and exit. |
+| `--report-json` | Print a JSON telemetry/outcome summary of the latest run (`version`, `task_id`, `outcome`, `branch`, `finished_at`, `total_tokens`, `cost_usd`) and exit. |
+| `--release <id>` | Operator escape hatch: force-release a stranded lease for `<id>` (local + shared ref) and exit; prompts for confirmation unless `--yes`. |
+| `--yes`       | Skip the confirmation prompt (used with `--release`). |
 
 Exit codes:
 
@@ -590,8 +612,8 @@ Exit codes:
 | `0` | Success. |
 | `1` | Failure (e.g. autorepair cap exceeded, or a stale push refused); the tree is rolled back. |
 | `2` | No task specified. |
-| `3` | **Financial abort** — a token/cost budget was breached; the tree is rolled back and a forensic report is written. |
-| `4` | **Containment breach** — the agent committed outside its allowlist or made an out-of-band (hook-bypassed) commit; the tree is rolled back and a forensic report is written. |
+| `3` | **Financial or time abort** — a token/cost budget was breached, or a step (`AGENT_STEP_TIMEOUT_SECONDS`) / wall-clock (`MAX_RUN_SECONDS`) timeout fired; the tree is rolled back and a forensic report (carrying the distinguishing reason) is written. |
+| `4` | **Containment breach** — the agent committed outside its allowlist, made an out-of-band (hook-bypassed) commit, or exhausted the `guard_penalties` ceiling with repeated git-bypass attempts; the tree is rolled back and a forensic report is written. |
 
 Example dry-run output (remote-less repo):
 
@@ -722,24 +744,32 @@ workload's contracts.
   fresh, remote-less repo never crashes.
 - **Honest reconcile** — a PR is opened via `gh` or an exact manual command is
   printed; the framework never falsely claims a PR was created.
-- **Mechanical vs. semantic** — an auto-fixer rewrite ("files were modified by
-  this hook") triggers a single re-stage+retry and does **not** consume an
-  autorepair attempt.
+- **Mechanical vs. semantic** — a failed commit is classified by inspecting
+  whether an auto-fixer **dirtied the worktree** (not by string-matching English
+  hook wording); a mechanical rewrite triggers a single re-stage+retry and does
+  **not** consume an autorepair attempt.
 - **Single source of truth** — `compute_allowlist()` is imported by both the hook
   and the runner to prevent policy drift.
 - **Always-locked** — `AGENTS.md` and `.pre-commit-config.yaml` can never be
   modified by an agent task.
-- **Financial circuit-breaker** — cumulative token and USD budgets are checked
-  after every LLM step; a breach hard-rolls-back and exits 3 before more spend.
+- **Financial & time circuit-breaker** — cumulative token and USD budgets are
+  checked after every LLM step, alongside per-step (`AGENT_STEP_TIMEOUT_SECONDS`)
+  and wall-clock (`MAX_RUN_SECONDS`) time ceilings; a breach hard-rolls-back and
+  exits 3 (with a reason distinguishing a budget breach from a timeout) before
+  more spend.
 - **Lean repair context** — raw tool dumps are condensed to failing assertions
   with a 3-line window, keeping the autorepair loop token-efficient.
 - **Cache-ordered prompts** — repair prompts are assembled static→dynamic to
   maximise provider prompt-cache hits across recursive repairs.
 - **Escape-hatch interception** — `--no-verify` / `-n` on a spawned `git commit`
-  / `git push` are stripped and penalised, and unstrippable hook-evasion
-  (`core.hooksPath`, plumbing) is flagged. This raises the cost of a bypass but
-  is **not** a security boundary; the authoritative defences are the post-hoc
-  containment gate and the server-side CI re-check.
+  / `git push` are stripped and charged to a dedicated `guard_penalties` budget
+  (separate from the autorepair counter, with its own exit-4 ceiling), and
+  unstrippable hook-evasion (`core.hooksPath`, plumbing) is flagged. This raises
+  the cost of a bypass but is **not** a security boundary; the authoritative
+  defences are the post-hoc containment gate and the server-side CI re-check.
+- **Scoped LLM environment** — `AGENT_ENV_ALLOWLIST` restricts which parent env
+  vars reach the seam; unset means a full copy plus a one-time warning, and the
+  active `env_scope` is surfaced in forensics and `--doctor`.
 - **Post-hoc containment gate** — after mutation the orchestrator inspects
   committed history (`base..HEAD`); any out-of-allowlist or out-of-band
   (hook-bypassed) commit triggers a forensic rollback and **exit 4**, so a

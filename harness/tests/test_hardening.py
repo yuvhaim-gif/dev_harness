@@ -22,8 +22,10 @@ BINDING_HOOK = REPO_ROOT / "harness" / "enforce_contract_binding.py"
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "harness"))
 
+import agent_runner  # noqa: E402
 import command_guard  # noqa: E402
 import forensic  # noqa: E402
+import git  # noqa: E402
 import log_condenser  # noqa: E402
 import prompt_builder  # noqa: E402
 import telemetry  # noqa: E402
@@ -393,3 +395,263 @@ def test_h8_out_of_band_commit_is_contained(seeded_repo: Path) -> None:
     assert branch == "main"
     status = _git(seeded_repo, "status", "--porcelain", "-uno").stdout.strip()
     assert status == "", f"tracked files not clean after rollback: {status}"
+
+
+# --------------------------------------------------------------------------- #
+# H9. Rollback removes agent-created untracked files (T01)
+# --------------------------------------------------------------------------- #
+# A containment abort must leave the original branch pristine, including the
+# stray untracked file the LLM created but never staged. The sample workload
+# lives under ``harness/example/``, so the old literal ``example`` pathspec
+# matched nothing and the file survived rollback.
+_STRAY_LLM = (
+    "import subprocess\n"
+    "open('stray.py', 'w').write('x = 1\\n')\n"
+    "open('escaped.py', 'w').write('x = 1\\n')\n"
+    "subprocess.run(['git', 'add', 'escaped.py'])\n"
+    "subprocess.run(['git', '-c', 'core.hooksPath=.', 'commit', '-m', 'out of band'])\n"
+)
+
+
+def test_h9_rollback_removes_agent_untracked_files(seeded_repo: Path) -> None:
+    (seeded_repo / "stray_llm.py").write_text(_STRAY_LLM, encoding="utf-8")
+    # Commit the driver so the only untracked file at assert time is the one
+    # the LLM creates -- which rollback must remove.
+    _git(seeded_repo, "add", "stray_llm.py")
+    _git(seeded_repo, "commit", "-m", "add driver")
+
+    env = os.environ.copy()
+    env.pop("SKIP_AGENT_HARNESS", None)
+    env["AGENT_ID"] = "agent-test"
+    env["AGENT_LLM_CMD"] = f'"{sys.executable}" stray_llm.py'
+
+    res = subprocess.run(
+        [sys.executable, str(RUNNER), "--task", "optimise_query_layer"],
+        cwd=str(seeded_repo),
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert res.returncode == 4, res.stdout + res.stderr  # CONTAINMENT_ABORT_EXIT
+
+    # The agent-created untracked file is gone, and nothing outside the
+    # harness's own coordination state (.harness/ -- forensic + journals) is
+    # left dirty back on the original branch.
+    assert not (seeded_repo / "stray.py").exists()
+    branch = _git(seeded_repo, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+    assert branch == "main"
+    entries = _git(seeded_repo, "status", "--porcelain").stdout.splitlines()
+    leftover = [line for line in entries if ".harness/" not in line]
+    assert leftover == [], f"tree not clean after rollback: {leftover}"
+
+
+# --------------------------------------------------------------------------- #
+# H10. Commit classification keys off worktree state, not hook wording (T03)
+# --------------------------------------------------------------------------- #
+class _FakeCommit:
+    """Stand-in for a blocked `git commit` subprocess result."""
+
+    returncode = 1
+    stdout = ""
+    stderr = "a hook rejected the commit (wording the harness must NOT parse)"
+
+
+def _enforce_ctx(repo_path: Path) -> agent_runner.RunContext:
+    repo = git.Repo(str(repo_path))
+    repo.git.checkout("-b", "agent/optimise_query_layer/test")
+    task = agent_runner._parse_task("optimise_query_layer")
+    return agent_runner.RunContext(
+        repo=repo,
+        task=task,
+        dry_run=False,
+        agent_id="a",
+        base_commit=repo.head.commit.hexsha,
+    )
+
+
+def test_h10a_dirty_worktree_after_block_is_mechanical(
+    seeded_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(seeded_repo)
+    ctx = _enforce_ctx(seeded_repo)
+    # An auto-fixer-style change left in the worktree: a blocked commit that
+    # dirtied the tree must be classified mechanical regardless of hook wording.
+    (seeded_repo / "harness" / "example" / "src" / "db" / "queries.py").write_text(
+        "# q\nx = 1\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(agent_runner.subprocess, "run", lambda *a, **k: _FakeCommit())
+    status, _ = agent_runner.enforce(ctx)
+    assert status == "mechanical"
+
+
+def test_h10b_clean_worktree_after_block_is_semantic(
+    seeded_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(seeded_repo)
+    ctx = _enforce_ctx(seeded_repo)
+    # Nothing changed on disk: a blocked commit that left the tree as staged is
+    # a genuine semantic/lock rejection.
+    monkeypatch.setattr(agent_runner.subprocess, "run", lambda *a, **k: _FakeCommit())
+    status, _ = agent_runner.enforce(ctx)
+    assert status == "semantic"
+
+
+# --------------------------------------------------------------------------- #
+# H11. LLM seam env scoping + exposure visibility (T05)
+# --------------------------------------------------------------------------- #
+def test_h11a_allowlist_scopes_seam_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AGENT_ENV_ALLOWLIST", "FOO, BAR")
+    monkeypatch.setenv("FOO", "1")
+    monkeypatch.setenv("BAR", "2")
+    monkeypatch.setenv("SECRET", "leak")
+    monkeypatch.setenv("AGENT_CUSTOM", "kept")  # AGENT_* keys carry through
+
+    env = agent_runner._seam_base_env()
+    assert env.get("FOO") == "1"
+    assert env.get("BAR") == "2"
+    assert env.get("AGENT_CUSTOM") == "kept"
+    assert "SECRET" not in env
+
+
+def test_h11b_no_allowlist_is_full_copy(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("AGENT_ENV_ALLOWLIST", raising=False)
+    monkeypatch.setenv("SECRET", "inherited")
+    env = agent_runner._seam_base_env()
+    assert env.get("SECRET") == "inherited"  # default behaviour unchanged
+
+
+def test_h11c_missing_allowlist_warns_once_and_reports_full_copy(seeded_repo: Path) -> None:
+    (seeded_repo / "fake_llm.py").write_text(_FAKE_LLM, encoding="utf-8")
+
+    env = os.environ.copy()
+    env.pop("SKIP_AGENT_HARNESS", None)
+    env.pop("AGENT_ENV_ALLOWLIST", None)
+    env["AGENT_ID"] = "agent-test"
+    env["AGENT_LLM_CMD"] = f'"{sys.executable}" fake_llm.py'
+    env["MAX_TOTAL_TOKENS"] = "10"
+
+    res = subprocess.run(
+        [sys.executable, str(RUNNER), "--task", "optimise_query_layer"],
+        cwd=str(seeded_repo),
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    combined = res.stdout + res.stderr
+    assert res.returncode == 3, combined
+    # The exposure is surfaced exactly once at the seam.
+    assert combined.count("AGENT_ENV_ALLOWLIST not set") == 1
+
+    body = (seeded_repo / ".harness" / "logs" / "FAILED_AGENT_RUN.md").read_text(encoding="utf-8")
+    assert "`full_copy`" in body  # forensic env_scope audit field
+    assert "AGENT_ENV_ALLOWLIST not set" in body  # recorded as a git warning
+
+
+def test_h11d_doctor_reports_env_scope(seeded_repo: Path) -> None:
+    env = os.environ.copy()
+    env["AGENT_ENV_ALLOWLIST"] = "FOO"
+    scoped = subprocess.run(
+        [sys.executable, str(RUNNER), "--doctor"],
+        cwd=str(seeded_repo),
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert "env_scope=allowlisted" in scoped.stdout
+
+    env.pop("AGENT_ENV_ALLOWLIST", None)
+    unscoped = subprocess.run(
+        [sys.executable, str(RUNNER), "--doctor"],
+        cwd=str(seeded_repo),
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert "env_scope=full_copy" in unscoped.stdout
+
+
+# --------------------------------------------------------------------------- #
+# H12. Step timeout aborts with a timeout reason distinct from a budget abort (T08)
+# --------------------------------------------------------------------------- #
+# Sleeps well past AGENT_STEP_TIMEOUT_SECONDS so the per-step timeout always
+# fires first. Kept short because, with captured output, the orphaned child
+# holds the pipe until it exits on its own.
+_SLEEP_LLM = "import time\ntime.sleep(5)\n"
+
+
+def test_h12_step_timeout_aborts_distinct_from_financial(seeded_repo: Path) -> None:
+    (seeded_repo / "sleep_llm.py").write_text(_SLEEP_LLM, encoding="utf-8")
+
+    env = os.environ.copy()
+    env.pop("SKIP_AGENT_HARNESS", None)
+    env["AGENT_ID"] = "agent-test"
+    env["AGENT_LLM_CMD"] = f'"{sys.executable}" sleep_llm.py'
+    env["AGENT_STEP_TIMEOUT_SECONDS"] = "1"
+
+    res = subprocess.run(
+        [sys.executable, str(RUNNER), "--task", "optimise_query_layer"],
+        cwd=str(seeded_repo),
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    combined = res.stdout + res.stderr
+    assert res.returncode == 3, combined  # BUDGET_ABORT_EXIT family, but a timeout
+    assert "TIMEOUT ABORT" in combined
+    assert "FINANCIAL ABORT" not in combined
+
+    body = (seeded_repo / ".harness" / "logs" / "FAILED_AGENT_RUN.md").read_text(encoding="utf-8")
+    assert "step timeout" in body.lower()
+    assert "financial abort" not in body.lower()
+
+    # Safely contained: back on main with a clean tracked tree.
+    branch = _git(seeded_repo, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+    assert branch == "main"
+
+
+# --------------------------------------------------------------------------- #
+# H13. Guard penalties have their own budget, separate from autorepair (T10)
+# --------------------------------------------------------------------------- #
+def test_h13a_guard_penalty_does_not_charge_autorepair(
+    seeded_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(seeded_repo)
+    ctx = _enforce_ctx(seeded_repo)
+    # A git bypass flag on a commit/push must charge guard_penalties, not the
+    # legitimate autorepair budget. The flag is stripped, so the sanitized
+    # `git commit -m noop` is a harmless no-op on the clean fixture tree.
+    monkeypatch.setenv("AGENT_LLM_CMD", "git commit --no-verify -m noop")
+    agent_runner._run_llm(ctx, "mutate")
+    assert ctx.guard_penalties == 1
+    assert ctx.autorepair_attempts == 0
+
+
+# A no-op LLM keeps the tree unchanged, so enforce finds nothing to commit and
+# the loop keeps cycling -- charging a fresh guard penalty each mutate/autorepair
+# until the guard ceiling is crossed.
+_NOOP_LLM = "x = 0\n"
+
+
+def test_h13b_guard_ceiling_exits_four_with_bypass_reason(seeded_repo: Path) -> None:
+    (seeded_repo / "noop_llm.py").write_text(_NOOP_LLM, encoding="utf-8")
+
+    env = os.environ.copy()
+    env.pop("SKIP_AGENT_HARNESS", None)
+    env["AGENT_ID"] = "agent-test"
+    env["AGENT_LLM_CMD"] = f'"{sys.executable}" noop_llm.py && git commit --no-verify -m noop'
+
+    res = subprocess.run(
+        [sys.executable, str(RUNNER), "--task", "optimise_query_layer"],
+        cwd=str(seeded_repo),
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    combined = res.stdout + res.stderr
+    assert res.returncode == 4, combined  # CONTAINMENT_ABORT_EXIT, not the budget family
+    assert "GUARD ABORT" in combined
+
+    body = (seeded_repo / ".harness" / "logs" / "FAILED_AGENT_RUN.md").read_text(encoding="utf-8")
+    assert "git-bypass" in body.lower()
+    assert "financial abort" not in body.lower()
+    assert "autorepair cap" not in body.lower()

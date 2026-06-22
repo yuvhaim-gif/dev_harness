@@ -21,6 +21,10 @@ dev = [
     "pytest",
 ]
 
+[project.scripts]
+agent-harness = "harness.agent_runner:main"
+agent-ci-enforce = "harness.ci_enforce:main"
+
 [tool.setuptools]
 packages = ["harness"]
 
@@ -37,7 +41,7 @@ mypy_path = ["harness", "harness/example/src/billing", "harness/example/src/db"]
 explicit_package_bases = true
 namespace_packages = true
 warn_unused_ignores = false
-exclude = ["harness/tests/", "harness/example/"]
+exclude = ["harness/tests/", "harness/example/", "harness/__init__.py", "harness/__main__.py"]
 
 [[tool.mypy.overrides]]
 module = ["git", "git.*"]

@@ -12,12 +12,14 @@ part this framework hardens.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import subprocess
 import sys
+import time
 import uuid
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
@@ -48,6 +50,8 @@ REPAIR_PROMPT_FILE = ".harness/telemetry/repair_prompt.txt"
 BUDGET_ABORT_EXIT = 3
 CONTAINMENT_ABORT_EXIT = 4
 
+VERSION = "0.1.0"
+
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 
 # Marker stamped into the template README the harness ships at the repo root.
@@ -75,6 +79,16 @@ python -m harness --task <task_id>
 
 def _env_flag(name: str) -> bool:
     return (os.getenv(name) or "").strip().lower() in _TRUTHY
+
+
+def _env_float(name: str) -> float | None:
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        return None
 
 
 def _minimal_mode() -> bool:
@@ -122,6 +136,7 @@ class RunContext:
     original_branch: str = ""
     work_branch: str = ""
     autorepair_attempts: int = 0
+    guard_penalties: int = 0
     last_hook_log: str = ""
     branch_created: bool = field(default=False)
     lease_acquired: bool = field(default=False)
@@ -132,6 +147,10 @@ class RunContext:
     rollback_ok: bool = False
     forensic_written: bool = False
     runner_commits: set[str] = field(default_factory=set)
+    baseline_untracked: frozenset[str] = frozenset()
+    env_warned: bool = False
+    start_time: float = 0.0
+    timed_out: str = ""
 
 
 # --------------------------------------------------------------------------- #
@@ -273,7 +292,10 @@ def initialize(args: argparse.Namespace) -> RunContext:
 
     if tracking is not None and _has_origin(repo):
         log("tracking remote detected; pulling from origin...")
-        repo.remotes.origin.pull()
+        try:
+            repo.remotes.origin.pull()
+        except git.exc.GitCommandError as exc:
+            log(f"WARNING: pull from origin failed; continuing on local state: {exc}")
     else:
         log("no tracking remote configured; skipping pull.")
 
@@ -290,7 +312,14 @@ def initialize(args: argparse.Namespace) -> RunContext:
         dry_run=bool(args.dry_run),
         agent_id=agent_id,
         base_commit=base_commit,
+        start_time=time.monotonic(),
     )
+
+    try:
+        listed = repo.git.ls_files("--others", "--exclude-standard")
+        ctx.baseline_untracked = frozenset(p for p in listed.splitlines() if p)
+    except git.exc.GitCommandError:
+        ctx.baseline_untracked = frozenset()
 
     _recover_handover(ctx)
 
@@ -301,11 +330,13 @@ def initialize(args: argparse.Namespace) -> RunContext:
 # --------------------------------------------------------------------------- #
 # E3. State 2 — Isolate
 # --------------------------------------------------------------------------- #
-def compute_branch_name(task_id: str, now: datetime | None = None) -> str:
+def compute_branch_name(task_id: str, now: datetime | None = None, unique: bool = False) -> str:
     moment = now or datetime.now(UTC)
     # NOTE: strftime form is colon-free; isoformat() emits ':' and '+',
     # which git check-ref-format rejects.
     stamp = moment.strftime("%Y%m%dT%H%M%SZ")
+    if unique:
+        stamp = f"{stamp}-{uuid.uuid4().hex[:6]}"
     return f"agent/{task_id}/{stamp}"
 
 
@@ -347,11 +378,31 @@ def _harden_git_env(env: dict[str, str]) -> None:
     env.pop("GIT_CONFIG_GLOBAL", None)
 
 
+def _seam_base_env() -> dict[str, str]:
+    """Base environment for the LLM subprocess.
+
+    Default (no AGENT_ENV_ALLOWLIST) is a full copy, preserving setups that rely
+    on inherited vars. When AGENT_ENV_ALLOWLIST is set (comma/newline-separated
+    var names), start from only those vars plus the AGENT_*/GIT_* keys the
+    harness manages, so the seam no longer inherits every secret in the parent
+    environment. _harden_git_env still runs last in _llm_env.
+    """
+    raw = os.getenv("AGENT_ENV_ALLOWLIST")
+    if not raw:
+        return os.environ.copy()
+    names = {n.strip() for n in raw.replace(",", "\n").splitlines() if n.strip()}
+    return {
+        k: v
+        for k, v in os.environ.items()
+        if k in names or k.startswith("AGENT_") or k.startswith("GIT_")
+    }
+
+
 def _llm_env(
     ctx: RunContext, phase: str, repair_log: str = "", prompt_file: str = ""
 ) -> dict[str, str]:
     allow = sorted(compute_allowlist(ctx.task.raw))
-    env = os.environ.copy()
+    env = _seam_base_env()
     _harden_git_env(env)
     env.update(
         {
@@ -390,24 +441,33 @@ def _run_llm(ctx: RunContext, phase: str, repair_log: str = "", prompt_file: str
         log(f"[{phase}] no AGENT_LLM_CMD set; LLM seam is a no-op.")
         return False
 
+    if not os.getenv("AGENT_ENV_ALLOWLIST") and not ctx.env_warned:
+        warning = (
+            "AGENT_ENV_ALLOWLIST not set -- the LLM subprocess inherits the FULL "
+            "parent environment, including any secrets. Set AGENT_ENV_ALLOWLIST to scope it."
+        )
+        log(f"[{phase}] WARNING: {warning}")
+        ctx.git_warnings.append(warning)
+        ctx.env_warned = True
+
     guard = command_guard.sanitize_command(cmd)
     if guard.tampered:
         warning = (
             f"escape-hatch attempt in AGENT_LLM_CMD: stripped {guard.stripped} "
-            f"(git bypass flags). Penalising repair counter."
+            f"(git bypass flags). Charging the guard-penalty counter."
         )
         log(f"[{phase}] PENALTY: {warning}")
         ctx.git_warnings.append(warning)
-        ctx.autorepair_attempts += 1
+        ctx.guard_penalties += 1
     if guard.suspicious:
         warning = (
             f"hook-evasion pattern in AGENT_LLM_CMD: {guard.flagged}. These cannot "
             "be stripped from an arbitrary shell command; the post-hoc containment "
-            "gate and CI re-check are the backstop. Penalising repair counter."
+            "gate and CI re-check are the backstop. Charging the guard-penalty counter."
         )
         log(f"[{phase}] PENALTY: {warning}")
         ctx.git_warnings.append(warning)
-        ctx.autorepair_attempts += 1
+        ctx.guard_penalties += 1
     run_cmd = guard.sanitized
 
     usage_path = telemetry.usage_file_path()
@@ -415,9 +475,28 @@ def _run_llm(ctx: RunContext, phase: str, repair_log: str = "", prompt_file: str
     telemetry.clear_usage_file(usage_path)
 
     log(f"[{phase}] invoking AGENT_LLM_CMD (provider-agnostic seam).")
-    res = subprocess.run(run_cmd, shell=True, env=_llm_env(ctx, phase, repair_log, prompt_file))
+    step_timeout = _env_float("AGENT_STEP_TIMEOUT_SECONDS")
+    try:
+        res = subprocess.run(
+            run_cmd,
+            shell=True,
+            env=_llm_env(ctx, phase, repair_log, prompt_file),
+            timeout=step_timeout,
+        )
+    except subprocess.TimeoutExpired:
+        ctx.timed_out = "step timeout (AGENT_STEP_TIMEOUT_SECONDS)"
+        log(
+            f"[{phase}] WARNING: AGENT_LLM_CMD exceeded AGENT_STEP_TIMEOUT_SECONDS; "
+            "treating as a failed step."
+        )
+        return True
     if res.returncode != 0:
         log(f"[{phase}] WARNING: AGENT_LLM_CMD exited {res.returncode}.")
+
+    # Wall-clock ceiling spanning every step of the run, not just this one.
+    max_run = _env_float("MAX_RUN_SECONDS")
+    if max_run is not None and (time.monotonic() - ctx.start_time) > max_run:
+        ctx.timed_out = "wall-clock timeout (MAX_RUN_SECONDS)"
 
     step = ctx.ledger.record_from_file(phase, usage_path)
     if step is not None:
@@ -429,7 +508,9 @@ def isolate(ctx: RunContext) -> None:
     repo = ctx.repo
     ctx.original_branch = repo.active_branch.name
 
-    name = compute_branch_name(ctx.task.task_id)
+    # The branch name is pure to compute, so resolve and validate it before any
+    # side effect. The uuid suffix keeps two same-second agents from colliding.
+    name = compute_branch_name(ctx.task.task_id, unique=True)
     # Defensive pre-flight: raises GitCommandError on an invalid ref name.
     repo.git.check_ref_format("--branch", name)
     ctx.work_branch = name
@@ -444,10 +525,10 @@ def isolate(ctx: RunContext) -> None:
         log(f"[dry-run] computed work branch '{name}' (not created).")
         return
 
-    repo.git.checkout("-b", name)
-    ctx.branch_created = True
-    log(f"created and checked out work branch '{name}'.")
-
+    # Lease gate FIRST: acquire the lease before `checkout -b` so a lost race
+    # never creates an orphan work branch. Nothing branch-side has happened yet,
+    # so an abort here needs no rollback. The uuid suffix above is
+    # defense-in-depth on top of this ordering, not a substitute for it.
     if _state_enabled(ctx):
         shared_lease_path = _posix(leases.lease_path(ctx.task.task_id))
         remote_lease = state_sync.read_json(_repo_dir(ctx), shared_lease_path)
@@ -456,7 +537,6 @@ def isolate(ctx: RunContext) -> None:
             and leases.is_active(remote_lease)
             and remote_lease.get("agent_id") != ctx.agent_id
         ):
-            _rollback(ctx)
             raise SystemExit(
                 f"ERROR: task '{ctx.task.task_id}' is leased (shared ref) by "
                 f"'{remote_lease.get('agent_id')}' on '{remote_lease.get('branch')}' "
@@ -472,13 +552,19 @@ def isolate(ctx: RunContext) -> None:
         targets=ctx.task.targets,
     )
     if not ok and holder is not None:
-        _rollback(ctx)
         raise SystemExit(
             f"ERROR: task '{ctx.task.task_id}' is leased by "
             f"'{holder.get('agent_id')}' on '{holder.get('branch')}' "
             f"(created {holder.get('created_at')}). Back off or wait for it to expire."
         )
     ctx.lease_acquired = True
+
+    # Only now create the branch; the untracked lease file (written by acquire
+    # while still on the original branch) is carried into it by `checkout -b`.
+    repo.git.checkout("-b", name)
+    ctx.branch_created = True
+    log(f"created and checked out work branch '{name}'.")
+
     lease_path = leases.lease_path(ctx.task.task_id)
     _commit_coordination(ctx, lease_path, "claim lease")
     if _state_enabled(ctx):
@@ -526,6 +612,16 @@ def _staging_set(task: TaskSpec) -> list[str]:
     return [p for p in posix if os.path.exists(p)]
 
 
+def _worktree_dirty(ctx: RunContext) -> bool:
+    # Decide mechanical-vs-semantic by inspecting the worktree, not by parsing
+    # English hook wording. If an earlier auto-fixer dirties the tree on the
+    # same attempt a later hook blocks for a semantic reason, this misclassifies
+    # that one attempt as mechanical; the wasted retry does not consume an
+    # autorepair attempt and self-corrects next pass once the tree is clean.
+    # That trade-off is deliberate -- do not "fix" it back to substring matching.
+    return bool(ctx.repo.git.status("--porcelain").strip())
+
+
 def enforce(ctx: RunContext) -> tuple[str, str]:
     staging = _staging_set(ctx.task)
 
@@ -551,7 +647,7 @@ def enforce(ctx: RunContext) -> tuple[str, str]:
     if res.returncode == 0:
         _record_runner_commit(ctx)
         return ("passed", out)
-    if "files were modified by this hook" in out.lower():
+    if _worktree_dirty(ctx):
         return ("mechanical", out)
     return ("semantic", out)
 
@@ -618,7 +714,17 @@ def _rollback(ctx: RunContext) -> None:
         # Clear any uncommitted/staged mutation the blocked commit left behind
         # so the working tree is pristine before we leave the work branch.
         ctx.repo.git.reset("--hard")
-        ctx.repo.git.clean("-fd", "--", "example")
+        listed = ctx.repo.git.ls_files("--others", "--exclude-standard")
+        new_untracked = [
+            p
+            for p in listed.splitlines()
+            if p and p not in ctx.baseline_untracked and not p.startswith(".harness/")
+        ]
+        for rel in new_untracked:
+            try:
+                os.remove(os.path.join(_repo_dir(ctx), rel))
+            except OSError:
+                pass
         reset_ok = True
     except git.exc.GitCommandError as exc:
         log(f"WARNING: hard reset during rollback failed: {exc}")
@@ -676,6 +782,7 @@ def _write_forensics(ctx: RunContext, outcome: str, reason: str, exit_code: int 
         attempts=list(ctx.journal_entry.get("attempts", [])),
         telemetry=ctx.ledger.as_dict(),
         rollback_ok=ctx.rollback_ok,
+        env_scope="allowlisted" if os.getenv("AGENT_ENV_ALLOWLIST") else "full_copy",
     )
     path = forensic.write_report(report, repo_dir=_repo_dir(ctx))
     forensic.print_badge(outcome, path)
@@ -744,6 +851,49 @@ def _budget_abort(ctx: RunContext) -> bool:
     ctx.git_warnings.append(f"financial abort: {reason}")
     _write_forensics(ctx, "escalated", f"financial abort -- {reason}", exit_code=BUDGET_ABORT_EXIT)
     _persist_journal(ctx, "escalated", notes=f"financial abort: {reason}. {ctx.ledger.summary()}.")
+    _rollback(ctx)
+    return True
+
+
+def _timeout_abort(ctx: RunContext) -> bool:
+    """Time circuit-breaker: hard rollback + escalate on step/wall-clock timeout.
+
+    Shares BUDGET_ABORT_EXIT (3) so exit-code-based scripts keep working, but
+    logs and stamps a *timeout* reason so an operator never mistakes a hung
+    provider for a budget breach.
+    """
+    if not ctx.timed_out:
+        return False
+    log(f"TIMEOUT ABORT: {ctx.timed_out}; {ctx.ledger.summary()}. Rolling back.")
+    ctx.git_warnings.append(f"timeout abort: {ctx.timed_out}")
+    _write_forensics(
+        ctx, "escalated", f"timeout abort -- {ctx.timed_out}", exit_code=BUDGET_ABORT_EXIT
+    )
+    _persist_journal(
+        ctx, "escalated", notes=f"timeout abort: {ctx.timed_out}. {ctx.ledger.summary()}."
+    )
+    _rollback(ctx)
+    return True
+
+
+def _guard_abort(ctx: RunContext) -> bool:
+    """Containment circuit-breaker for repeated git-bypass attempts.
+
+    Guard penalties have their own ceiling so a tamper-once agent keeps its full
+    autorepair budget, but a persistent escape attempt is contained. Exits 4
+    (the escape family), not 3, because this is a breach attempt, not a budget
+    event.
+    """
+    if ctx.guard_penalties < ctx.task.max_autorepair_attempts:
+        return False
+    reason = (
+        f"repeated git-bypass attempts ({ctx.guard_penalties} >= "
+        f"{ctx.task.max_autorepair_attempts})"
+    )
+    log(f"GUARD ABORT: {reason}. Rolling back.")
+    ctx.git_warnings.append(f"guard abort: {reason}")
+    _write_forensics(ctx, "escalated", f"guard abort -- {reason}", exit_code=CONTAINMENT_ABORT_EXIT)
+    _persist_journal(ctx, "escalated", notes=f"guard abort: {reason}.")
     _rollback(ctx)
     return True
 
@@ -942,33 +1092,97 @@ def reconcile(ctx: RunContext) -> int:
 # --------------------------------------------------------------------------- #
 # E8. CLI / main loop
 # --------------------------------------------------------------------------- #
-def _drive(ctx: RunContext) -> int:
+# Abort checks fired right after a mutate step: budget and timeout exit 3,
+# guard and post-hoc containment exit 4. Order is significant -- the first that
+# trips wins, matching the original inline sequence.
+_POST_MUTATE_ABORTS: tuple[tuple[Callable[[RunContext], bool], int], ...] = (
+    (_budget_abort, BUDGET_ABORT_EXIT),
+    (_timeout_abort, BUDGET_ABORT_EXIT),
+    (_guard_abort, CONTAINMENT_ABORT_EXIT),
+    (_containment_abort, CONTAINMENT_ABORT_EXIT),
+)
+# After autorepair nothing new is committed yet, so containment is not re-checked
+# here -- it runs after the next iteration's enforce instead.
+_POST_REPAIR_ABORTS: tuple[tuple[Callable[[RunContext], bool], int], ...] = (
+    (_budget_abort, BUDGET_ABORT_EXIT),
+    (_timeout_abort, BUDGET_ABORT_EXIT),
+    (_guard_abort, CONTAINMENT_ABORT_EXIT),
+)
+
+
+@dataclass
+class DriveModel:
+    """Side-effecting steps and abort checks of the drive loop, injected so the
+    transition logic can be unit-tested with fakes instead of subprocesses."""
+
+    mutate: Callable[[RunContext], None]
+    enforce: Callable[[RunContext], tuple[str, str]]
+    autorepair: Callable[[RunContext], bool]
+    reconcile: Callable[[RunContext], int]
+    containment: Callable[[RunContext], bool]
+    post_mutate_aborts: tuple[tuple[Callable[[RunContext], bool], int], ...]
+    post_repair_aborts: tuple[tuple[Callable[[RunContext], bool], int], ...]
+
+
+def _default_drive_model() -> DriveModel:
+    return DriveModel(
+        mutate=mutate,
+        enforce=enforce,
+        autorepair=autorepair,
+        reconcile=reconcile,
+        containment=_containment_abort,
+        post_mutate_aborts=_POST_MUTATE_ABORTS,
+        post_repair_aborts=_POST_REPAIR_ABORTS,
+    )
+
+
+def _first_abort(
+    ctx: RunContext, checks: tuple[tuple[Callable[[RunContext], bool], int], ...]
+) -> int | None:
+    for check, code in checks:
+        if check(ctx):
+            return code
+    return None
+
+
+def run_drive(ctx: RunContext, model: DriveModel) -> int:
+    """Run the mutate -> enforce -> autorepair/reconcile machine to a terminal code.
+
+    Transitions per iteration:
+      mutate -> (post-mutate aborts) -> enforce
+        "dry-run"             -> reconcile (terminal)
+        "mechanical"          -> enforce once more, then fall through
+        "passed"              -> containment check, else reconcile (terminal)
+        "semantic"/mechanical -> autorepair; cap exit 1, else (post-repair aborts), loop
+    """
     while True:
-        mutate(ctx)
-        if _budget_abort(ctx):
-            return BUDGET_ABORT_EXIT
-        if _containment_abort(ctx):
-            return CONTAINMENT_ABORT_EXIT
-        status, log_text = enforce(ctx)
+        model.mutate(ctx)
+        code = _first_abort(ctx, model.post_mutate_aborts)
+        if code is not None:
+            return code
 
+        status, log_text = model.enforce(ctx)
         if status == "dry-run":
-            return reconcile(ctx)
-
+            return model.reconcile(ctx)
         if status == "mechanical":
             log("mechanical hook fix detected; re-staging and retrying once.")
-            status, log_text = enforce(ctx)
-
+            status, log_text = model.enforce(ctx)
         if status == "passed":
-            if _containment_abort(ctx):
+            if model.containment(ctx):
                 return CONTAINMENT_ABORT_EXIT
-            return reconcile(ctx)
+            return model.reconcile(ctx)
 
         # semantic (or still mechanical after the single retry) -> autorepair
         ctx.last_hook_log = log_text
-        if not autorepair(ctx):
+        if not model.autorepair(ctx):
             return 1
-        if _budget_abort(ctx):
-            return BUDGET_ABORT_EXIT
+        code = _first_abort(ctx, model.post_repair_aborts)
+        if code is not None:
+            return code
+
+
+def _drive(ctx: RunContext) -> int:
+    return run_drive(ctx, _default_drive_model())
 
 
 # --------------------------------------------------------------------------- #
@@ -1090,6 +1304,18 @@ def doctor() -> int:
     if not found:
         print("  (no local leases)")
 
+    print("-- llm seam --")
+    if os.getenv("AGENT_ENV_ALLOWLIST"):
+        print(
+            "  OK: AGENT_ENV_ALLOWLIST set; the LLM subprocess env is scoped "
+            "(env_scope=allowlisted)."
+        )
+    else:
+        print(
+            "  WARNING: AGENT_ENV_ALLOWLIST not set; the LLM subprocess inherits the "
+            "FULL parent environment (env_scope=full_copy). Set it to scope the seam."
+        )
+
     print("-- handover journals (unresolved) --")
     try:
         ledger = _load_ledger()
@@ -1133,6 +1359,118 @@ def doctor() -> int:
     return 1 if problems else 0
 
 
+# --------------------------------------------------------------------------- #
+# Opt-in CLI helpers
+# --------------------------------------------------------------------------- #
+def _version() -> str:
+    """Installed distribution version, falling back to the source constant."""
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        return version("agent-workflow-harness")
+    except PackageNotFoundError:
+        return VERSION
+
+
+def list_tasks() -> int:
+    """Enumerate the tasks declared in AGENTS.md (read-only)."""
+    tasks = _load_ledger().get("tasks") or {}
+    if not tasks:
+        print("(no tasks declared in AGENTS.md)")
+        return 0
+    print("== tasks ==")
+    for task_id, raw in tasks.items():
+        mode = raw.get("mutation_mode", "?") if isinstance(raw, dict) else "?"
+        targets = raw.get("targets") or [] if isinstance(raw, dict) else []
+        print(f"  {task_id}: mode={mode}, targets={len(targets)}")
+    return 0
+
+
+def _latest_journal() -> dict[str, Any] | None:
+    """Most recent journal entry across all tasks, by ``finished_at``."""
+    jdir = journal.JOURNAL_DIR
+    if not os.path.isdir(jdir):
+        return None
+    best: dict[str, Any] | None = None
+    best_at = ""
+    for name in sorted(os.listdir(jdir)):
+        if not name.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(jdir, name), encoding="utf-8") as fh:
+                entry = json.load(fh)
+        except (OSError, json.JSONDecodeError):
+            continue
+        at = str(entry.get("finished_at", ""))
+        if best is None or at > best_at:
+            best, best_at = entry, at
+    return best
+
+
+def report_json() -> int:
+    """Emit a JSON telemetry/outcome summary of the most recent run."""
+    entry = _latest_journal() or {}
+    tokens = 0
+    cost = 0.0
+    try:
+        with open(telemetry.usage_file_path(), encoding="utf-8") as fh:
+            usage = json.load(fh)
+        tokens = int(usage.get("total_tokens", 0) or 0)
+        cost = float(usage.get("cost_usd", 0.0) or 0.0)
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        pass
+    report = {
+        "version": _version(),
+        "task_id": entry.get("task_id"),
+        "outcome": entry.get("outcome", "none"),
+        "branch": entry.get("branch"),
+        "finished_at": entry.get("finished_at"),
+        "total_tokens": tokens,
+        "cost_usd": cost,
+    }
+    print(json.dumps(report, indent=2, sort_keys=True))
+    return 0
+
+
+def release_lease(task_id: str, assume_yes: bool = False) -> int:
+    """Operator escape hatch: force-release a stranded lease for ``task_id``."""
+    lease = leases.read_lease(task_id)
+    if lease is None:
+        print(f"  no local lease recorded for '{task_id}'.")
+    else:
+        state = "ACTIVE" if leases.is_active(lease) else "expired"
+        print(
+            f"  local lease ({state}): agent={lease.get('agent_id')} "
+            f"branch={lease.get('branch')} created={lease.get('created_at')}"
+        )
+    if not assume_yes:
+        reply = input(f"Force-release the lease for '{task_id}'? [y/N] ").strip().lower()
+        if reply not in {"y", "yes"}:
+            print("  aborted; no lease was released.")
+            return 1
+
+    removed = leases.release(task_id)
+    print(f"  local lease {'removed' if removed else 'was already absent'}.")
+
+    try:
+        repo = git.Repo(search_parent_directories=True)
+        repo_dir = str(repo.working_tree_dir or ".")
+        shared = _has_origin(repo) and not _minimal_mode()
+    except git.exc.GitError:
+        repo_dir, shared = ".", False
+    if shared:
+        posix_lease = _posix(leases.lease_path(task_id))
+        ok = state_sync.publish_files(
+            repo_dir,
+            {posix_lease: None},
+            message=f"harness: force-release lease {task_id}",
+        )
+        print(f"  shared-ref lease release {'published' if ok else 'FAILED to publish'}.")
+    else:
+        print("  (no origin / minimal mode): shared-ref release skipped.")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Agent workflow orchestrator.")
     parser.add_argument(
@@ -1165,11 +1503,48 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="With --init, overwrite existing AGENTS.md / project README.",
     )
+    parser.add_argument(
+        "--version",
+        action="store_true",
+        help="Print the harness version and exit.",
+    )
+    parser.add_argument(
+        "--list",
+        dest="list_tasks",
+        action="store_true",
+        help="List the tasks declared in AGENTS.md and exit.",
+    )
+    parser.add_argument(
+        "--report-json",
+        dest="report_json",
+        action="store_true",
+        help="Print a JSON telemetry/outcome summary of the latest run and exit.",
+    )
+    parser.add_argument(
+        "--release",
+        metavar="TASK_ID",
+        default=None,
+        help="Force-release a stranded lease for TASK_ID and exit.",
+    )
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Skip the confirmation prompt (used with --release).",
+    )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.version:
+        print(f"agent-workflow-harness {_version()}")
+        return 0
+    if args.list_tasks:
+        return list_tasks()
+    if args.report_json:
+        return report_json()
+    if args.release:
+        return release_lease(args.release, assume_yes=args.yes)
     if args.init:
         return init(from_example=args.example, force=args.force)
     if args.doctor:
@@ -1179,8 +1554,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
 
     ctx = initialize(args)
-    isolate(ctx)
     try:
+        isolate(ctx)
         return _drive(ctx)
     except SystemExit:
         raise
@@ -1189,6 +1564,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         ctx.git_warnings.append(f"unhandled error: {exc}")
         _write_forensics(ctx, "error", f"Unhandled error: {exc}", exit_code=1)
         _persist_journal(ctx, "error", notes=f"Unhandled error: {exc}")
+        # After T02 the lease can be held before `checkout -b`, where _rollback
+        # early-returns (branch_created is False) and would not release it.
+        # _release_lease is idempotent, so call it directly to be safe.
+        _release_lease(ctx, commit=False)
         _rollback(ctx)
         return 1
 

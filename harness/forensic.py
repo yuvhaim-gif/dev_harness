@@ -39,6 +39,7 @@ class ForensicReport:
     attempts: list[dict[str, Any]] = field(default_factory=list)
     telemetry: dict[str, Any] = field(default_factory=dict)
     rollback_ok: bool = False
+    env_scope: str = "full_copy"
 
 
 def report_path(repo_dir: str = ".", report_dir: str = REPORT_DIR) -> str:
@@ -114,6 +115,8 @@ def render(report: ForensicReport) -> str:
         lines.append("**Git policy warnings:**")
         lines.append(_fmt_list(report.git_warnings).rstrip("\n"))
         lines.append("")
+    lines.append(f"**LLM seam env scope:** `{report.env_scope}`")
+    lines.append("")
     lines.append("**Failure excerpt (condensed):**")
     lines.append("")
     lines.append("```")

@@ -28,7 +28,8 @@ repos:
     rev: v1.10.0
     hooks:
       - id: mypy
-        args: ["--strict", "--ignore-missing-imports"]
+        pass_filenames: false
+        args: ["--strict", "harness"]
         additional_dependencies: ["types-PyYAML>=6.0", "pytest>=7.0"]
 
   # LAYER 3: LEDGER INTEGRITY + FILE-LOCK ENFORCEMENT

@@ -25,6 +25,21 @@ STATE_REF = os.getenv("AGENT_STATE_REF", "harness-state")
 _REMOTE_PREFIX = "refs/remotes"
 
 
+def log(msg: str) -> None:
+    print(f"[state_sync] {msg}")
+
+
+# Process-level memo of successful fetches, keyed by (repo_dir, remote, ref).
+# Every shared-state read fetches the ref; without this a single run re-fetches
+# the same ref many times. Writers pass ``refresh=True`` and reset the cache
+# after a push so a build is never made on a stale read.
+_fetch_cache: set[tuple[str, str, str]] = set()
+
+
+def reset_fetch_cache() -> None:
+    _fetch_cache.clear()
+
+
 def _git(
     repo_dir: str,
     *args: str,
@@ -45,8 +60,13 @@ def _tracking_ref(remote: str, ref: str) -> str:
     return f"{_REMOTE_PREFIX}/{remote}/{ref}"
 
 
-def fetch_ref(repo_dir: str, ref: str = STATE_REF, remote: str = "origin") -> bool:
+def fetch_ref(
+    repo_dir: str, ref: str = STATE_REF, remote: str = "origin", refresh: bool = False
+) -> bool:
     """Fetch ``ref`` from ``remote`` into a local tracking ref. False if absent."""
+    key = (repo_dir, remote, ref)
+    if not refresh and key in _fetch_cache:
+        return True
     res = _git(
         repo_dir,
         "fetch",
@@ -54,6 +74,12 @@ def fetch_ref(repo_dir: str, ref: str = STATE_REF, remote: str = "origin") -> bo
         remote,
         f"+refs/heads/{ref}:{_tracking_ref(remote, ref)}",
     )
+    if res.returncode != 0 and res.stderr.strip():
+        # Distinguish a real auth/network failure from "no shared ref yet": a
+        # missing ref fetches quietly, so a non-empty stderr is a genuine error.
+        log(f"fetch of '{ref}' from '{remote}' failed: {res.stderr.strip()}")
+    if res.returncode == 0:
+        _fetch_cache.add(key)
     return res.returncode == 0
 
 
@@ -117,7 +143,7 @@ def publish_files(
             if attempt > 0 and backoff_base > 0:
                 delay = min(backoff_cap, backoff_base * (2 ** (attempt - 1)))
                 time.sleep(delay + random.uniform(0, backoff_base))
-            fetched = fetch_ref(repo_dir, ref, remote)
+            fetched = fetch_ref(repo_dir, ref, remote, refresh=True)
             base = _tracking_ref(remote, ref) if fetched else None
 
             if base is not None:
@@ -155,6 +181,9 @@ def publish_files(
 
             push = _git(repo_dir, "push", remote, f"{commit}:refs/heads/{ref}")
             if push.returncode == 0:
+                # The shared ref advanced; drop memoized fetches so no later
+                # read in this process is served from a now-stale tracking ref.
+                reset_fetch_cache()
                 return True
         return False
     finally:

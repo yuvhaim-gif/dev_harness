@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 from datetime import UTC, datetime
 from typing import Any
 
@@ -89,9 +90,19 @@ def acquire(
         "ttl_seconds": ttl_seconds,
     }
     os.makedirs(leases_dir, exist_ok=True)
-    with open(lease_path(task_id, leases_dir), "w", encoding="utf-8", newline="\n") as fh:
-        json.dump(lease, fh, indent=2, sort_keys=True)
-        fh.write("\n")
+    final = lease_path(task_id, leases_dir)
+    # Write to a sibling temp file and os.replace into place: a crash mid-write
+    # leaves the old lease (or nothing), never a half-written file that
+    # read_lease would reject as corrupt and silently drop the claim.
+    fd, tmp = tempfile.mkstemp(dir=leases_dir, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
+            json.dump(lease, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+        os.replace(tmp, final)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
     return (True, lease)
 
 
