@@ -386,16 +386,23 @@ def _seam_base_env() -> dict[str, str]:
     var names), start from only those vars plus the AGENT_*/GIT_* keys the
     harness manages, so the seam no longer inherits every secret in the parent
     environment. _harden_git_env still runs last in _llm_env.
+
+    SKIP_AGENT_HARNESS is always dropped, even in full-copy mode: it is a
+    human-only override that disables the local lock/contract hooks, and must
+    never be inherited by git commands the agent itself spawns.
     """
     raw = os.getenv("AGENT_ENV_ALLOWLIST")
     if not raw:
-        return os.environ.copy()
-    names = {n.strip() for n in raw.replace(",", "\n").splitlines() if n.strip()}
-    return {
-        k: v
-        for k, v in os.environ.items()
-        if k in names or k.startswith("AGENT_") or k.startswith("GIT_")
-    }
+        env = os.environ.copy()
+    else:
+        names = {n.strip() for n in raw.replace(",", "\n").splitlines() if n.strip()}
+        env = {
+            k: v
+            for k, v in os.environ.items()
+            if k in names or k.startswith("AGENT_") or k.startswith("GIT_")
+        }
+    env.pop("SKIP_AGENT_HARNESS", None)
+    return env
 
 
 def _llm_env(

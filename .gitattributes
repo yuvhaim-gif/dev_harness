@@ -1,0 +1,4 @@
+# Normalize all text to LF in the repository and the working tree, on every
+# platform. The contract manifest hashes working-tree bytes, so a stable line
+# ending is required for the hash to match across Windows, macOS, Linux and CI.
+* text=auto eol=lf

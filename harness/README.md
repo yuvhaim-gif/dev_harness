@@ -423,7 +423,9 @@ across recursive repair cycles:
 set to a truthy value (`1`/`true`/`yes`/`on`). When active, the file-lock and
 contract-binding hooks pass immediately, letting a human make sweeping
 structural or configuration changes without the autonomous-agent gates blocking
-them. The agent orchestrator never sets it.
+them. The agent orchestrator never sets it, and the LLM seam **strips it from
+the subprocess environment** (even in full-copy mode), so a value inherited from
+the parent env cannot disable the hooks for git commands the agent itself spawns.
 
 ### Forensic post-mortem diagnostics
 
@@ -769,7 +771,8 @@ workload's contracts.
   defences are the post-hoc containment gate and the server-side CI re-check.
 - **Scoped LLM environment** — `AGENT_ENV_ALLOWLIST` restricts which parent env
   vars reach the seam; unset means a full copy plus a one-time warning, and the
-  active `env_scope` is surfaced in forensics and `--doctor`.
+  active `env_scope` is surfaced in forensics and `--doctor`. `SKIP_AGENT_HARNESS`
+  is always dropped from the seam so the human override cannot be inherited.
 - **Post-hoc containment gate** — after mutation the orchestrator inspects
   committed history (`base..HEAD`); any out-of-allowlist or out-of-band
   (hook-bypassed) commit triggers a forensic rollback and **exit 4**, so a
@@ -786,7 +789,9 @@ workload's contracts.
   subsystem in one pass; `AGENT_MINIMAL=1` drops the shared-ref machinery for
   simple single-agent runs.
 - **Human override** — `SKIP_AGENT_HARNESS=1` lets a developer bypass the gates
-  for sweeping manual changes; the orchestrator itself never sets it.
+  for sweeping manual changes; the orchestrator never sets it and the LLM seam
+  strips it from the subprocess env, so it cannot be inherited into
+  agent-spawned git commands.
 - **Forensic containment** — a rejected/crashed run leaves a transparent
   `.harness/logs/FAILED_AGENT_RUN.md` and a terminal badge, with the working
   tree verified clean.

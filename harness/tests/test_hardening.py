@@ -520,6 +520,18 @@ def test_h11b_no_allowlist_is_full_copy(monkeypatch: pytest.MonkeyPatch) -> None
     assert env.get("SECRET") == "inherited"  # default behaviour unchanged
 
 
+def test_h11e_skip_override_never_inherited_by_seam(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The human override must not reach the agent's subprocess in either mode,
+    # or it could disable the local lock hook for git commands the agent spawns.
+    monkeypatch.setenv("SKIP_AGENT_HARNESS", "1")
+
+    monkeypatch.delenv("AGENT_ENV_ALLOWLIST", raising=False)
+    assert "SKIP_AGENT_HARNESS" not in agent_runner._seam_base_env()  # full-copy mode
+
+    monkeypatch.setenv("AGENT_ENV_ALLOWLIST", "SKIP_AGENT_HARNESS")  # even if allowlisted
+    assert "SKIP_AGENT_HARNESS" not in agent_runner._seam_base_env()
+
+
 def test_h11c_missing_allowlist_warns_once_and_reports_full_copy(seeded_repo: Path) -> None:
     (seeded_repo / "fake_llm.py").write_text(_FAKE_LLM, encoding="utf-8")
 
