@@ -84,6 +84,7 @@ dev_process/
 │   ├── telemetry/                     # Per-step usage.json + cache-ordered repair_prompt.txt (gitignored)
 │   └── logs/                          # FAILED_AGENT_RUN.md forensic post-mortems (gitignored)
 └── harness/                           # THE FRAMEWORK (run via `python -m harness`)
+    ├── __init__.py                    # Marks `harness` as an installable package
     ├── __main__.py                    # ← `python -m harness` entry point
     ├── agent_runner.py                # Orchestrator: the 5-state loop (+ --init / --doctor)
     ├── README.md                      # This document (the framework's own docs)
@@ -621,13 +622,13 @@ Example dry-run output (remote-less repo):
 
 ```
 [agent_runner] no tracking remote configured; skipping pull.
-[agent_runner] initialized for task 'optimise_query_layer' (mode=isolated).
-[agent_runner] [dry-run] computed work branch 'agent/optimise_query_layer/20260616T131752Z' (not created).
+[agent_runner] initialized for task 'optimise_query_layer' (mode=isolated, agent=agent-9f3a2c10).
+[agent_runner] [dry-run] computed work branch 'agent/optimise_query_layer/20260616T131752Z-3e5b1d' (not created).
 [agent_runner] [mutate] isolated: source-in-targets only (LLM integration seam).
 [agent_runner] [dry-run] would stage exactly: ['harness/example/src/db/queries.py']
 [agent_runner] [dry-run] skipping commit to keep 'no commits created' honest.
-[agent_runner] [dry-run] would run: git push -u origin agent/optimise_query_layer/20260616T131752Z
-[agent_runner] [dry-run] no 'origin' remote; manual push: git push -u origin agent/optimise_query_layer/20260616T131752Z
+[agent_runner] [dry-run] would run: git push -u origin agent/optimise_query_layer/20260616T131752Z-3e5b1d
+[agent_runner] [dry-run] no 'origin' remote; manual push: git push -u origin agent/optimise_query_layer/20260616T131752Z-3e5b1d
 ```
 
 ---
@@ -703,6 +704,9 @@ throwaway git repos in a temp dir):
 | **F15** bootstrap  | `test_f15a_init_writes_empty_skeleton_that_validates` | `--init` writes a project README + an empty `AGENTS.md` skeleton that validates. |
 | **F15**            | `test_f15b_init_example_recreates_shipped_ledger`     | `--init --example` reproduces the shipped example ledger byte-for-byte. |
 | **F15**            | `test_f15c_doctor_flags_template_readme_then_init_clears_it` | `--doctor` warns on the template README; `--init` clears the sentinel. |
+| **F16** drive loop | `test_f16a–h_*`                                        | The `run_drive` state machine, exercised with fakes: `passed`/`dry-run` reconcile, a single mechanical retry, post-mutate/post-repair aborts (exit 3/4), the autorepair cap (exit 1), and post-pass containment (exit 4). |
+| **F17** CLI        | `test_f17a–d_*`                                        | `--version`, `--list`, `--report-json` (valid JSON with the expected keys), and `--release` clearing a local lease. |
+| **F18** packaging  | `test_f18_editable_install_exposes_console_script`    | An editable install exposes the `agent-harness` console entry point. |
 
 `harness/tests/test_hardening.py` covers the LLM-execution hardening layer: token-usage
 normalisation and budget aborts (telemetry), log condensation, cache-ordered
@@ -725,13 +729,18 @@ workload's contracts.
 
 `.pre-commit-config.yaml` runs, in order:
 
-1. **Syntax/format** — merge-conflict, `check-yaml` (`.yaml`/`.yml`), `check-json`,
-   large-file guard, trailing-whitespace, end-of-file-fixer.
-2. **Lint & types** — `ruff` (`--fix`), `ruff-format`, `mypy --strict`.
-3. **Ledger integrity + file locks** —
+1. **Syntax/format** — merge-conflict, `check-yaml` (`.yaml`/`.yml`), `check-json`
+   (`.json`), large-file guard (`--maxkb=500`), trailing-whitespace,
+   end-of-file-fixer.
+2. **Lint & types** — `ruff` (`--fix`), `ruff-format`, `mypy --strict harness`.
+3. **Ledger integrity, file locks & contract binding** —
    - `validate-agents-ledger` (because `check-yaml` skips the `.md`-extensioned
      `AGENTS.md`),
-   - `enforce-file-locks`.
+   - `enforce-file-locks` (no staged file may fall outside the task's allowlist),
+   - `verify-contract-manifest` (every declared contract still matches
+     `.harness/contracts.lock`),
+   - `enforce-contract-binding` (a staged contract change must co-stage the
+     manifest and a bound test).
 
 ---
 
