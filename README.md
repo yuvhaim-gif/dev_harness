@@ -115,6 +115,7 @@ dev_process/
 ├── AGENTS.md                          # ← EDIT THIS. Operational ledger (YAML): task definitions
 ├── README.md                          # ← YOUR PROJECT'S README (template ships with a sentinel;
 │                                      #    replace it or run `python -m harness --init`)
+├── LICENSE                            # MIT license (Copyright (c) 2026 Yuval Haim)
 ├── pyproject.toml                     # Packaging + ruff / mypy / pytest config (root-discovered)
 ├── .pre-commit-config.yaml            # Syntax/lint/type + ledger + lock + contract hooks (root-required)
 ├── .gitignore
