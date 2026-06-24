@@ -27,6 +27,39 @@ when the local hooks are skipped).
 
 ---
 
+## Contents
+
+- [The five-state loop](#the-five-state-loop)
+- [Repository layout](#repository-layout)
+- [The operational ledger (`AGENTS.md`)](#the-operational-ledger-agentsmd)
+  - [Lock model](#lock-model)
+- [Contract binding](#contract-binding)
+- [How enforcement works](#how-enforcement-works)
+- [Cross-agent coordination](#cross-agent-coordination)
+- [LLM integration seam](#llm-integration-seam)
+  - [Token & cost budgeting](#token--cost-budgeting)
+  - [Context truncation & error condensation](#context-truncation--error-condensation)
+  - [Deterministic prompt caching](#deterministic-prompt-caching)
+  - [Human override switch](#human-override-switch)
+- [Containment defences](#containment-defences)
+  - [Post-hoc containment gate](#post-hoc-containment-gate)
+  - [Server-side CI re-check](#server-side-ci-re-check)
+- [Operations & diagnostics](#operations--diagnostics)
+  - [Forensic post-mortem diagnostics](#forensic-post-mortem-diagnostics)
+  - [Diagnostics (`--doctor`)](#diagnostics---doctor)
+  - [Minimal mode](#minimal-mode)
+- [Threat model & failure modes](#threat-model--failure-modes)
+- [Requirements](#requirements)
+- [Setup](#setup)
+- [Running the orchestrator](#running-the-orchestrator)
+- [The sample workload](#the-sample-workload)
+- [Testing & verification](#testing--verification)
+- [Pre-commit pipeline](#pre-commit-pipeline)
+- [Design notes / hardening](#design-notes--hardening)
+- [Extending the framework](#extending-the-framework)
+
+---
+
 ## The five-state loop
 
 ```mermaid
@@ -228,6 +261,8 @@ A task's `contracts` are the subset of its `spec_docs` that are treated as
 `harness/tests/test_contracts.py` mirrors the manifest hook at test time, so a
 drifted contract fails CI even when commits are bypassed.
 
+---
+
 ## How enforcement works
 
 `harness/enforce_file_locks.py` runs as a `pre-commit` hook:
@@ -337,37 +372,6 @@ and the run is penalised — but the **authoritative** defences are the post-hoc
 containment gate and the server-side CI re-check below, both of which inspect
 committed history and therefore hold regardless of which git the agent ran.
 
-### Post-hoc containment gate
-
-After the mutation/repair phase and before Reconcile, the orchestrator runs
-`_containment_breach()`: it inspects only **committed** state on `base..HEAD`
-(the history a push would publish, so benign uncommitted scratch files are
-ignored) and flags two things —
-
-- a committed path outside the task's computed allowlist (coordination paths
-  excepted), and
-- an **out-of-band commit** the orchestrator did not author itself (i.e. a SHA
-  not in its `runner_commits` set — the signature of a hook-bypassed commit).
-
-Either one is a breach: the run logs `CONTAINMENT BREACH`, writes a forensic
-report, hard-rolls-back, journals `escalated`, and exits **4**. This is the gate
-that makes the `core.hooksPath` bypass moot on the agent's own machine.
-
-### Server-side CI re-check
-
-`harness/ci_enforce.py` re-applies the *same* policy from a trusted runner the
-agent cannot influence (wired up in `.github/workflows/harness-ci.yml`):
-
-1. the hashed contract manifest must still verify (content-based, bypass-proof),
-   and
-2. every file changed on an `agent/<task_id>/…` branch (computed over the
-   aggregate `base...head` diff) must fall inside that task's allowlist
-   (coordination paths excepted).
-
-A non-agent (human) branch only gets the manifest check; its file scope is the
-reviewer's responsibility. Run it locally with
-`python harness/ci_enforce.py --base <ref> --head <ref> [--task <id>]`.
-
 ### Token & cost budgeting
 
 `harness/telemetry.py` keeps a running `TokenLedger`. After each LLM step
@@ -427,6 +431,50 @@ structural or configuration changes without the autonomous-agent gates blocking
 them. The agent orchestrator never sets it, and the LLM seam **strips it from
 the subprocess environment** (even in full-copy mode), so a value inherited from
 the parent env cannot disable the hooks for git commands the agent itself spawns.
+
+---
+
+## Containment defences
+
+The pre-commit hooks are advisory — an agent that spawns its own git can skip
+them. The two gates below are **authoritative** because they inspect *committed
+history* instead of trusting a hook to have fired, so the usual
+`git -c core.hooksPath=…` / plumbing bypasses do not defeat them.
+
+### Post-hoc containment gate
+
+After the mutation/repair phase and before Reconcile, the orchestrator runs
+`_containment_breach()`: it inspects only **committed** state on `base..HEAD`
+(the history a push would publish, so benign uncommitted scratch files are
+ignored) and flags two things —
+
+- a committed path outside the task's computed allowlist (coordination paths
+  excepted), and
+- an **out-of-band commit** the orchestrator did not author itself (i.e. a SHA
+  not in its `runner_commits` set — the signature of a hook-bypassed commit).
+
+Either one is a breach: the run logs `CONTAINMENT BREACH`, writes a forensic
+report, hard-rolls-back, journals `escalated`, and exits **4**. This is the gate
+that makes the `core.hooksPath` bypass moot on the agent's own machine.
+
+### Server-side CI re-check
+
+`harness/ci_enforce.py` re-applies the *same* policy from a trusted runner the
+agent cannot influence (wired up in `.github/workflows/harness-ci.yml`):
+
+1. the hashed contract manifest must still verify (content-based, bypass-proof),
+   and
+2. every file changed on an `agent/<task_id>/…` branch (computed over the
+   aggregate `base...head` diff) must fall inside that task's allowlist
+   (coordination paths excepted).
+
+A non-agent (human) branch only gets the manifest check; its file scope is the
+reviewer's responsibility. Run it locally with
+`python harness/ci_enforce.py --base <ref> --head <ref> [--task <id>]`.
+
+---
+
+## Operations & diagnostics
 
 ### Forensic post-mortem diagnostics
 
