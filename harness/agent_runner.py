@@ -39,7 +39,7 @@ import prompt_builder  # noqa: E402
 import staleness  # noqa: E402
 import state_sync  # noqa: E402
 import telemetry  # noqa: E402
-from lock_policy import compute_allowlist, is_coordination_path  # noqa: E402
+from lock_policy import compute_allowlist, is_coordination_path, symlink_paths  # noqa: E402
 
 SUPPORTED_SCHEMA_VERSION = 1
 
@@ -934,6 +934,21 @@ def _committed_paths(ctx: RunContext) -> list[str]:
     return [p for p in out.splitlines() if p]
 
 
+def _committed_symlinks(ctx: RunContext) -> list[str]:
+    """Symlinks committed on ``base..HEAD``, detected via git's recorded mode.
+
+    A path inside the allowlist can be flipped to a symlink (mode 100644 ->
+    120000) aimed at a locked file, which the path-only check cannot see.
+    """
+    if ctx.dry_run or not ctx.base_commit:
+        return []
+    try:
+        raw = str(ctx.repo.git.diff("--raw", f"{ctx.base_commit}..HEAD"))
+    except git.exc.GitCommandError:
+        return []
+    return symlink_paths(raw)
+
+
 def _containment_breach(ctx: RunContext) -> list[str]:
     """Authoritative post-hoc check that the agent stayed inside its scope.
 
@@ -950,6 +965,9 @@ def _containment_breach(ctx: RunContext) -> list[str]:
         p for p in _committed_paths(ctx) if p not in allow and not is_coordination_path(p)
     )
     violations = [f"out-of-allowlist committed change: {p}" for p in out_of_scope]
+    violations += [
+        f"symlink committed (file-lock bypass): {p}" for p in sorted(_committed_symlinks(ctx))
+    ]
     violations += [
         f"out-of-band commit (hook-bypassed): {sha[:12]}" for sha in _unexpected_commits(ctx)
     ]

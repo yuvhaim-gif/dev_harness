@@ -17,6 +17,7 @@ from lock_policy import (  # noqa: E402
     compute_allowlist,
     human_override_active,
     is_coordination_path,
+    symlink_paths,
 )
 
 
@@ -31,6 +32,19 @@ def _staged_files() -> list[str]:
         print(f"ERROR: could not read git index: {res.stderr.strip()}")
         sys.exit(1)
     return [line for line in res.stdout.splitlines() if line]
+
+
+def _staged_raw() -> str:
+    # Mode-aware view of the index so a path turned into a symlink is visible.
+    res = subprocess.run(
+        ["git", "diff", "--cached", "--raw"],
+        capture_output=True,
+        text=True,
+    )
+    if res.returncode != 0:
+        print(f"ERROR: could not read git index: {res.stderr.strip()}")
+        sys.exit(1)
+    return res.stdout
 
 
 def main() -> None:
@@ -67,6 +81,16 @@ def main() -> None:
         sys.exit(1)
 
     mode = task.get("mutation_mode")
+
+    # Symlinks bypass the path-only allowlist: an allowed path can be aliased
+    # onto a locked file without ever leaving the allowlist. Reject outright.
+    links = sorted(symlink_paths(_staged_raw()))
+    if links:
+        print(f"ERROR: task '{task_id}' ({mode}) staged symlink(s) (file-lock bypass):")
+        for link in links:
+            print(f"  - {link}")
+        sys.exit(1)
+
     violations = sorted(
         f for f in _staged_files() if f not in allowed and not is_coordination_path(f)
     )

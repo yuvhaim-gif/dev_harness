@@ -26,6 +26,7 @@ import agent_runner  # noqa: E402
 import command_guard  # noqa: E402
 import forensic  # noqa: E402
 import git  # noqa: E402
+import lock_policy  # noqa: E402
 import log_condenser  # noqa: E402
 import prompt_builder  # noqa: E402
 import telemetry  # noqa: E402
@@ -395,6 +396,68 @@ def test_h8_out_of_band_commit_is_contained(seeded_repo: Path) -> None:
     assert branch == "main"
     status = _git(seeded_repo, "status", "--porcelain", "-uno").stdout.strip()
     assert status == "", f"tracked files not clean after rollback: {status}"
+
+
+# --------------------------------------------------------------------------- #
+# H8b. Symlink file-lock bypass is rejected by mode (not just path)
+# --------------------------------------------------------------------------- #
+# An allowlisted path can be flipped from a regular file (mode 100644) to a
+# symlink (mode 120000) aimed at a locked file. The path never leaves the
+# allowlist, so the path-only gates pass it; the mode-aware check must reject it.
+def _stage_symlink(repo: Path, link_path: str, target: str) -> None:
+    """Stage ``link_path`` as a git symlink to ``target`` without touching disk.
+
+    Uses plumbing (blob + ``--cacheinfo`` mode 120000) so the test is portable
+    to platforms without filesystem symlink support, while producing the exact
+    tree entry a real symlink would.
+    """
+    (repo / "_link_target").write_text(target, encoding="utf-8")
+    blob = _git(repo, "hash-object", "-w", "_link_target").stdout.strip()
+    _git(repo, "update-index", "--add", "--cacheinfo", f"120000,{blob},{link_path}")
+
+
+def test_h8b_symlink_paths_parser() -> None:
+    raw = (
+        ":100644 120000 1111111 2222222 T\tsrc/app.py\n"
+        ":100644 100644 3333333 4444444 M\tsrc/keep.py\n"
+        ":000000 120000 0000000 5555555 A\tsrc/new_link\n"
+    )
+    assert lock_policy.symlink_paths(raw) == ["src/app.py", "src/new_link"]
+
+
+def test_h8c_staged_symlink_blocked_by_hook(seeded_repo: Path) -> None:
+    # queries.py is in the task allowlist; alias it onto the locked AGENTS.md.
+    _stage_symlink(seeded_repo, "harness/example/src/db/queries.py", "AGENTS.md")
+
+    env = os.environ.copy()
+    env.pop("SKIP_AGENT_HARNESS", None)
+    env["AGENT_TASK_ID"] = "optimise_query_layer"
+
+    res = subprocess.run(
+        [sys.executable, str(HOOK)], cwd=str(seeded_repo), capture_output=True, text=True, env=env
+    )
+    combined = res.stdout + res.stderr
+    assert res.returncode == 1, combined
+    assert "symlink" in combined.lower()
+    assert "harness/example/src/db/queries.py" in combined
+
+
+def test_h8d_committed_symlink_is_containment_breach(
+    seeded_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(seeded_repo)
+    ctx = _enforce_ctx(seeded_repo)
+
+    _stage_symlink(seeded_repo, "harness/example/src/db/queries.py", "AGENTS.md")
+    _git(seeded_repo, "-c", "core.hooksPath=.", "commit", "-m", "symlink bypass")
+
+    # Attribute the commit to the orchestrator so the out-of-band-commit layer
+    # stays quiet -- isolating the symlink (mode) detection as the sole trigger.
+    ctx.runner_commits.add(ctx.repo.head.commit.hexsha)
+
+    violations = agent_runner._containment_breach(ctx)
+    assert any("symlink" in v for v in violations), violations
+    assert any("harness/example/src/db/queries.py" in v for v in violations), violations
 
 
 # --------------------------------------------------------------------------- #

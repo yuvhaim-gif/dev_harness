@@ -35,6 +35,7 @@ from lock_policy import (  # noqa: E402
     UnknownMutationModeError,
     compute_allowlist,
     is_coordination_path,
+    symlink_paths,
 )
 
 try:
@@ -70,6 +71,16 @@ def _changed_files(base: str, head: str) -> list[str]:
         print(f"ERROR: could not diff {base}...{head}: {res.stderr.strip()}")
         sys.exit(1)
     return [line for line in res.stdout.splitlines() if line]
+
+
+def _changed_symlinks(base: str, head: str) -> list[str]:
+    # Mode-aware diff so an allowlisted path flipped to a symlink is caught.
+    res = _git("diff", "--raw", f"{base}...{head}")
+    if res.returncode != 0:
+        res = _git("diff", "--raw", f"{base}..{head}")
+    if res.returncode != 0:
+        return []
+    return symlink_paths(res.stdout)
 
 
 def _load_task(task_id: str) -> dict[str, object] | None:
@@ -126,6 +137,13 @@ def main(argv: list[str] | None = None) -> int:
         print(f"FAIL: task '{task_id}' has unknown mutation_mode '{exc}'.")
         return 1
 
+    links = sorted(_changed_symlinks(args.base, args.head))
+    if links:
+        failed = True
+        print(f"FAIL: task '{task_id}' introduced symlink(s) (file-lock bypass):")
+        for path in links:
+            print(f"  - {path}")
+
     changed = _changed_files(args.base, args.head)
     violations = sorted(f for f in changed if f not in allowed and not is_coordination_path(f))
     if violations:
@@ -134,7 +152,7 @@ def main(argv: list[str] | None = None) -> int:
         for path in violations:
             print(f"  - {path}")
         print("Allowed:", ", ".join(sorted(allowed)) or "(none)")
-    else:
+    elif not links:
         print(f"OK: all {len(changed)} changed file(s) are within '{task_id}' scope.")
 
     return 1 if failed else 0

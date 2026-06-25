@@ -28,6 +28,36 @@ CONTRACT_LOCK_PATH = ".harness/contracts.lock"
 
 COORDINATION_PREFIXES: tuple[str, ...] = (".harness/leases/", ".harness/journal/")
 
+# Git records a symlink with this tree mode. An allowlisted *path* can be
+# turned into a symlink (mode 100644 -> 120000) without ever leaving the
+# allowlist, which lets an agent alias an allowed path onto a locked file and
+# defeat the path-only lock gates. We therefore reject any agent-introduced
+# symlink outright, regardless of where it points.
+SYMLINK_MODE = "120000"
+
+
+def symlink_paths(raw_diff: str) -> list[str]:
+    """Paths whose resulting git mode is a symlink, from ``git diff --raw`` output.
+
+    ``--raw`` lines look like::
+
+        :<old_mode> <new_mode> <old_sha> <new_sha> <status>\\t<path>
+
+    The result is a symlink iff ``new_mode`` is ``120000``. Mode is read from
+    git's recorded tree entry (not ``os.path.islink``) so the check is portable
+    and works against committed history on a CI runner where the link may not be
+    materialised on disk.
+    """
+    out: list[str] = []
+    for line in raw_diff.splitlines():
+        if not line.startswith(":"):
+            continue
+        meta, _, path = line.partition("\t")
+        fields = meta.split()  # [:old_mode, new_mode, old_sha, new_sha, status]
+        if len(fields) >= 2 and fields[1] == SYMLINK_MODE and path:
+            out.append(path)
+    return out
+
 
 class UnknownMutationModeError(ValueError):
     """Raised when a task declares an unsupported mutation_mode."""
