@@ -416,7 +416,7 @@ configured ceiling is breached the run performs an **immediate financial abort**
 | `AGENT_COST_PER_1K_INPUT` | Per-1K input-token price used to derive cost when a payload omits it. |
 | `AGENT_COST_PER_1K_OUTPUT`| Per-1K output-token price used to derive cost when a payload omits it. |
 | `AGENT_TOKEN_USAGE_FILE`  | Override the default `.harness/telemetry/usage.json` sink path. |
-| `AGENT_STEP_TIMEOUT_SECONDS` | Per-step ceiling on a single `AGENT_LLM_CMD` invocation; an overrun aborts with a *timeout* reason and **exit 3**. |
+| `AGENT_STEP_TIMEOUT_SECONDS` | Per-step ceiling on a single `AGENT_LLM_CMD` invocation; an overrun aborts with a *timeout* reason and **exit 3**. The seam runs in its own session / process group, so an overrun kills the **whole process tree** (not just the immediate shell) — a forked grandchild cannot survive the timeout and keep mutating the tree after the rollback. |
 | `MAX_RUN_SECONDS`         | Wall-clock ceiling on the whole run; an overrun aborts with a *timeout* reason and **exit 3**. |
 
 The same circuit-breaker also enforces the two **time** ceilings above; a

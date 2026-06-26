@@ -15,6 +15,7 @@ import argparse
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -483,22 +484,39 @@ def _run_llm(ctx: RunContext, phase: str, repair_log: str = "", prompt_file: str
 
     log(f"[{phase}] invoking AGENT_LLM_CMD (provider-agnostic seam).")
     step_timeout = _env_float("AGENT_STEP_TIMEOUT_SECONDS")
+    # Put the seam shell in its own session / process group so a timeout can
+    # kill the WHOLE tree. With shell=True, subprocess.run's own timeout only
+    # SIGKILLs the immediate child (the shell); a forked grandchild
+    # (sh -> bash -> sleep ...) would be orphaned and keep mutating the tree
+    # after we have already rolled back. Killing the group closes that hole.
+    popen_kwargs: dict[str, Any] = {
+        "shell": True,
+        "env": _llm_env(ctx, phase, repair_log, prompt_file),
+    }
+    if os.name == "posix":
+        popen_kwargs["start_new_session"] = True
+    else:
+        popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    proc = subprocess.Popen(run_cmd, **popen_kwargs)
     try:
-        res = subprocess.run(
-            run_cmd,
-            shell=True,
-            env=_llm_env(ctx, phase, repair_log, prompt_file),
-            timeout=step_timeout,
-        )
+        proc.communicate(timeout=step_timeout)
     except subprocess.TimeoutExpired:
+        if os.name == "posix":
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)  # type: ignore[attr-defined]
+            except (ProcessLookupError, PermissionError):
+                proc.kill()
+        else:
+            proc.kill()
+        proc.communicate()
         ctx.timed_out = "step timeout (AGENT_STEP_TIMEOUT_SECONDS)"
         log(
             f"[{phase}] WARNING: AGENT_LLM_CMD exceeded AGENT_STEP_TIMEOUT_SECONDS; "
             "treating as a failed step."
         )
         return True
-    if res.returncode != 0:
-        log(f"[{phase}] WARNING: AGENT_LLM_CMD exited {res.returncode}.")
+    if proc.returncode != 0:
+        log(f"[{phase}] WARNING: AGENT_LLM_CMD exited {proc.returncode}.")
 
     # Wall-clock ceiling spanning every step of the run, not just this one.
     max_run = _env_float("MAX_RUN_SECONDS")
