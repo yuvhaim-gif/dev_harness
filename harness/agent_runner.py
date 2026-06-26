@@ -765,15 +765,27 @@ def _modified_paths(ctx: RunContext) -> list[str]:
     return sorted(seen)
 
 
-def _write_forensics(ctx: RunContext, outcome: str, reason: str, exit_code: int | None) -> None:
-    """Compile the post-mortem audit and print the containment badge once."""
+def _build_forensic_report(
+    ctx: RunContext, outcome: str, reason: str, exit_code: int | None
+) -> forensic.ForensicReport | None:
+    """Compile the post-mortem audit against the *current* (pre-rollback) tree.
+
+    The scope evidence in sections 1-3 (allowlist vs. modified paths, the
+    containment proof) must be read *before* ``_rollback`` wipes the working
+    tree, so this is called first at every abort site. The ``rollback_ok`` /
+    ``git_warnings`` fields are only provisional here; ``_emit_forensic_report``
+    refreshes them after the rollback actually runs so section 4 tells the truth.
+
+    Returns ``None`` when forensics are suppressed (dry run) or already emitted,
+    so callers can pass the result straight to ``_emit_forensic_report``.
+    """
     if ctx.dry_run or ctx.forensic_written:
-        return
+        return None
     allow = sorted(compute_allowlist(ctx.task.raw))
     modified = _modified_paths(ctx)
     out_of_scope = sorted(p for p in modified if p not in allow and not is_coordination_path(p))
     excerpt = log_condenser.condense(ctx.last_hook_log, repo_dir=_repo_dir(ctx))
-    report = forensic.ForensicReport(
+    return forensic.ForensicReport(
         task_id=ctx.task.task_id,
         mutation_mode=ctx.task.mutation_mode,
         outcome=outcome,
@@ -791,9 +803,33 @@ def _write_forensics(ctx: RunContext, outcome: str, reason: str, exit_code: int 
         rollback_ok=ctx.rollback_ok,
         env_scope="allowlisted" if os.getenv("AGENT_ENV_ALLOWLIST") else "full_copy",
     )
+
+
+def _emit_forensic_report(ctx: RunContext, report: forensic.ForensicReport | None) -> None:
+    """Write the audit and print the containment badge exactly once.
+
+    Refreshes the rollback-dependent fields from the context at emit time, so a
+    report *built* before ``_rollback`` still reports the real rollback verdict
+    (and any warnings the rollback itself raised) rather than the stale default.
+    """
+    if report is None or ctx.dry_run or ctx.forensic_written:
+        return
+    report.rollback_ok = ctx.rollback_ok
+    report.git_warnings = list(ctx.git_warnings)
     path = forensic.write_report(report, repo_dir=_repo_dir(ctx))
-    forensic.print_badge(outcome, path)
+    forensic.print_badge(report.outcome, path)
     ctx.forensic_written = True
+
+
+def _write_forensics(ctx: RunContext, outcome: str, reason: str, exit_code: int | None) -> None:
+    """Build and emit the forensic report in a single step.
+
+    Retained as a convenience wrapper for callers that do not roll back (or that
+    roll back *before* reporting). Abort paths that roll back afterwards must
+    instead call ``_build_forensic_report`` before ``_rollback`` and
+    ``_emit_forensic_report`` after it, so section 4 reflects the real outcome.
+    """
+    _emit_forensic_report(ctx, _build_forensic_report(ctx, outcome, reason, exit_code))
 
 
 def autorepair(ctx: RunContext) -> bool:
@@ -811,9 +847,10 @@ def autorepair(ctx: RunContext) -> bool:
             "should decide whether to fix the implementation or revise the "
             "test/contract that keeps failing."
         )
-        _write_forensics(ctx, "escalated", reason, exit_code=1)
+        report = _build_forensic_report(ctx, "escalated", reason, exit_code=1)
         _persist_journal(ctx, "escalated", notes=reason)
         _rollback(ctx)
+        _emit_forensic_report(ctx, report)
         return False
 
     # Condense the raw hook log and build a cache-ordered repair prompt so the
@@ -856,9 +893,12 @@ def _budget_abort(ctx: RunContext) -> bool:
         return False
     log(f"FINANCIAL ABORT: {reason}; {ctx.ledger.summary()}. Rolling back.")
     ctx.git_warnings.append(f"financial abort: {reason}")
-    _write_forensics(ctx, "escalated", f"financial abort -- {reason}", exit_code=BUDGET_ABORT_EXIT)
+    report = _build_forensic_report(
+        ctx, "escalated", f"financial abort -- {reason}", exit_code=BUDGET_ABORT_EXIT
+    )
     _persist_journal(ctx, "escalated", notes=f"financial abort: {reason}. {ctx.ledger.summary()}.")
     _rollback(ctx)
+    _emit_forensic_report(ctx, report)
     return True
 
 
@@ -873,13 +913,14 @@ def _timeout_abort(ctx: RunContext) -> bool:
         return False
     log(f"TIMEOUT ABORT: {ctx.timed_out}; {ctx.ledger.summary()}. Rolling back.")
     ctx.git_warnings.append(f"timeout abort: {ctx.timed_out}")
-    _write_forensics(
+    report = _build_forensic_report(
         ctx, "escalated", f"timeout abort -- {ctx.timed_out}", exit_code=BUDGET_ABORT_EXIT
     )
     _persist_journal(
         ctx, "escalated", notes=f"timeout abort: {ctx.timed_out}. {ctx.ledger.summary()}."
     )
     _rollback(ctx)
+    _emit_forensic_report(ctx, report)
     return True
 
 
@@ -899,9 +940,12 @@ def _guard_abort(ctx: RunContext) -> bool:
     )
     log(f"GUARD ABORT: {reason}. Rolling back.")
     ctx.git_warnings.append(f"guard abort: {reason}")
-    _write_forensics(ctx, "escalated", f"guard abort -- {reason}", exit_code=CONTAINMENT_ABORT_EXIT)
+    report = _build_forensic_report(
+        ctx, "escalated", f"guard abort -- {reason}", exit_code=CONTAINMENT_ABORT_EXIT
+    )
     _persist_journal(ctx, "escalated", notes=f"guard abort: {reason}.")
     _rollback(ctx)
+    _emit_forensic_report(ctx, report)
     return True
 
 
@@ -984,9 +1028,10 @@ def _containment_abort(ctx: RunContext) -> bool:
         log(f"  - {v}")
     reason = "containment breach -- " + "; ".join(violations)
     ctx.git_warnings.append(reason)
-    _write_forensics(ctx, "escalated", reason, exit_code=CONTAINMENT_ABORT_EXIT)
+    report = _build_forensic_report(ctx, "escalated", reason, exit_code=CONTAINMENT_ABORT_EXIT)
     _persist_journal(ctx, "escalated", notes=reason)
     _rollback(ctx)
+    _emit_forensic_report(ctx, report)
     return True
 
 
@@ -1587,13 +1632,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     except Exception as exc:  # noqa: BLE001
         log(f"unhandled error: {exc}; attempting rollback.")
         ctx.git_warnings.append(f"unhandled error: {exc}")
-        _write_forensics(ctx, "error", f"Unhandled error: {exc}", exit_code=1)
+        report = _build_forensic_report(ctx, "error", f"Unhandled error: {exc}", exit_code=1)
         _persist_journal(ctx, "error", notes=f"Unhandled error: {exc}")
         # After T02 the lease can be held before `checkout -b`, where _rollback
         # early-returns (branch_created is False) and would not release it.
         # _release_lease is idempotent, so call it directly to be safe.
         _release_lease(ctx, commit=False)
         _rollback(ctx)
+        _emit_forensic_report(ctx, report)
         return 1
 
 

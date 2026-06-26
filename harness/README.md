@@ -507,6 +507,13 @@ assertions, and git policy warnings, (3) a chronological step log with token
 consumption and cost per attempt, and (4) confirmation that the local working
 tree was safely rolled back.
 
+The scope evidence in sections 1–3 is compiled from the working tree **before**
+the rollback runs (so the containment proof is not erased by the `git reset
+--hard`), while the **Rollback Verification** in section 4 reflects the *actual*
+post-rollback outcome: the report is built before the rollback and emitted after
+it, so the verdict (`CONFIRMED` / `NOT CONFIRMED`) is the real one rather than a
+stale default.
+
 ### Diagnostics (`--doctor`)
 
 The coordination layer has several moving parts (a hashed manifest, TTL'd

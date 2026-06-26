@@ -258,6 +258,39 @@ def test_h5a_report_has_all_four_sections_and_breach(tmp_path: Path) -> None:
     assert Path(path).name == "FAILED_AGENT_RUN.md"
 
 
+class _EmitCtx:
+    """Minimal RunContext stand-in for exercising the forensic emit path."""
+
+    def __init__(self, repo_dir: str, rollback_ok: bool) -> None:
+        self.repo = type("R", (), {"working_tree_dir": repo_dir})()
+        self.dry_run = False
+        self.forensic_written = False
+        self.rollback_ok = rollback_ok
+        self.git_warnings: list[str] = []
+
+
+def test_h5b_emit_refreshes_rollback_ok_built_before_rollback(tmp_path: Path) -> None:
+    # Build-then-emit contract: a report constructed while rollback_ok was still
+    # False (i.e. before _rollback ran) must report the *real* rollback outcome
+    # once emitted after the rollback flips the flag. Before the split this field
+    # was frozen at build time and section 4 always read NOT CONFIRMED.
+    ctx = _EmitCtx(str(tmp_path), rollback_ok=False)
+    report = forensic.ForensicReport(
+        task_id="t", mutation_mode="isolated", outcome="escalated", rollback_ok=False
+    )
+
+    ctx.rollback_ok = True  # _rollback succeeded after the report was built
+    agent_runner._emit_forensic_report(ctx, report)
+
+    assert ctx.forensic_written is True
+    body = (tmp_path / ".harness" / "logs" / "FAILED_AGENT_RUN.md").read_text(encoding="utf-8")
+    assert "Local working tree rollback: **CONFIRMED**" in body
+    assert "NOT CONFIRMED" not in body
+
+    # Idempotent: a second emit must not double-write once forensic_written is set.
+    agent_runner._emit_forensic_report(ctx, report)
+
+
 # --------------------------------------------------------------------------- #
 # H6. Human override switch on the gating hooks
 # --------------------------------------------------------------------------- #
@@ -330,6 +363,13 @@ def test_h7_financial_abort_writes_forensic_and_rolls_back(seeded_repo: Path) ->
     assert branch == "main"
     status = _git(seeded_repo, "status", "--porcelain", "-uno").stdout.strip()
     assert status == "", f"tracked files not clean after rollback: {status}"
+
+    # Regression: the report is *built* before _rollback but *emitted* after, so
+    # section 4 must reflect the real (successful) rollback, not the stale False
+    # default. Before the build/emit split this always read NOT CONFIRMED even
+    # though the tree above is provably clean and back on main.
+    assert "Local working tree rollback: **CONFIRMED**" in body
+    assert "NOT CONFIRMED" not in body
 
 
 def test_h6_skip_agent_harness_bypasses_lock_hook(seeded_repo: Path) -> None:
