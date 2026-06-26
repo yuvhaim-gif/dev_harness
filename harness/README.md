@@ -110,7 +110,11 @@ dev_process/
 ├── pyproject.toml                     # Packaging + ruff / mypy / pytest config (root-discovered)
 ├── .pre-commit-config.yaml            # Syntax/lint/type + ledger + lock + contract hooks (root-required)
 ├── .gitignore
-├── .github/workflows/harness-ci.yml   # Trusted-runner re-check (lint/type/test + ci_enforce)
+├── .github/                           # Community health + trusted-runner CI
+│   ├── workflows/harness-ci.yml       # Trusted-runner re-check (lint/type/test + ci_enforce)
+│   ├── SECURITY.md                    # Private vulnerability-reporting policy
+│   ├── CONTRIBUTING.md                # Contribution + local-check guide
+│   └── CODE_OF_CONDUCT.md             # Contributor Covenant v2.1
 ├── .harness/                          # Harness-managed coordination + run state
 │   ├── contracts.lock                 # Hashed manifest of every declared contract
 │   ├── leases/                        # <task_id>.json — active task leases (TTL'd)
