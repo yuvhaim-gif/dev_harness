@@ -493,21 +493,21 @@ def _run_llm(ctx: RunContext, phase: str, repair_log: str = "", prompt_file: str
         "shell": True,
         "env": _llm_env(ctx, phase, repair_log, prompt_file),
     }
-    if os.name == "posix":
-        popen_kwargs["start_new_session"] = True
-    else:
+    if sys.platform == "win32":
         popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        popen_kwargs["start_new_session"] = True
     proc = subprocess.Popen(run_cmd, **popen_kwargs)
     try:
         proc.communicate(timeout=step_timeout)
     except subprocess.TimeoutExpired:
-        if os.name == "posix":
+        if sys.platform == "win32":
+            proc.kill()
+        else:
             try:
-                os.killpg(proc.pid, signal.SIGKILL)  # type: ignore[attr-defined]
+                os.killpg(proc.pid, signal.SIGKILL)
             except (ProcessLookupError, PermissionError):
                 proc.kill()
-        else:
-            proc.kill()
         proc.communicate()
         ctx.timed_out = "step timeout (AGENT_STEP_TIMEOUT_SECONDS)"
         log(
