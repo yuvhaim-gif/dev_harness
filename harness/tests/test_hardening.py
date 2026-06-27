@@ -229,6 +229,28 @@ def test_h4i_flags_survive_unparseable_command() -> None:
     assert res.suspicious
 
 
+def test_h4j_strips_no_verify_after_global_C_flag() -> None:
+    res = command_guard.sanitize_command("git -C /repo commit --no-verify -m x")
+    assert "--no-verify" in res.stripped
+    assert "--no-verify" not in res.sanitized
+
+
+def test_h4k_strips_short_n_after_git_dir_value_flag() -> None:
+    res = command_guard.sanitize_command("git --git-dir /repo/.git commit -n -m x")
+    assert "-n" in res.stripped
+    assert "-n" not in res.sanitized
+
+
+def test_h4l_value_flag_does_not_consume_real_subcommand() -> None:
+    res = command_guard.sanitize_command("git -c user.name=x commit --no-verify -m y")
+    assert "--no-verify" in res.stripped
+
+
+def test_h4m_global_flag_before_commit_tree_is_still_flagged() -> None:
+    res = command_guard.sanitize_command("git -C /repo commit-tree abc -m x")
+    assert any("commit-tree" in f for f in res.flagged)
+
+
 # --------------------------------------------------------------------------- #
 # H5. Forensic post-mortem
 # --------------------------------------------------------------------------- #

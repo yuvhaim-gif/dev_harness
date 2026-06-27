@@ -109,6 +109,7 @@ dev_process/
 ├── LICENSE                            # MIT license (Copyright (c) 2026 Yuval Haim)
 ├── pyproject.toml                     # Packaging + ruff / mypy / pytest config (root-discovered)
 ├── .pre-commit-config.yaml            # Syntax/lint/type + ledger + lock + contract hooks (root-required)
+├── .gitattributes                     # Normalises EOL to LF so contract hashes match cross-OS
 ├── .gitignore
 ├── .github/                           # Community health + trusted-runner CI
 │   ├── workflows/harness-ci.yml       # Trusted-runner re-check (lint/type/test + ci_enforce)
@@ -491,10 +492,14 @@ agent cannot influence (wired up in `.github/workflows/harness-ci.yml`):
    (coordination paths excepted), and
 3. no change on that branch may introduce a **symlink** — a `--raw` diff over
    the same range rejects any entry whose resulting mode is `120000`, so the
-   alias-to-a-locked-file bypass is blocked remotely too.
+   alias-to-a-locked-file bypass is blocked remotely too, and
+4. a contract changed on an agent branch must carry a change to at least one of
+   that task's bound `contract_tests` — the same binding the local
+   `enforce_contract_binding` hook applies, re-checked here so it survives a
+   branch pushed without the local hook (this runner ignores `SKIP_AGENT_HARNESS`).
 
-A non-agent (human) branch only gets the manifest check; its file scope is the
-reviewer's responsibility. Run it locally with
+A non-agent (human) branch only gets the manifest check; its file scope and
+bound-test discipline are the reviewer's responsibility. Run it locally with
 `python harness/ci_enforce.py --base <ref> --head <ref> [--task <id>]`.
 
 ---
@@ -596,7 +601,7 @@ bypasses do not defeat them.
 - The shared `harness-state` ref is a coordination convenience, not a consensus
   system. Under heavy concurrency prefer one clone per agent, or
   `AGENT_MINIMAL=1`.
-- The complexity is real: ~15 harness modules, a YAML ledger, a shared ref,
+- The complexity is real: ~16 harness modules, a YAML ledger, a shared ref,
   TTL'd leases, a journal, a hashed manifest, and a multi-stage pre-commit
   pipeline. `--doctor` exists specifically to make that surface debuggable; if
   you do not need cross-agent coordination, minimal mode collapses most of it.
@@ -644,6 +649,13 @@ python -m harness --init
 > hard to forget. Use `--init --example` to instead reproduce the bundled demo
 > ledger (handy for self-checking the harness), and `--force` to overwrite an
 > existing `AGENTS.md` / project README.
+>
+> On a fresh clone, `--doctor` prints two **expected** warnings, neither an
+> error: this template-README reminder, and an `AGENT_ENV_ALLOWLIST not set`
+> notice (without it the LLM subprocess inherits the full parent environment —
+> set `AGENT_ENV_ALLOWLIST` to scope it). Note that *this* repository is the
+> harness itself, so the template-README warning is expected here; it clears in
+> any project that runs `--init`.
 
 ---
 
@@ -782,6 +794,7 @@ throwaway git repos in a temp dir):
 | **F12** state sync | `test_f12_publish_files_returns_false_on_unreachable_remote` | A push that cannot reach its remote returns `False` (no silent swallow). |
 | **F13** manifest   | `test_f13_corrupt_lock_reports_cleanly`               | A corrupt `contracts.lock` yields an actionable message, not a traceback. |
 | **F14** CI re-check| `test_f14a/b_ci_enforce_*_agent_branch`               | `ci_enforce.py` blocks an out-of-scope agent branch and passes an in-scope one. |
+| **F14** CI binding | `test_f14c/d_ci_enforce_*_bound_test`                 | `ci_enforce.py` blocks a contract change that omits its bound `contract_tests` and passes one that includes them. |
 | **F15** bootstrap  | `test_f15a_init_writes_empty_skeleton_that_validates` | `--init` writes a project README + an empty `AGENTS.md` skeleton that validates. |
 | **F15**            | `test_f15b_init_example_recreates_shipped_ledger`     | `--init --example` reproduces the shipped example ledger byte-for-byte. |
 | **F15**            | `test_f15c_doctor_flags_template_readme_then_init_clears_it` | `--doctor` warns on the template README; `--init` clears the sentinel. |

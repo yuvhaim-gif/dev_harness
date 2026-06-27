@@ -6,12 +6,16 @@ skipped by an agent that does its own git (``-c core.hooksPath=...`` or
 plumbing). This script re-applies the *same* policy against the aggregate diff
 of a pushed branch, from a trusted CI runner the agent cannot influence:
 
-  1. the hashed contract manifest must still verify (no silent drift), and
+  1. the hashed contract manifest must still verify (no silent drift),
   2. every file changed on an ``agent/<task_id>/...`` branch must fall inside
-     that task's computed allowlist (coordination paths excepted).
+     that task's computed allowlist (coordination paths excepted), and
+  3. a contract changed on an agent branch must carry a change to at least one
+     of that task's bound ``contract_tests`` -- the same binding the local
+     ``enforce_contract_binding`` hook applies, re-checked here so it holds even
+     when the local hook was skipped (this runner ignores ``SKIP_AGENT_HARNESS``).
 
-A human (non-agent) branch only gets the manifest check; its file scope is the
-reviewer's responsibility, not the harness's.
+A human (non-agent) branch only gets the manifest check; its file scope and
+bound-test discipline are the reviewer's responsibility, not the harness's.
 
 Usage:
     python harness/ci_enforce.py [--base <ref>] [--head <ref>] [--task <id>]
@@ -154,6 +158,25 @@ def main(argv: list[str] | None = None) -> int:
         print("Allowed:", ", ".join(sorted(allowed)) or "(none)")
     elif not links:
         print(f"OK: all {len(changed)} changed file(s) are within '{task_id}' scope.")
+
+    # 3. Contract<->test binding, re-applied server-side. enforce_contract_binding
+    #    runs locally but is skippable by an agent that does its own git; this
+    #    re-check holds on the trusted runner so a contract change that omits its
+    #    bound test cannot pass green on a directly pushed or orphaned branch.
+    #    (The manifest half of the binding is covered by step 1 above.)
+    raw_contracts = task.get("contracts") or []
+    raw_tests = task.get("contract_tests") or []
+    contracts = set(raw_contracts) if isinstance(raw_contracts, list) else set()
+    contract_tests = set(raw_tests) if isinstance(raw_tests, list) else set()
+    changed_set = set(changed)
+    touched_contracts = sorted(changed_set & contracts)
+    if touched_contracts and contract_tests and not (changed_set & contract_tests):
+        failed = True
+        print(
+            f"FAIL: task '{task_id}' changed a contract "
+            f"({', '.join(touched_contracts)}) without updating any bound "
+            "contract_test: " + ", ".join(sorted(contract_tests))
+        )
 
     return 1 if failed else 0
 

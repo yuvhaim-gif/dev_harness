@@ -30,6 +30,12 @@ _SEPARATORS = frozenset({"&&", "||", "|", ";", "&"})
 _GIT_SUBCOMMANDS = frozenset({"commit", "push"})
 _GIT_NAMES = frozenset({"git", "git.exe"})
 
+# Global git options that consume the *next* token as their value, so that
+# value must never be mistaken for the subcommand (e.g. ``git -C <path> commit``).
+_GIT_VALUE_FLAGS = frozenset(
+    {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env"}
+)
+
 # Low-level git that writes history without firing the pre-commit hooks.
 _FLAGGED_SUBCOMMANDS = frozenset(
     {"commit-tree", "update-ref", "fast-import", "hash-object", "update-index"}
@@ -92,6 +98,7 @@ def sanitize_command(cmd: str | None) -> GuardResult:
     flagged: list[str] = []
     in_git = False
     git_sub = ""
+    skip_value = False  # the previous token was a value-taking global flag
 
     for tok in tokens:
         if _HOOKSPATH_NEEDLE in tok.lower():
@@ -99,15 +106,31 @@ def sanitize_command(cmd: str | None) -> GuardResult:
         if tok in _SEPARATORS:
             in_git = False
             git_sub = ""
+            skip_value = False
             out.append(tok)
             continue
         base = os.path.basename(tok).lower()
         if not in_git and base in _GIT_NAMES:
             in_git = True
             git_sub = ""
+            skip_value = False
             out.append(tok)
             continue
-        if in_git and not git_sub and not tok.startswith("-"):
+        if in_git and not git_sub:
+            # Still scanning git's global options, before the subcommand.
+            if skip_value:
+                skip_value = False
+                out.append(tok)
+                continue
+            if tok in _GIT_VALUE_FLAGS:
+                skip_value = True
+                out.append(tok)
+                continue
+            if tok.startswith("-"):
+                # A no-value global flag, or a joined ``--flag=value`` form;
+                # never the subcommand.
+                out.append(tok)
+                continue
             git_sub = tok.lower()
             if git_sub in _FLAGGED_SUBCOMMANDS:
                 flagged.append(f"low-level git: {git_sub}")

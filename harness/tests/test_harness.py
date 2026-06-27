@@ -615,6 +615,37 @@ def test_f14b_ci_enforce_allows_in_scope_agent_branch(harness_repo: Path) -> Non
     assert res.returncode == 0, res.stdout + res.stderr
 
 
+def test_f14c_ci_enforce_blocks_contract_change_without_bound_test(harness_repo: Path) -> None:
+    base = _seed_contract_lock(harness_repo)
+    _git(harness_repo, "checkout", "-b", "agent/add_payments_endpoint/20260101T000000Z")
+    with (harness_repo / "harness/example/docs/API_SCHEMA.md").open("a", encoding="utf-8") as fh:
+        fh.write("\n## new field\n")
+    subprocess.run([sys.executable, str(MANIFEST), "--update"], cwd=str(harness_repo), check=True)
+    _git(harness_repo, "add", "-A")
+    _git(harness_repo, "commit", "-m", "contract change, no test")
+
+    res = _run_ci_enforce(harness_repo, base)
+    assert res.returncode == 1, res.stdout + res.stderr
+    assert "bound" in res.stdout and "contract_test" in res.stdout
+
+
+def test_f14d_ci_enforce_allows_contract_change_with_bound_test(harness_repo: Path) -> None:
+    base = _seed_contract_lock(harness_repo)
+    _git(harness_repo, "checkout", "-b", "agent/add_payments_endpoint/20260101T000000Z")
+    schema = harness_repo / "harness/example/docs/API_SCHEMA.md"
+    bound_test = harness_repo / "harness/example/tests/test_payments.py"
+    with schema.open("a", encoding="utf-8") as fh:
+        fh.write("\n## new field\n")
+    with bound_test.open("a", encoding="utf-8") as fh:
+        fh.write("\n# cover new field\n")
+    subprocess.run([sys.executable, str(MANIFEST), "--update"], cwd=str(harness_repo), check=True)
+    _git(harness_repo, "add", "-A")
+    _git(harness_repo, "commit", "-m", "contract change with test")
+
+    res = _run_ci_enforce(harness_repo, base)
+    assert res.returncode == 0, res.stdout + res.stderr
+
+
 # --------------------------------------------------------------------------- #
 # F15. Bootstrap (--init) and the doctor README sentinel
 # --------------------------------------------------------------------------- #
