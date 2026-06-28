@@ -251,6 +251,45 @@ def test_h4m_global_flag_before_commit_tree_is_still_flagged() -> None:
     assert any("commit-tree" in f for f in res.flagged)
 
 
+def test_h4n_flags_bypass_via_command_substitution() -> None:
+    res = command_guard.sanitize_command("echo $(git commit --no-verify)")
+    assert res.suspicious
+    assert any("obfuscated git-bypass" in f for f in res.flagged)
+
+
+def test_h4o_flags_bypass_via_backticks() -> None:
+    res = command_guard.sanitize_command("`git commit -m x --no-verify`")
+    assert res.suspicious
+    assert any("obfuscated git-bypass" in f for f in res.flagged)
+
+
+def test_h4p_flags_bypass_via_shell_variable() -> None:
+    res = command_guard.sanitize_command("GIT=git; $GIT commit --no-verify")
+    assert res.suspicious
+    assert any("obfuscated git-bypass" in f for f in res.flagged)
+
+
+def test_h4q_obfuscated_bypass_is_not_double_charged() -> None:
+    # A cleanly stripped flag must stay tampered-only, never also suspicious,
+    # so the orchestrator charges exactly one guard penalty for it.
+    res = command_guard.sanitize_command("git commit --no-verify -m x")
+    assert res.tampered
+    assert not res.suspicious
+
+
+def test_h4r_bypass_in_other_segment_is_not_flagged() -> None:
+    # Clean git + a benign `-n` in a different segment must not be mistaken for
+    # an obfuscated git-bypass.
+    res = command_guard.sanitize_command("echo -n hi && git commit -m ok")
+    assert not res.suspicious
+
+
+def test_h4s_bypass_inside_quoted_message_is_not_flagged() -> None:
+    res = command_guard.sanitize_command('git commit -m "note: --no-verify is bad"')
+    assert not res.suspicious
+    assert not res.tampered
+
+
 # --------------------------------------------------------------------------- #
 # H5. Forensic post-mortem
 # --------------------------------------------------------------------------- #

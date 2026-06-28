@@ -17,6 +17,14 @@ them: the orchestrator logs the policy event, penalises the repair counter, and
 the post-hoc containment gate (see ``agent_runner._containment_breach``) plus the
 server-side CI re-check (see ``harness/ci_enforce.py``) are the authoritative
 defences.
+
+The same evasion applies to the bypass *flags*: the structured pass only strips
+``--no-verify``/``-n`` when ``git`` is a clean shell token, so hiding git behind
+command substitution (``$(git commit --no-verify)``), backticks
+(```git commit --no-verify```), or a shell variable (``$GIT commit --no-verify``)
+slips a bypass flag past the stripper untouched. Those obfuscated tokens cannot
+be safely rewritten either, so like the plumbing patterns above they are
+*flagged* (and charged a guard penalty) rather than silently passed.
 """
 
 from __future__ import annotations
@@ -41,6 +49,11 @@ _FLAGGED_SUBCOMMANDS = frozenset(
     {"commit-tree", "update-ref", "fast-import", "hash-object", "update-index"}
 )
 _HOOKSPATH_NEEDLE = "hookspath"
+
+# Shell-meta characters wrapping a token when git (or a bypass flag) is hidden in
+# a command substitution / backtick / variable expansion, e.g. ``$(git``,
+# ```git``, ``$GIT``, ``${GIT}`` or ``--no-verify)``.
+_SHELL_META = "$(){}`\"'"
 
 
 @dataclass
@@ -76,6 +89,52 @@ def _literal_flagged(cmd: str) -> list[str]:
         if f" {sub}" in f" {low}":
             flagged.append(f"low-level git: {sub}")
     return sorted(set(flagged))
+
+
+def _is_obfuscated_git(tok: str) -> bool:
+    """True when ``tok`` is a git invocation hidden behind shell-meta wrapping.
+
+    A clean ``git`` token is returned untouched by ``strip``; an obfuscated one
+    (``$(git``, ```git``, ``$GIT``, ``${GIT}``) loses its wrapper and only then
+    resolves to a git name, which is exactly what defeats the structured strip.
+    """
+    core = tok.strip(_SHELL_META)
+    if core == tok:
+        return False
+    return os.path.basename(core).lower() in _GIT_NAMES
+
+
+def _obfuscated_bypass(tokens: list[str]) -> list[str]:
+    """Flag bypass flags riding on an obfuscated git commit/push.
+
+    Per shell segment, require all three signals together — an obfuscated git
+    token, a ``commit``/``push`` subcommand, and a bypass flag — so a benign
+    ``echo -n hi && git commit`` (clean git, flag in a different segment) is
+    never flagged.
+    """
+    found: set[str] = set()
+    obf_git = sub = False
+    bypass: set[str] = set()
+
+    def _flush() -> None:
+        if obf_git and sub and bypass:
+            found.update(bypass)
+
+    for tok in tokens:
+        if tok in _SEPARATORS:
+            _flush()
+            obf_git = sub = False
+            bypass = set()
+            continue
+        if _is_obfuscated_git(tok):
+            obf_git = True
+        if tok.lower() in _GIT_SUBCOMMANDS:
+            sub = True
+        core = tok.strip(_SHELL_META)
+        if core in _BYPASS_FLAGS:
+            bypass.add(core)
+    _flush()
+    return sorted(found)
 
 
 def sanitize_command(cmd: str | None) -> GuardResult:
@@ -141,6 +200,7 @@ def sanitize_command(cmd: str | None) -> GuardResult:
             continue
         out.append(tok)
 
+    flagged.extend(f"obfuscated git-bypass: {f}" for f in _obfuscated_bypass(tokens))
     flagged = sorted(set(flagged))
     if not stripped:
         return GuardResult(original=cmd, sanitized=cmd, flagged=flagged)
