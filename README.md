@@ -57,6 +57,7 @@ when the local hooks are skipped).
   - [Forensic post-mortem diagnostics](#forensic-post-mortem-diagnostics)
   - [Diagnostics (`--doctor`)](#diagnostics---doctor)
   - [Minimal mode](#minimal-mode)
+  - [Journal growth & cleanup](#journal-growth--cleanup)
 - [Threat model & failure modes](#threat-model--failure-modes)
 - [Requirements](#requirements)
 - [Setup](#setup)
@@ -96,7 +97,7 @@ flowchart TD
 | **Mutate** | Dispatch on `mutation_mode` (`evolve` / `isolated`) and invoke `AGENT_LLM_CMD` — a provider-agnostic shell command — with the task context and allowlist exported as environment variables. The subprocess environment is **scoped by `AGENT_ENV_ALLOWLIST`** (comma/newline-separated names); when it is unset the seam falls back to a full copy of the parent environment and logs a one-time warning, and the active scope is recorded as an `env_scope` (`allowlisted` / `full_copy`) audit field in the forensic report and `--doctor`. The command string is then scanned by the command guard: git bypass flags (`--no-verify` / `-n`) are **stripped** when `git` is a clean token, and unstrippable evasion patterns are **flagged** — `core.hooksPath`, plumbing such as `commit-tree`/`update-ref`, and a bypass flag riding on an *obfuscated* git commit/push where `git` is hidden behind command substitution (`$(git commit --no-verify)`), backticks, or a shell variable (`$GIT commit --no-verify`) so the stripper cannot reach it; each guard hit charges a separate `guard_penalties` budget (its own exit-4 ceiling), not the autorepair counter. The git environment is also hardened (`GIT_CONFIG_NOSYSTEM`, dropped `GIT_CONFIG_GLOBAL`). After the run the per-step token/cost payload is read and accumulated. A no-op when `AGENT_LLM_CMD` is unset (the seam is honest about being inactive). |
 | **Enforce** | Stage **only** the task's allowlist (POSIX-normalized), commit with `AGENT_TASK_ID` set so the lock / contract-binding hooks gate it, then classify the result as `passed` / `mechanical` / `semantic`. Every attempt is appended to the journal. After each step the **token/cost budget** is checked; a breach triggers an immediate financial abort (forensic report + hard rollback + exit 3). The same checkpoint enforces **time ceilings** — a per-step `AGENT_STEP_TIMEOUT_SECONDS` and a wall-clock `MAX_RUN_SECONDS` — which also exit 3 but stamp a *timeout* reason distinct from a financial/budget abort. |
 | **Autorepair** | On a semantic failure, **condense** the hook log to its load-bearing assertions and build a **cache-ordered** repair prompt (static rules → task contracts → dynamic diff/log/ledger), fed to the LLM via `AGENT_REPAIR_LOG` / `AGENT_REPAIR_PROMPT_FILE`. When `max_autorepair_attempts` is exceeded, journal `escalated`, write a forensic report, **roll back** to the original branch, release the lease, and exit non-zero. |
-| **Reconcile** | Run the optimistic **staleness guard** against `AGENT_SHARED_REF` (default `origin/main`); if any critical file moved since the base commit, journal `stale`, refuse the push, and exit 1. Otherwise push (when `origin` exists), open a PR via `gh` if available (or print the exact manual command), release the lease, and journal `pushed` / `local`. |
+| **Reconcile** | Run the optimistic **staleness guard** against `AGENT_SHARED_REF` (default `origin/main`); if any critical file moved since the base commit, journal `stale`, refuse the push, and exit 1. Otherwise push (when `origin` exists), open a PR via `gh` if available (or print the exact manual command), release the lease, and journal `pushed` / `local`. If the push itself fails after a clean local run, the journal is re-finalized to a **recoverable `error`** outcome (the work stays committed locally on the branch and the lease is already released), so re-running the task retries the push instead of stranding the run on a misleading `pushed` state. |
 
 ---
 
@@ -462,6 +463,13 @@ them. The agent orchestrator never sets it, and the LLM seam **strips it from
 the subprocess environment** (even in full-copy mode), so a value inherited from
 the parent env cannot disable the hooks for git commands the agent itself spawns.
 
+The same rule covers the orchestrator's **own** commits: it builds their git
+environment through `_commit_env()`, which sets `AGENT_TASK_ID` and **drops
+`SKIP_AGENT_HARNESS`** so the override can never disable the lock / contract
+gates during an autonomous run. If the switch is set when a run starts,
+`initialize` logs a one-time warning that it is being ignored for the run's
+commits.
+
 ---
 
 ## Containment defences
@@ -544,7 +552,9 @@ runs a single read-only health pass and prints, in one place:
   exit),
 - every local **lease** with its `ACTIVE` / `expired (reclaimable)` state, owner,
   and branch (and a `PROBLEM` line for an unreadable one),
-- any **unresolved handover journals** awaiting the next agent,
+- any **unresolved handover journals** awaiting the next agent, plus a
+  **`journal files: N committed (M unresolved)`** count so journal growth is
+  visible at a glance (see [Journal growth & cleanup](#journal-growth--cleanup)),
 - whether the **shared state ref** resolves, and
 - whether the root **README** is still the harness template (a soft warning,
   cleared by replacing it or running `--init`).
@@ -561,6 +571,29 @@ do not need it. Set `AGENT_MINIMAL=1` (or `AGENT_DISABLE_STATE_SYNC=1`) to keep
 the full local file-lock + contract guarantee while skipping the cross-clone
 git-plumbing entirely — leases and journals are still written locally, they are
 just not mirrored to the shared ref.
+
+### Journal growth & cleanup
+
+Handover records under `.harness/journal/` are **committed** so an unresolved
+session can be recovered from any clone (and, with the shared state ref, across
+clones). This is intentional, but it means the directory **accumulates over
+time**; `--doctor` surfaces the running total (`journal files: N committed
+(M unresolved)`) so the growth never goes unnoticed.
+
+The harness does **not** prune journals automatically. Deleting committed
+journals dirties the working tree, and `initialize` refuses to start on a dirty
+tree — an auto-pruner would therefore block the next run. Cleanup is a
+deliberate **manual** operation: remove old, *resolved* journals and commit the
+deletions yourself so the tree is clean for the next run, e.g.
+
+```bash
+git rm .harness/journal/<old-resolved-branch>.json
+git commit -m "chore: prune resolved handover journals"
+```
+
+Keep any journal whose outcome is still unresolved (`escalated` / `error` /
+`stale`) — those are exactly the records the next agent recovers. Automatic
+shared-ref retention is a known, deferred enhancement.
 
 ---
 
@@ -864,7 +897,9 @@ workload's contracts.
 - **No-remote tolerant** — Initialize and Reconcile both guard on `origin`, so a
   fresh, remote-less repo never crashes.
 - **Honest reconcile** — a PR is opened via `gh` or an exact manual command is
-  printed; the framework never falsely claims a PR was created.
+  printed; the framework never falsely claims a PR was created. A push that fails
+  after a clean local run is re-journaled to a recoverable `error` (work retained
+  locally, lease released) so a re-run retries it rather than reporting `pushed`.
 - **Mechanical vs. semantic** — a failed commit is classified by inspecting
   whether an auto-fixer **dirtied the worktree** (not by string-matching English
   hook wording); a mechanical rewrite triggers a single re-stage+retry and does
@@ -914,9 +949,10 @@ workload's contracts.
   subsystem in one pass; `AGENT_MINIMAL=1` drops the shared-ref machinery for
   simple single-agent runs.
 - **Human override** — `SKIP_AGENT_HARNESS=1` lets a developer bypass the gates
-  for sweeping manual changes; the orchestrator never sets it and the LLM seam
-  strips it from the subprocess env, so it cannot be inherited into
-  agent-spawned git commands.
+  for sweeping manual changes; the orchestrator never sets it, the LLM seam
+  strips it from the subprocess env, and the runner's own commits go through
+  `_commit_env()` which drops it too (with a one-time warning at `initialize`),
+  so it cannot be inherited into any git command an autonomous run issues.
 - **Forensic containment** — a rejected/crashed run leaves a transparent
   `.harness/logs/FAILED_AGENT_RUN.md` and a terminal badge, with the working
   tree verified clean.
