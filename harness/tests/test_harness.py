@@ -204,6 +204,45 @@ def test_f4b_validator_fails_on_corrupt_ledger(harness_repo: Path) -> None:
     assert res.returncode == 1
 
 
+def test_f4d_validator_rejects_non_int_attempts_and_scalar_list_field(
+    harness_repo: Path,
+) -> None:
+    ledger = (
+        "schema_version: 1\n"
+        "tasks:\n"
+        "  bad:\n"
+        "    mutation_mode: isolated\n"
+        "    max_autorepair_attempts: three\n"
+        "    targets: not-a-list\n"
+    )
+    _write(harness_repo, "AGENTS.md", ledger)
+    res = subprocess.run(
+        [sys.executable, str(VALIDATOR), "AGENTS.md"],
+        cwd=str(harness_repo),
+        capture_output=True,
+        text=True,
+    )
+    assert res.returncode == 1
+    assert "max_autorepair_attempts must be an integer" in res.stdout
+    assert "field 'targets' must be a list" in res.stdout
+
+
+def test_f4d_parse_task_rejects_bad_attempts(
+    harness_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ledger = (
+        "schema_version: 1\n"
+        "tasks:\n"
+        "  bad:\n"
+        "    mutation_mode: isolated\n"
+        "    max_autorepair_attempts: three\n"
+    )
+    _write(harness_repo, "AGENTS.md", ledger)
+    monkeypatch.chdir(harness_repo)
+    with pytest.raises(SystemExit):
+        agent_runner._parse_task("bad")
+
+
 # --------------------------------------------------------------------------- #
 # F4c. Isolate: lease gates branch creation (T02) + top-level guard (T06)
 # --------------------------------------------------------------------------- #
@@ -409,6 +448,78 @@ def test_f8b_acquire_writes_atomically_and_byte_stable(
 
     leftovers = [p for p in os.listdir(leases.LEASES_DIR) if p.endswith(".tmp")]
     assert leftovers == []
+
+
+def test_acquire_exclusive_when_absent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # A fresh claim takes the O_EXCL create fast path and stays byte-stable.
+    monkeypatch.chdir(tmp_path)
+    ok, lease = leases.acquire("t", "agent/t/1", "agent-a", "base", ["src/b.py", "src/a.py"])
+    assert ok and lease is not None
+
+    raw = Path(leases.lease_path("t")).read_text(encoding="utf-8")
+    assert raw == json.dumps(lease, indent=2, sort_keys=True) + "\n"
+    assert [p for p in os.listdir(leases.LEASES_DIR) if p.endswith(".tmp")] == []
+
+
+def test_acquire_blocks_live_other_agent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    ok, _ = leases.acquire("t", "agent/t/1", "agent-a", "base", ["x"])
+    assert ok
+
+    ok2, holder = leases.acquire("t", "agent/t/2", "agent-b", "base", ["x"])
+    assert not ok2
+    assert holder is not None and holder["agent_id"] == "agent-a"
+
+
+def test_acquire_reclaims_expired(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # An expired lease is present, so the create fast path is skipped and the
+    # atomic-replace reclaim takes over, handing ownership to the new agent.
+    monkeypatch.chdir(tmp_path)
+    expired = {
+        "task_id": "t",
+        "branch": "agent/t/old",
+        "agent_id": "agent-b",
+        "base_commit": "base",
+        "targets": [],
+        "created_at": "2000-01-01T00:00:00Z",
+        "ttl_seconds": 1,
+    }
+    os.makedirs(leases.LEASES_DIR, exist_ok=True)
+    Path(leases.lease_path("t")).write_text(
+        json.dumps(expired, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+
+    ok, lease = leases.acquire("t", "agent/t/new", "agent-a", "base", ["x"])
+    assert ok and lease is not None and lease["agent_id"] == "agent-a"
+    on_disk = leases.read_lease("t")
+    assert on_disk is not None and on_disk["agent_id"] == "agent-a"
+    assert [p for p in os.listdir(leases.LEASES_DIR) if p.endswith(".tmp")] == []
+
+
+def test_acquire_lost_race_blocks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # We read "absent", enter the exclusive-create fast path, but lose the race:
+    # the create fails and a live OTHER-agent lease is now present, so we back off.
+    monkeypatch.chdir(tmp_path)
+    competitor = {
+        "task_id": "t",
+        "branch": "agent/t/b",
+        "agent_id": "agent-b",
+        "base_commit": "base",
+        "targets": [],
+        "created_at": leases._stamp(leases._now()),
+        "ttl_seconds": leases.DEFAULT_TTL_SECONDS,
+    }
+    reads = iter([None, competitor])  # 1st: absent; 2nd (post-race): live competitor
+    monkeypatch.setattr(leases, "read_lease", lambda *a, **k: next(reads))
+
+    def boom(*_a: object, **_k: object) -> int:
+        raise FileExistsError
+
+    monkeypatch.setattr(leases.os, "open", boom)
+
+    ok, holder = leases.acquire("t", "agent/t/a", "agent-a", "base", ["x"])
+    assert not ok
+    assert holder is not None and holder["agent_id"] == "agent-b"
 
 
 # --------------------------------------------------------------------------- #
@@ -718,6 +829,24 @@ def test_f15c_doctor_flags_template_readme_then_init_clears_it(empty_repo: Path)
     assert "project-owned" in after.stdout
 
 
+def test_f15d_doctor_reports_journal_file_count(empty_repo: Path) -> None:
+    (empty_repo / "AGENTS.md").write_text("schema_version: 1\n\ntasks: {}\n", encoding="utf-8")
+    jdir = empty_repo / ".harness" / "journal"
+    jdir.mkdir(parents=True)
+    (jdir / "agent__t__1.json").write_text(
+        json.dumps({"task_id": "t", "branch": "agent/t/1", "outcome": "error"}),
+        encoding="utf-8",
+    )
+    (jdir / "agent__t__2.json").write_text(
+        json.dumps({"task_id": "t", "branch": "agent/t/2", "outcome": "pushed"}),
+        encoding="utf-8",
+    )
+
+    res = _run_module(empty_repo, "--doctor")
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert "journal files: 2 committed (1 unresolved)" in res.stdout
+
+
 # --------------------------------------------------------------------------- #
 # F16. Drive state machine is a testable dispatcher (T13)
 # --------------------------------------------------------------------------- #
@@ -893,3 +1022,131 @@ def test_f18_editable_install_exposes_console_script(tmp_path: Path) -> None:
     )
     assert via_module.returncode == 0, via_module.stdout + via_module.stderr
     assert "agent-workflow-harness" in via_module.stdout
+
+
+# --------------------------------------------------------------------------- #
+# F19. Reconcile push-failure recovery (recoverable error outcome)
+# --------------------------------------------------------------------------- #
+class _RecordingGit:
+    """Wrap a real ``git.Git`` but intercept ``push`` with a test double."""
+
+    def __init__(self, real: object, push: object) -> None:
+        self._real = real
+        self._push = push
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._real, name)
+
+    def push(self, *args: object, **kwargs: object) -> object:
+        return self._push(*args, **kwargs)  # type: ignore[operator]
+
+
+def _reconcile_ctx(repo_path: Path) -> agent_runner.RunContext:
+    ctx = _ctx_for(repo_path, "agent-a")
+    ctx.work_branch = "agent/optimise_query_layer/recon"
+    ctx.journal_entry = journal.start_session(ctx.task.task_id, ctx.work_branch, ctx.base_commit)
+    return ctx
+
+
+def _journal_outcome(branch: str) -> str:
+    data = json.loads(Path(journal.session_path(branch)).read_text(encoding="utf-8"))
+    return str(data["outcome"])
+
+
+def test_reconcile_success_pushes_and_journals_pushed(
+    harness_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(harness_repo)
+    monkeypatch.setenv("AGENT_MINIMAL", "1")  # local-only: skip shared-ref publish
+    monkeypatch.setattr(agent_runner, "_has_origin", lambda repo: True)
+    monkeypatch.setattr(agent_runner, "_staleness_guard", lambda ctx: [])
+    monkeypatch.setattr(agent_runner, "_open_pr", lambda ctx: None)
+
+    ctx = _reconcile_ctx(harness_repo)
+    calls = {"n": 0}
+
+    def push(*args: object, **kwargs: object) -> str:
+        calls["n"] += 1
+        return ""
+
+    monkeypatch.setattr(ctx.repo, "git", _RecordingGit(ctx.repo.git, push))
+
+    assert agent_runner.reconcile(ctx) == 0
+    assert calls["n"] == 1
+    assert _journal_outcome(ctx.work_branch) == "pushed"
+
+
+def test_reconcile_failed_push_marks_error_and_returns_1(
+    harness_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(harness_repo)
+    monkeypatch.setenv("AGENT_MINIMAL", "1")
+    monkeypatch.setattr(agent_runner, "_has_origin", lambda repo: True)
+    monkeypatch.setattr(agent_runner, "_staleness_guard", lambda ctx: [])
+    monkeypatch.setattr(agent_runner, "_open_pr", lambda ctx: None)
+
+    ctx = _reconcile_ctx(harness_repo)
+    calls = {"n": 0}
+
+    def push(*args: object, **kwargs: object) -> str:
+        calls["n"] += 1
+        raise git.exc.GitCommandError(["push"], 128, b"remote rejected")
+
+    monkeypatch.setattr(ctx.repo, "git", _RecordingGit(ctx.repo.git, push))
+
+    assert agent_runner.reconcile(ctx) == 1
+    assert calls["n"] == 1
+    # The terminal state is the recoverable 'error', not the optimistic 'pushed'.
+    assert _journal_outcome(ctx.work_branch) == "error"
+    assert "error" in journal.UNRESOLVED_OUTCOMES
+
+
+# --------------------------------------------------------------------------- #
+# F20. The runner's own commit env never inherits the human override
+# --------------------------------------------------------------------------- #
+def _minimal_task(task_id: str = "t") -> agent_runner.TaskSpec:
+    return agent_runner.TaskSpec(
+        task_id=task_id,
+        description="",
+        mutation_mode="isolated",
+        spec_docs=[],
+        tests=[],
+        targets=[],
+        locked_files=[],
+        commit_prefix="chore",
+        max_autorepair_attempts=3,
+        pr_labels=[],
+        contracts=[],
+        contract_tests=[],
+        raw={},
+    )
+
+
+def test_commit_env_drops_human_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SKIP_AGENT_HARNESS", "1")
+    ctx = agent_runner.RunContext(
+        repo=None,  # type: ignore[arg-type]
+        task=_minimal_task("payments"),
+        dry_run=False,
+    )
+    env = agent_runner._commit_env(ctx)
+    assert "SKIP_AGENT_HARNESS" not in env
+    assert env["AGENT_TASK_ID"] == "payments"
+
+
+# --------------------------------------------------------------------------- #
+# F21. Autorepair journals the real enforce status, not a hardcoded label
+# --------------------------------------------------------------------------- #
+def test_autorepair_records_real_status_below_cap(
+    harness_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(harness_repo)
+    monkeypatch.setattr(agent_runner, "_run_llm", lambda *a, **k: None)
+
+    ctx = _ctx_for(harness_repo, "agent-a")
+    ctx.journal_entry = journal.start_session(ctx.task.task_id, "agent/t/1", ctx.base_commit)
+    ctx.last_status = "mechanical"
+    ctx.last_hook_log = "boom"
+
+    assert agent_runner.autorepair(ctx) is True  # below the cap -> retry
+    assert ctx.journal_entry["attempts"][-1]["status"] == "mechanical"

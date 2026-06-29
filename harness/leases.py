@@ -91,9 +91,28 @@ def acquire(
     }
     os.makedirs(leases_dir, exist_ok=True)
     final = lease_path(task_id, leases_dir)
-    # Write to a sibling temp file and os.replace into place: a crash mid-write
-    # leaves the old lease (or nothing), never a half-written file that
-    # read_lease would reject as corrupt and silently drop the claim.
+
+    # Fast path for a fresh claim: create the lease file exclusively so two
+    # agents that both read "absent" cannot each believe they won. The loser of
+    # the create race re-reads and backs off only if a *live other-agent* lease
+    # now exists; an expired/own lease falls through to the atomic replace below.
+    if existing is None:
+        try:
+            fd = os.open(final, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError:
+            other = read_lease(task_id, leases_dir)
+            if other is not None and is_active(other) and other.get("agent_id") != agent_id:
+                return (False, other)
+            # expired / our own / raced-then-expired -> fall through to replace
+        else:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
+                json.dump(lease, fh, indent=2, sort_keys=True)
+                fh.write("\n")
+            return (True, lease)
+
+    # Reclaim path: write to a sibling temp file and os.replace into place. A
+    # crash mid-write leaves the old lease (or nothing), never a half-written
+    # file that read_lease would reject as corrupt and silently drop the claim.
     fd, tmp = tempfile.mkstemp(dir=leases_dir, suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:

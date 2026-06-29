@@ -40,7 +40,12 @@ import prompt_builder  # noqa: E402
 import staleness  # noqa: E402
 import state_sync  # noqa: E402
 import telemetry  # noqa: E402
-from lock_policy import compute_allowlist, is_coordination_path, symlink_paths  # noqa: E402
+from lock_policy import (  # noqa: E402
+    compute_allowlist,
+    human_override_active,
+    is_coordination_path,
+    symlink_paths,
+)
 
 SUPPORTED_SCHEMA_VERSION = 1
 
@@ -139,6 +144,7 @@ class RunContext:
     autorepair_attempts: int = 0
     guard_penalties: int = 0
     last_hook_log: str = ""
+    last_status: str = ""
     branch_created: bool = field(default=False)
     lease_acquired: bool = field(default=False)
     handover_path: str = ""
@@ -177,6 +183,19 @@ def _parse_task(task_id: str) -> TaskSpec:
     raw = tasks.get(task_id)
     if not isinstance(raw, dict):
         raise SystemExit(f"ERROR: task '{task_id}' not found in AGENTS.md.")
+    attempts_raw = raw.get("max_autorepair_attempts", 3)
+    if isinstance(attempts_raw, bool):
+        raise SystemExit(
+            f"ERROR: task '{task_id}' max_autorepair_attempts must be an integer, "
+            f"got {attempts_raw!r}."
+        )
+    try:
+        max_autorepair_attempts = int(attempts_raw)
+    except (TypeError, ValueError):
+        raise SystemExit(
+            f"ERROR: task '{task_id}' max_autorepair_attempts must be an integer, "
+            f"got {attempts_raw!r}."
+        ) from None
     return TaskSpec(
         task_id=task_id,
         description=str(raw.get("description", "")).strip(),
@@ -186,7 +205,7 @@ def _parse_task(task_id: str) -> TaskSpec:
         targets=list(raw.get("targets") or []),
         locked_files=list(raw.get("locked_files") or []),
         commit_prefix=str(raw.get("commit_prefix", "chore")),
-        max_autorepair_attempts=int(raw.get("max_autorepair_attempts", 3)),
+        max_autorepair_attempts=max_autorepair_attempts,
         pr_labels=list(raw.get("pr_labels") or []),
         contracts=list(raw.get("contracts") or []),
         contract_tests=list(raw.get("contract_tests") or []),
@@ -285,6 +304,12 @@ def initialize(args: argparse.Namespace) -> RunContext:
     if repo.is_dirty(untracked_files=False):
         raise SystemExit("ERROR: refusing to run on a dirty working tree.")
 
+    if human_override_active():
+        log(
+            "WARNING: SKIP_AGENT_HARNESS is set; it is a human-only override and "
+            "will be ignored for this autonomous run's commits (gates stay active)."
+        )
+
     tracking: Any | None = None
     try:
         tracking = repo.active_branch.tracking_branch()
@@ -341,6 +366,19 @@ def compute_branch_name(task_id: str, now: datetime | None = None, unique: bool 
     return f"agent/{task_id}/{stamp}"
 
 
+def _commit_env(ctx: RunContext) -> dict[str, str]:
+    """Environment for the orchestrator's own git commits.
+
+    Sets AGENT_TASK_ID so the lock/contract hooks gate the commit and drops
+    SKIP_AGENT_HARNESS: that switch is a human-only override and must never
+    disable the gates during an autonomous run (the LLM seam env drops it too).
+    """
+    env = os.environ.copy()
+    env["AGENT_TASK_ID"] = ctx.task.task_id
+    env.pop("SKIP_AGENT_HARNESS", None)
+    return env
+
+
 def _commit_coordination(ctx: RunContext, path: str, what: str) -> None:
     """Commit harness-managed coordination state (lease/journal) on its own.
 
@@ -350,8 +388,7 @@ def _commit_coordination(ctx: RunContext, path: str, what: str) -> None:
     if ctx.dry_run:
         return
     posix = path.replace("\\", "/")
-    env = os.environ.copy()
-    env["AGENT_TASK_ID"] = ctx.task.task_id
+    env = _commit_env(ctx)
     if os.path.exists(posix):
         ctx.repo.git.add("--", posix)
     else:
@@ -488,7 +525,8 @@ def _run_llm(ctx: RunContext, phase: str, repair_log: str = "", prompt_file: str
     # kill the WHOLE tree. With shell=True, subprocess.run's own timeout only
     # SIGKILLs the immediate child (the shell); a forked grandchild
     # (sh -> bash -> sleep ...) would be orphaned and keep mutating the tree
-    # after we have already rolled back. Killing the group closes that hole.
+    # after we have already rolled back. The tree is killed via killpg (POSIX)
+    # / taskkill /T (Windows), which closes that hole on both platforms.
     popen_kwargs: dict[str, Any] = {
         "shell": True,
         "env": _llm_env(ctx, phase, repair_log, prompt_file),
@@ -502,6 +540,15 @@ def _run_llm(ctx: RunContext, phase: str, repair_log: str = "", prompt_file: str
         proc.communicate(timeout=step_timeout)
     except subprocess.TimeoutExpired:
         if sys.platform == "win32":
+            # taskkill /T tears down the whole child tree (CREATE_NEW_PROCESS_GROUP
+            # gives us a clean group to target); proc.kill() is the fallback.
+            try:
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                    capture_output=True,
+                )
+            except OSError:
+                pass
             proc.kill()
         else:
             try:
@@ -658,8 +705,7 @@ def enforce(ctx: RunContext) -> tuple[str, str]:
     if staging:
         ctx.repo.git.add("--", *staging)
 
-    env = os.environ.copy()
-    env["AGENT_TASK_ID"] = ctx.task.task_id
+    env = _commit_env(ctx)
     message = f"{ctx.task.commit_prefix}: {ctx.task.task_id}"
     res = subprocess.run(
         ["git", "commit", "-m", message],
@@ -852,7 +898,9 @@ def _write_forensics(ctx: RunContext, outcome: str, reason: str, exit_code: int 
 
 def autorepair(ctx: RunContext) -> bool:
     """Return True to retry the loop, False to escalate (caller should stop)."""
-    journal.record_attempt(ctx.journal_entry, "enforce", "semantic", ctx.last_hook_log)
+    journal.record_attempt(
+        ctx.journal_entry, "enforce", ctx.last_status or "semantic", ctx.last_hook_log
+    )
     ctx.autorepair_attempts += 1
     if ctx.autorepair_attempts > ctx.task.max_autorepair_attempts:
         log(
@@ -1171,7 +1219,21 @@ def reconcile(ctx: RunContext) -> int:
 
     _persist_journal(ctx, "pushed", notes="Work committed and pushed; PR requested.")
     _release_lease(ctx, commit=True)
-    ctx.repo.git.push("-u", "origin", branch)
+    try:
+        ctx.repo.git.push("-u", "origin", branch)
+    except git.exc.GitCommandError as exc:
+        log(f"ERROR: push of '{branch}' to origin failed: {exc}")
+        ctx.git_warnings.append(f"push failed: {exc}")
+        _persist_journal(
+            ctx,
+            "error",
+            notes=(
+                f"Push to origin failed after a clean local run: {exc}. The lease "
+                f"was released and the work remains committed locally on '{branch}'. "
+                "Re-run the task to retry the push."
+            ),
+        )
+        return 1
     log(f"pushed branch '{branch}' to origin.")
     _open_pr(ctx)
     return 0
@@ -1262,6 +1324,7 @@ def run_drive(ctx: RunContext, model: DriveModel) -> int:
 
         # semantic (or still mechanical after the single retry) -> autorepair
         ctx.last_hook_log = log_text
+        ctx.last_status = status
         if not model.autorepair(ctx):
             return 1
         code = _first_abort(ctx, model.post_repair_aborts)
@@ -1405,6 +1468,26 @@ def doctor() -> int:
         )
 
     print("-- handover journals (unresolved) --")
+    journal_dir = journal.JOURNAL_DIR
+    journal_names = (
+        [n for n in os.listdir(journal_dir) if n.endswith(".json")]
+        if os.path.isdir(journal_dir)
+        else []
+    )
+    unresolved_total = 0
+    for name in journal_names:
+        try:
+            with open(os.path.join(journal_dir, name), encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(data, dict) and data.get("outcome") in journal.UNRESOLVED_OUTCOMES:
+            unresolved_total += 1
+    print(
+        f"  journal files: {len(journal_names)} committed "
+        f"({unresolved_total} unresolved); these accumulate by design -- see the "
+        "README 'Operations' note for the manual cleanup recipe."
+    )
     try:
         ledger = _load_ledger()
         task_ids = list((ledger.get("tasks") or {}).keys())

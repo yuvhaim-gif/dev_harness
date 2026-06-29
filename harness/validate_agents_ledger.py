@@ -54,6 +54,24 @@ def validate(path: str = "AGENTS.md") -> int:
             )
             ok = False
 
+        attempts = task.get("max_autorepair_attempts")
+        if attempts is not None and (isinstance(attempts, bool) or not isinstance(attempts, int)):
+            print(f"ERROR: task '{task_id}' max_autorepair_attempts must be an integer.")
+            ok = False
+        for field_name in (
+            "spec_docs",
+            "tests",
+            "targets",
+            "locked_files",
+            "contracts",
+            "contract_tests",
+            "pr_labels",
+        ):
+            value = task.get(field_name)
+            if value is not None and not isinstance(value, list):
+                print(f"ERROR: task '{task_id}' field '{field_name}' must be a list.")
+                ok = False
+
         contracts = set(task.get("contracts") or [])
         spec_docs = set(task.get("spec_docs") or [])
         if contracts - spec_docs:
