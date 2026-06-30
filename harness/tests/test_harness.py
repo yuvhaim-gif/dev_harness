@@ -13,6 +13,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -522,6 +523,66 @@ def test_acquire_lost_race_blocks(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     assert holder is not None and holder["agent_id"] == "agent-b"
 
 
+def test_is_active_nonnumeric_ttl_is_inactive() -> None:
+    # A corrupted/adversarial lease with a non-numeric ttl must not crash the
+    # check the whole coordination layer depends on; it is treated as inactive
+    # (reclaimable) rather than raising an uncaught ValueError.
+    lease = {"created_at": leases._stamp(leases._now()), "ttl_seconds": "not-a-number"}
+    assert leases.is_active(lease) is False
+    lease2 = {"created_at": leases._stamp(leases._now()), "ttl_seconds": None}
+    assert leases.is_active(lease2) is False
+
+
+def _seed_expired_lease(leases_dir: str, agent_id: str = "agent-old") -> None:
+    expired = {
+        "task_id": "t",
+        "branch": "agent/t/old",
+        "agent_id": agent_id,
+        "base_commit": "base",
+        "targets": [],
+        "created_at": "2000-01-01T00:00:00Z",
+        "ttl_seconds": 1,
+    }
+    os.makedirs(leases_dir, exist_ok=True)
+    Path(leases.lease_path("t", leases_dir)).write_text(
+        json.dumps(expired, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+
+
+def test_acquire_single_winner_under_concurrent_reclaim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The TOCTOU race: with no reclaim mutex, many agents that all read the same
+    # expired lease each os.replace their own copy and ALL return success. The
+    # os.mkdir mutex must serialise the reclaim so exactly one agent wins.
+    monkeypatch.chdir(tmp_path)
+    _seed_expired_lease(leases.LEASES_DIR)
+
+    n = 30
+    barrier = threading.Barrier(n)
+    results: list[bool] = []
+    lock = threading.Lock()
+
+    def worker(i: int) -> None:
+        barrier.wait()  # release all racers simultaneously
+        ok, _ = leases.acquire("t", f"agent/t/{i}", f"agent-{i}", "base", ["x"])
+        with lock:
+            results.append(ok)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert results.count(True) == 1, f"expected exactly one winner, got {results.count(True)}"
+    on_disk = leases.read_lease("t")
+    assert on_disk is not None and on_disk["agent_id"].startswith("agent-")
+    # No reclaim mutex dir and no temp files left behind.
+    leftovers = os.listdir(leases.LEASES_DIR)
+    assert not any(p.endswith((".tmp", ".lock")) for p in leftovers), leftovers
+
+
 # --------------------------------------------------------------------------- #
 # F9. Handover journal continuity
 # --------------------------------------------------------------------------- #
@@ -558,6 +619,25 @@ def test_f10_staleness_detects_moved_contract(harness_repo: Path) -> None:
 
     unchanged = staleness.check(str(harness_repo), base, base, task)
     assert unchanged == []
+
+
+def test_f10b_staleness_includes_task_targets(harness_repo: Path) -> None:
+    # critical_paths() must include the task's own targets, so that if two agents
+    # race the lease for an isolated-mode task, the loser is still caught when a
+    # target it built on has moved on the shared ref. Before the fix targets were
+    # omitted and a moved target slipped past the staleness guard entirely.
+    target = "harness/example/src/db/queries.py"
+    assert target in staleness.critical_paths({"targets": [target]})
+
+    base = _git(harness_repo, "rev-parse", "HEAD").stdout.strip()
+    _git(harness_repo, "checkout", "-b", "other")
+    with (harness_repo / target).open("a", encoding="utf-8") as fh:
+        fh.write("# target moved on shared ref\n")
+    _git(harness_repo, "add", target)
+    _git(harness_repo, "commit", "-m", "move target")
+
+    moved = staleness.check(str(harness_repo), base, "other", {"targets": [target]})
+    assert target in moved
 
 
 # --------------------------------------------------------------------------- #
@@ -752,6 +832,48 @@ def test_f14d_ci_enforce_allows_contract_change_with_bound_test(harness_repo: Pa
     subprocess.run([sys.executable, str(MANIFEST), "--update"], cwd=str(harness_repo), check=True)
     _git(harness_repo, "add", "-A")
     _git(harness_repo, "commit", "-m", "contract change with test")
+
+    res = _run_ci_enforce(harness_repo, base)
+    assert res.returncode == 0, res.stdout + res.stderr
+
+
+def test_f14e_ci_enforce_blocks_smuggled_py_under_journal(harness_repo: Path) -> None:
+    # The most serious finding: a branch pushed *directly* (never touching the
+    # local orchestrator or its SHA-based out-of-band backstop) smuggles an
+    # arbitrary .py under the allowlist-exempt .harness/journal/. ci_enforce is
+    # the only gate on this path and must reject the malformed coordination blob.
+    base = _seed_contract_lock(harness_repo)
+    _git(harness_repo, "checkout", "-b", "agent/optimise_query_layer/20260101T000000Z")
+    _write(harness_repo, ".harness/journal/payload.py", "import os  # injected payload\n")
+    _git(harness_repo, "add", "-A")
+    _git(harness_repo, "commit", "-m", "smuggle payload via journal")
+
+    res = _run_ci_enforce(harness_repo, base)
+    assert res.returncode == 1, res.stdout + res.stderr
+    assert "invalid coordination payload" in res.stdout
+    assert ".harness/journal/payload.py" in res.stdout
+
+
+def test_f14f_ci_enforce_blocks_unknown_shaped_journal_json(harness_repo: Path) -> None:
+    base = _seed_contract_lock(harness_repo)
+    _git(harness_repo, "checkout", "-b", "agent/optimise_query_layer/20260101T000000Z")
+    _write(harness_repo, ".harness/journal/x.json", json.dumps({"evil": "payload"}) + "\n")
+    _git(harness_repo, "add", "-A")
+    _git(harness_repo, "commit", "-m", "unknown-shaped journal json")
+
+    res = _run_ci_enforce(harness_repo, base)
+    assert res.returncode == 1, res.stdout + res.stderr
+    assert "invalid coordination payload" in res.stdout
+
+
+def test_f14g_ci_enforce_allows_valid_journal_json(harness_repo: Path) -> None:
+    # A well-formed journal artifact is the legitimate exempt case and must pass.
+    base = _seed_contract_lock(harness_repo)
+    _git(harness_repo, "checkout", "-b", "agent/optimise_query_layer/20260101T000000Z")
+    payload = {"task_id": "optimise_query_layer", "outcome": "escalated", "attempts": []}
+    _write(harness_repo, ".harness/journal/optimise_query_layer.json", json.dumps(payload) + "\n")
+    _git(harness_repo, "add", "-A")
+    _git(harness_repo, "commit", "-m", "valid journal entry")
 
     res = _run_ci_enforce(harness_repo, base)
     assert res.returncode == 0, res.stdout + res.stderr

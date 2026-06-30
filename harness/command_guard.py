@@ -25,11 +25,20 @@ command substitution (``$(git commit --no-verify)``), backticks
 slips a bypass flag past the stripper untouched. Those obfuscated tokens cannot
 be safely rewritten either, so like the plumbing patterns above they are
 *flagged* (and charged a guard penalty) rather than silently passed.
+
+A git bypass can also be buried inside a shell interpreter's script argument
+(``sh -c "git commit --no-verify"``, ``bash -lc ...``, ``cmd /c ...``): the
+quoted script is a single opaque token to the outer parse, so the structured
+strip never sees the inner ``git``. The script argument cannot be safely
+rewritten in place, so its contents are scanned recursively and any bypass flag,
+plumbing subcommand, or hooks-path override found inside is *flagged* (and
+charged a penalty) rather than passed.
 """
 
 from __future__ import annotations
 
 import os
+import re
 import shlex
 from dataclasses import dataclass, field
 
@@ -54,6 +63,15 @@ _HOOKSPATH_NEEDLE = "hookspath"
 # a command substitution / backtick / variable expansion, e.g. ``$(git``,
 # ```git``, ``$GIT``, ``${GIT}`` or ``--no-verify)``.
 _SHELL_META = "$(){}`\"'"
+
+# Shell interpreters whose ``-c``/``/c`` argument is an opaque script string the
+# outer parse cannot see into; its contents are scanned recursively.
+_SHELL_INTERPRETERS = frozenset(
+    {"sh", "bash", "zsh", "dash", "ash", "ksh", "cmd", "cmd.exe", "powershell", "pwsh"}
+)
+# The "run this string" flag: POSIX ``-c`` (possibly combined, e.g. ``-lc``) or
+# the Windows ``/c``.
+_RUN_STRING_FLAG = re.compile(r"^(?:-[a-z]*c|/c)$", re.IGNORECASE)
 
 
 @dataclass
@@ -137,6 +155,34 @@ def _obfuscated_bypass(tokens: list[str]) -> list[str]:
     return sorted(found)
 
 
+def _shell_c_evasion(tokens: list[str]) -> list[str]:
+    """Flag a git bypass buried inside a shell interpreter's ``-c`` script.
+
+    For each ``<interpreter> [flags] -c <script>`` run, recursively sanitise the
+    opaque ``<script>`` token; anything the inner pass would have stripped or
+    flagged is surfaced here (it cannot be rewritten in place from out here, so
+    it is flagged and penalised rather than passed).
+    """
+    found: list[str] = []
+    for i, tok in enumerate(tokens):
+        if os.path.basename(tok).lower() not in _SHELL_INTERPRETERS:
+            continue
+        j = i + 1
+        while j < len(tokens):
+            nxt = tokens[j]
+            if _RUN_STRING_FLAG.match(nxt):
+                if j + 1 < len(tokens):
+                    inner = sanitize_command(tokens[j + 1])
+                    found += [f"shell -c git-bypass: {f}" for f in inner.stripped]
+                    found += [f"shell -c {f}" for f in inner.flagged]
+                break
+            if nxt.startswith(("-", "/")):
+                j += 1
+                continue
+            break
+    return sorted(set(found))
+
+
 def sanitize_command(cmd: str | None) -> GuardResult:
     """Strip git bypass flags from ``cmd`` and flag unstrippable evasion."""
     if not cmd:
@@ -201,6 +247,7 @@ def sanitize_command(cmd: str | None) -> GuardResult:
         out.append(tok)
 
     flagged.extend(f"obfuscated git-bypass: {f}" for f in _obfuscated_bypass(tokens))
+    flagged.extend(_shell_c_evasion(tokens))
     flagged = sorted(set(flagged))
     if not stripped:
         return GuardResult(original=cmd, sanitized=cmd, flagged=flagged)

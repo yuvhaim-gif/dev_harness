@@ -6,6 +6,7 @@ Encoding the allowlist computation exactly once prevents hook/runner drift
 
 from __future__ import annotations
 
+import json
 import os
 from collections.abc import Mapping
 from typing import Any
@@ -71,6 +72,69 @@ def is_coordination_path(path: str) -> bool:
     """
     norm = path.replace("\\", "/")
     return any(norm.startswith(prefix) for prefix in COORDINATION_PREFIXES)
+
+
+# Top-level keys the orchestrator itself writes for each coordination artifact.
+# A payload under an exempt prefix is trusted ONLY when it is a flat JSON object
+# whose keys are a subset of these -- anything else (a .py file, a renamed blob,
+# or unknown-shaped JSON) is an attempt to smuggle content past the allowlist.
+_COORDINATION_SCHEMA: dict[str, frozenset[str]] = {
+    ".harness/leases/": frozenset(
+        {"task_id", "branch", "agent_id", "base_commit", "targets", "created_at", "ttl_seconds"}
+    ),
+    ".harness/journal/": frozenset(
+        {
+            "task_id",
+            "branch",
+            "base_commit",
+            "started_at",
+            "attempts",
+            "outcome",
+            "notes",
+            "finished_at",
+        }
+    ),
+}
+
+
+def _coordination_prefix(path: str) -> str | None:
+    norm = path.replace("\\", "/")
+    for prefix in COORDINATION_PREFIXES:
+        if norm.startswith(prefix):
+            return prefix
+    return None
+
+
+def is_valid_coordination_payload(path: str, blob: str | None) -> bool:
+    """True iff ``path``/``blob`` is a well-formed harness coordination artifact.
+
+    The allowlist exemption for ``.harness/leases/`` and ``.harness/journal/``
+    is only safe when the committed content is what the orchestrator would have
+    written: a flat ``*.json`` object (directly under the coordination dir, no
+    nesting) whose top-level keys are a subset of the known schema. This blocks
+    an attacker on a *directly pushed* branch -- one the local orchestrator and
+    its SHA-based out-of-band check never saw -- from smuggling an arbitrary file
+    (e.g. a ``.py`` payload) or unknown-shaped JSON under the exempt prefix.
+
+    Content is *structurally* validated only; free-text fields (``notes``,
+    attempt ``log_excerpt``) are still untrusted data and must be treated as such
+    wherever they re-enter an LLM context (see prompt_builder's immutable rules).
+    """
+    prefix = _coordination_prefix(path)
+    if prefix is None:
+        return False
+    rest = path.replace("\\", "/")[len(prefix) :]
+    if "/" in rest or not rest.endswith(".json"):
+        return False
+    if blob is None:
+        return False
+    try:
+        data: Any = json.loads(blob)
+    except (json.JSONDecodeError, ValueError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    return set(data) <= _COORDINATION_SCHEMA[prefix]
 
 
 def compute_allowlist(task: Mapping[str, Any]) -> set[str]:

@@ -17,12 +17,37 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import time
 from datetime import UTC, datetime
 from typing import Any
 
 LEASES_DIR = ".harness/leases"
 
 DEFAULT_TTL_SECONDS = 3600
+
+# A short-lived mutex (a directory, created atomically) serialises the reclaim of
+# an expired lease so two processes that both read it as expired cannot each
+# os.replace their own copy and both believe they won. A crashed holder leaves a
+# stale mutex; it is stolen once older than this many seconds.
+_RECLAIM_LOCK_STALE_SECONDS = 30
+
+# On Windows, os.replace onto an existing file fails with a sharing violation
+# (PermissionError) when another agent has the lease open for reading at that
+# instant. The replace itself is still atomic; a few short retries ride out the
+# transient sharing window so a contended-but-uncontested claim is not lost.
+_REPLACE_RETRIES = 10
+_REPLACE_BACKOFF_SECONDS = 0.01
+
+
+def _atomic_replace(src: str, dst: str) -> None:
+    for attempt in range(_REPLACE_RETRIES):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if attempt == _REPLACE_RETRIES - 1:
+                raise
+            time.sleep(_REPLACE_BACKOFF_SECONDS)
 
 
 def _now() -> datetime:
@@ -48,7 +73,9 @@ def read_lease(task_id: str, leases_dir: str = LEASES_DIR) -> dict[str, Any] | N
     try:
         with open(lease_path(task_id, leases_dir), encoding="utf-8") as fh:
             data: Any = json.load(fh)
-    except (FileNotFoundError, json.JSONDecodeError):
+    except (FileNotFoundError, json.JSONDecodeError, PermissionError):
+        # PermissionError: a concurrent atomic replace briefly holds the file on
+        # Windows; treat it as momentarily absent rather than crashing the read.
         return None
     return data if isinstance(data, dict) else None
 
@@ -56,10 +83,41 @@ def read_lease(task_id: str, leases_dir: str = LEASES_DIR) -> dict[str, Any] | N
 def is_active(lease: dict[str, Any], now: datetime | None = None) -> bool:
     moment = now or _now()
     created = _parse_stamp(str(lease.get("created_at", "")))
-    ttl = int(lease.get("ttl_seconds", DEFAULT_TTL_SECONDS))
     if created is None:
         return False
+    # A corrupted or adversarial lease (non-numeric ttl) must not crash the check
+    # that the whole coordination layer depends on; treat it as inactive so a
+    # legitimate agent can reclaim it rather than the run dying on a ValueError.
+    try:
+        ttl = int(lease.get("ttl_seconds", DEFAULT_TTL_SECONDS))
+    except (ValueError, TypeError):
+        return False
     return (moment - created).total_seconds() < ttl
+
+
+def _acquire_reclaim_mutex(lock_dir: str) -> bool:
+    """Atomically claim the reclaim critical section for one lease.
+
+    ``os.mkdir`` is atomic and fails if the directory exists, so exactly one
+    racer enters. A mutex left behind by a crashed holder is stolen once it is
+    older than ``_RECLAIM_LOCK_STALE_SECONDS``.
+    """
+    try:
+        os.mkdir(lock_dir)
+        return True
+    except FileExistsError:
+        try:
+            age = time.time() - os.path.getmtime(lock_dir)
+        except OSError:
+            return False
+        if age <= _RECLAIM_LOCK_STALE_SECONDS:
+            return False
+        try:
+            os.rmdir(lock_dir)
+            os.mkdir(lock_dir)
+            return True
+        except OSError:
+            return False
 
 
 def acquire(
@@ -110,19 +168,37 @@ def acquire(
                 fh.write("\n")
             return (True, lease)
 
-    # Reclaim path: write to a sibling temp file and os.replace into place. A
-    # crash mid-write leaves the old lease (or nothing), never a half-written
-    # file that read_lease would reject as corrupt and silently drop the claim.
-    fd, tmp = tempfile.mkstemp(dir=leases_dir, suffix=".tmp")
+    # Reclaim path: serialise behind a mutex so two agents that both read the
+    # lease as expired cannot each os.replace their own copy and both return
+    # success (the TOCTOU race). The winner of the mutex re-reads under the lock
+    # -- the lease may have just been reclaimed by a third agent or refreshed by
+    # its live owner -- before committing the claim.
+    lock_dir = final + ".lock"
+    if not _acquire_reclaim_mutex(lock_dir):
+        # Someone else is reclaiming right now; back off rather than double-claim.
+        return (False, read_lease(task_id, leases_dir))
     try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
-            json.dump(lease, fh, indent=2, sort_keys=True)
-            fh.write("\n")
-        os.replace(tmp, final)
+        current = read_lease(task_id, leases_dir)
+        if current is not None and is_active(current) and current.get("agent_id") != agent_id:
+            return (False, current)
+        # Write to a sibling temp file and os.replace into place. A crash
+        # mid-write leaves the old lease (or nothing), never a half-written file
+        # that read_lease would reject as corrupt and silently drop the claim.
+        fd, tmp = tempfile.mkstemp(dir=leases_dir, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
+                json.dump(lease, fh, indent=2, sort_keys=True)
+                fh.write("\n")
+            _atomic_replace(tmp, final)
+        finally:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        return (True, lease)
     finally:
-        if os.path.exists(tmp):
-            os.remove(tmp)
-    return (True, lease)
+        try:
+            os.rmdir(lock_dir)
+        except OSError:
+            pass
 
 
 def release(task_id: str, leases_dir: str = LEASES_DIR) -> bool:

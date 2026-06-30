@@ -39,6 +39,7 @@ from lock_policy import (  # noqa: E402
     UnknownMutationModeError,
     compute_allowlist,
     is_coordination_path,
+    is_valid_coordination_payload,
     symlink_paths,
 )
 
@@ -75,6 +76,13 @@ def _changed_files(base: str, head: str) -> list[str]:
         print(f"ERROR: could not diff {base}...{head}: {res.stderr.strip()}")
         sys.exit(1)
     return [line for line in res.stdout.splitlines() if line]
+
+
+def _blob_at(ref: str, path: str) -> str | None:
+    # Content of ``path`` at ``ref``; None when absent there (e.g. a deletion),
+    # which carries no payload to validate.
+    res = _git("show", f"{ref}:{path}")
+    return res.stdout if res.returncode == 0 else None
 
 
 def _changed_symlinks(base: str, head: str) -> list[str]:
@@ -149,14 +157,36 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  - {path}")
 
     changed = _changed_files(args.base, args.head)
-    violations = sorted(f for f in changed if f not in allowed and not is_coordination_path(f))
+    violations: list[str] = []
+    bad_payloads: list[str] = []
+    for f in changed:
+        if f in allowed:
+            continue
+        if is_coordination_path(f):
+            blob = _blob_at(args.head, f)
+            # Present coordination files are exempt only when well-formed; this
+            # is the layer that has no SHA-based out-of-band backstop, so a
+            # directly-pushed branch smuggling content here is caught right here.
+            if blob is not None and not is_valid_coordination_payload(f, blob):
+                bad_payloads.append(f)
+            continue
+        violations.append(f)
+    violations.sort()
+    bad_payloads.sort()
+
+    if bad_payloads:
+        failed = True
+        print(f"FAIL: task '{task_id}' committed invalid coordination payload(s):")
+        for path in bad_payloads:
+            print(f"  - {path}")
+        print("Coordination paths must be the harness's own *.json lease/journal artifacts.")
     if violations:
         failed = True
         print(f"FAIL: task '{task_id}' changed files outside its allowlist:")
         for path in violations:
             print(f"  - {path}")
         print("Allowed:", ", ".join(sorted(allowed)) or "(none)")
-    elif not links:
+    elif not links and not bad_payloads:
         print(f"OK: all {len(changed)} changed file(s) are within '{task_id}' scope.")
 
     # 3. Contract<->test binding, re-applied server-side. enforce_contract_binding

@@ -23,6 +23,10 @@ def critical_paths(task: Mapping[str, Any]) -> set[str]:
     paths |= set(task.get("contracts") or [])
     paths |= set(task.get("spec_docs") or [])
     paths |= set(task.get("locked_files") or [])
+    # The task's own targets are critical too: if two agents race the lease for an
+    # isolated-mode task, the loser of the lease race is still caught here when a
+    # target it built on has since moved on the shared ref.
+    paths |= set(task.get("targets") or [])
     return paths
 
 

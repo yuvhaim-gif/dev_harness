@@ -290,6 +290,37 @@ def test_h4s_bypass_inside_quoted_message_is_not_flagged() -> None:
     assert not res.tampered
 
 
+def test_h4t_flags_git_bypass_inside_sh_c() -> None:
+    # The quoted script is one opaque token to the outer parse; the recursive
+    # scan must still surface the buried bypass flag (was undetected before).
+    res = command_guard.sanitize_command('sh -c "git commit --no-verify -m foo"')
+    assert res.suspicious
+    assert any("shell -c" in f and "--no-verify" in f for f in res.flagged)
+
+
+def test_h4u_flags_git_bypass_inside_bash_lc() -> None:
+    res = command_guard.sanitize_command('bash -lc "git push --no-verify origin main"')
+    assert res.suspicious
+    assert any("--no-verify" in f for f in res.flagged)
+
+
+def test_h4v_flags_git_bypass_inside_cmd_c() -> None:
+    res = command_guard.sanitize_command('cmd /c "git commit --no-verify -m x"')
+    assert res.suspicious
+
+
+def test_h4w_flags_plumbing_inside_sh_c() -> None:
+    res = command_guard.sanitize_command('sh -c "git commit-tree abc -m x"')
+    assert res.suspicious
+    assert any("commit-tree" in f for f in res.flagged)
+
+
+def test_h4x_benign_sh_c_is_not_flagged() -> None:
+    res = command_guard.sanitize_command('sh -c "echo hello && python build.py"')
+    assert not res.suspicious
+    assert not res.tampered
+
+
 # --------------------------------------------------------------------------- #
 # H5. Forensic post-mortem
 # --------------------------------------------------------------------------- #
@@ -350,6 +381,115 @@ def test_h5b_emit_refreshes_rollback_ok_built_before_rollback(tmp_path: Path) ->
 
     # Idempotent: a second emit must not double-write once forensic_written is set.
     agent_runner._emit_forensic_report(ctx, report)
+
+
+def test_h5c_attempts_show_distinct_per_attempt_cost() -> None:
+    # Regression: _fmt_attempts must pair attempt i with the i-th autorepair
+    # step rather than repeat the first step's usage on every row. The final
+    # cap-exceeding attempt has no following step and honestly shows zero.
+    report = forensic.ForensicReport(
+        task_id="t",
+        mutation_mode="isolated",
+        outcome="escalated",
+        attempts=[
+            {"at": "t1", "state": "Enforce", "status": "semantic"},
+            {"at": "t2", "state": "Enforce", "status": "semantic"},
+            {"at": "t3", "state": "Enforce", "status": "cap"},
+        ],
+        telemetry={
+            "steps": [
+                {"phase": "mutate", "cost_usd": 5.0},
+                {
+                    "phase": "autorepair",
+                    "cost_usd": 0.10,
+                    "input_tokens": 1,
+                    "output_tokens": 2,
+                    "total_tokens": 3,
+                },
+                {
+                    "phase": "autorepair",
+                    "cost_usd": 0.20,
+                    "input_tokens": 4,
+                    "output_tokens": 5,
+                    "total_tokens": 9,
+                },
+            ],
+        },
+    )
+    table = forensic._fmt_attempts(report.attempts, report.telemetry)
+    rows = [r for r in table.splitlines() if r.startswith(("| 1 ", "| 2 ", "| 3 "))]
+    assert "0.1000" in rows[0] and "1/2/3" in rows[0]  # attempt 1 -> 1st repair step
+    assert "0.2000" in rows[1] and "4/5/9" in rows[1]  # attempt 2 -> 2nd repair step
+    assert "0.0000" in rows[2]  # attempt 3 -> no following step, honest zero
+    assert "5.0000" not in table  # the mutate step never leaks into an attempt row
+
+
+# --------------------------------------------------------------------------- #
+# H5d. Coordination-payload validator (allowlist exemption is content-aware)
+# --------------------------------------------------------------------------- #
+def test_h5d_validator_accepts_flat_lease_json() -> None:
+    blob = json.dumps(
+        {
+            "task_id": "t",
+            "branch": "b",
+            "agent_id": "a",
+            "base_commit": "c",
+            "targets": [],
+            "created_at": "x",
+            "ttl_seconds": 1,
+        }
+    )
+    assert lock_policy.is_valid_coordination_payload(".harness/leases/t.json", blob)
+
+
+def test_h5d_validator_accepts_flat_journal_json() -> None:
+    blob = json.dumps({"task_id": "t", "outcome": "escalated"})
+    assert lock_policy.is_valid_coordination_payload(".harness/journal/t.json", blob)
+
+
+def test_h5d_validator_rejects_non_json_extension() -> None:
+    # The core smuggling vector: an arbitrary .py under the exempt prefix.
+    assert not lock_policy.is_valid_coordination_payload(".harness/journal/payload.py", "x = 1\n")
+
+
+def test_h5d_validator_rejects_nested_path() -> None:
+    blob = json.dumps({"task_id": "t"})
+    assert not lock_policy.is_valid_coordination_payload(".harness/journal/sub/t.json", blob)
+
+
+def test_h5d_validator_rejects_unknown_keys() -> None:
+    assert not lock_policy.is_valid_coordination_payload(
+        ".harness/journal/t.json", json.dumps({"evil": "payload"})
+    )
+
+
+def test_h5d_validator_rejects_non_dict_and_malformed_json() -> None:
+    assert not lock_policy.is_valid_coordination_payload(".harness/leases/t.json", "[1, 2, 3]")
+    assert not lock_policy.is_valid_coordination_payload(".harness/leases/t.json", "{not json")
+
+
+def test_h5d_validator_rejects_non_coordination_path_and_none_blob() -> None:
+    assert not lock_policy.is_valid_coordination_payload("src/x.py", "{}")
+    assert not lock_policy.is_valid_coordination_payload(".harness/leases/t.json", None)
+
+
+# --------------------------------------------------------------------------- #
+# H5e. Immutable rules tag handover/journal content as untrusted data
+# --------------------------------------------------------------------------- #
+def test_h5e_static_rules_mark_handover_as_untrusted() -> None:
+    rules = prompt_builder.STATIC_RULES
+    assert "UNTRUSTED DATA" in rules
+    assert "AGENT_HANDOVER_FILE" in rules
+    # It must travel in the byte-stable static prefix, so every repair cycle and
+    # every assembled prompt carries the injection guard.
+    prompt = prompt_builder.build_repair_prompt(
+        task={"task_id": "t", "mutation_mode": "isolated"},
+        allowlist=["src/x.py"],
+        condensed_log="boom",
+        attempt=1,
+        max_attempts=3,
+    )
+    assert "UNTRUSTED DATA" in prompt
 
 
 # --------------------------------------------------------------------------- #
@@ -607,6 +747,40 @@ def test_h9_rollback_removes_agent_untracked_files(seeded_repo: Path) -> None:
     entries = _git(seeded_repo, "status", "--porcelain").stdout.splitlines()
     leftover = [line for line in entries if ".harness/" not in line]
     assert leftover == [], f"tree not clean after rollback: {leftover}"
+
+
+def test_h9b_harness_managed_classification(
+    seeded_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Rollback keeps only the harness's own artifacts under .harness/ and removes
+    # LLM-written junk there. Before the fix, _rollback skipped everything under
+    # .harness/, so a stray .py or malformed json survived a "pristine" rollback.
+    monkeypatch.chdir(seeded_repo)
+    repo_dir = str(seeded_repo)
+    harness = seeded_repo / ".harness"
+    (harness / "logs").mkdir(parents=True, exist_ok=True)
+    (harness / "journal").mkdir(parents=True, exist_ok=True)
+    (harness / "logs" / "FAILED_AGENT_RUN.md").write_text("x\n", encoding="utf-8")
+    (harness / "telemetry").mkdir(parents=True, exist_ok=True)
+    (harness / "telemetry" / "usage.json").write_text("{}\n", encoding="utf-8")
+    (harness / "contracts.lock").write_text("{}\n", encoding="utf-8")
+    (harness / "journal" / "t.json").write_text(
+        json.dumps({"task_id": "t", "outcome": "escalated"}), encoding="utf-8"
+    )
+    (harness / "journal" / "payload.py").write_text("x = 1\n", encoding="utf-8")
+    (harness / "journal" / "bad.json").write_text("{not json", encoding="utf-8")
+    (harness / "stray.py").write_text("x = 1\n", encoding="utf-8")
+
+    # Kept (managed): logs, telemetry, manifest, and a well-formed journal blob.
+    assert agent_runner._is_harness_managed(repo_dir, ".harness/logs/FAILED_AGENT_RUN.md")
+    assert agent_runner._is_harness_managed(repo_dir, ".harness/telemetry/usage.json")
+    assert agent_runner._is_harness_managed(repo_dir, ".harness/contracts.lock")
+    assert agent_runner._is_harness_managed(repo_dir, ".harness/journal/t.json")
+    # Removed (not managed): a smuggled .py, malformed json, or a stray file
+    # outside the managed subtrees -- all junk rollback must clean up.
+    assert not agent_runner._is_harness_managed(repo_dir, ".harness/journal/payload.py")
+    assert not agent_runner._is_harness_managed(repo_dir, ".harness/journal/bad.json")
+    assert not agent_runner._is_harness_managed(repo_dir, ".harness/stray.py")
 
 
 # --------------------------------------------------------------------------- #

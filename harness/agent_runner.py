@@ -44,6 +44,7 @@ from lock_policy import (  # noqa: E402
     compute_allowlist,
     human_override_active,
     is_coordination_path,
+    is_valid_coordination_payload,
     symlink_paths,
 )
 
@@ -776,6 +777,36 @@ def _persist_journal(ctx: RunContext, outcome: str, notes: str = "") -> None:
             ctx.git_warnings.append(warning)
 
 
+# Paths under .harness/ the orchestrator itself writes and must survive rollback:
+# the forensic logs, the telemetry sink, and the hashed contract manifest. Valid
+# lease/journal artifacts are kept via the coordination-payload check below.
+_HARNESS_MANAGED_PREFIXES: tuple[str, ...] = (".harness/logs/", ".harness/telemetry/")
+_HARNESS_MANAGED_FILES: frozenset[str] = frozenset({".harness/contracts.lock"})
+
+
+def _is_harness_managed(repo_dir: str, path: str) -> bool:
+    """True when an untracked ``.harness/`` path is the harness's own artifact.
+
+    Forensic logs, telemetry, and the manifest are kept. A coordination path is
+    kept only when its on-disk content is a well-formed lease/journal artifact;
+    LLM-written junk under .harness/ (a stray .py, malformed JSON, or files
+    outside the managed subtrees) is *not* managed and is removed by rollback.
+    """
+    norm = path.replace("\\", "/")
+    if norm in _HARNESS_MANAGED_FILES:
+        return True
+    if any(norm.startswith(p) for p in _HARNESS_MANAGED_PREFIXES):
+        return True
+    if is_coordination_path(norm):
+        try:
+            with open(os.path.join(repo_dir, norm), encoding="utf-8") as fh:
+                blob: str | None = fh.read()
+        except OSError:
+            blob = None
+        return is_valid_coordination_payload(norm, blob)
+    return False
+
+
 def _rollback(ctx: RunContext) -> None:
     if ctx.dry_run or not ctx.branch_created or not ctx.original_branch:
         return
@@ -785,15 +816,19 @@ def _rollback(ctx: RunContext) -> None:
         # Clear any uncommitted/staged mutation the blocked commit left behind
         # so the working tree is pristine before we leave the work branch.
         ctx.repo.git.reset("--hard")
+        repo_dir = _repo_dir(ctx)
         listed = ctx.repo.git.ls_files("--others", "--exclude-standard")
+        # Remove every agent-created untracked file -- including junk the LLM
+        # wrote under .harness/ -- but keep the harness's own coordination state,
+        # forensic logs, telemetry, and manifest so the audit stays intact.
         new_untracked = [
             p
             for p in listed.splitlines()
-            if p and p not in ctx.baseline_untracked and not p.startswith(".harness/")
+            if p and p not in ctx.baseline_untracked and not _is_harness_managed(repo_dir, p)
         ]
         for rel in new_untracked:
             try:
-                os.remove(os.path.join(_repo_dir(ctx), rel))
+                os.remove(os.path.join(repo_dir, rel))
             except OSError:
                 pass
         reset_ok = True
@@ -1044,6 +1079,14 @@ def _committed_paths(ctx: RunContext) -> list[str]:
     return [p for p in out.splitlines() if p]
 
 
+def _committed_blob(ctx: RunContext, path: str) -> str | None:
+    """Content of ``path`` committed at HEAD; None when absent (e.g. deleted)."""
+    try:
+        return str(ctx.repo.git.show(f"HEAD:{path}"))
+    except git.exc.GitCommandError:
+        return None
+
+
 def _committed_symlinks(ctx: RunContext) -> list[str]:
     """Symlinks committed on ``base..HEAD``, detected via git's recorded mode.
 
@@ -1071,10 +1114,19 @@ def _containment_breach(ctx: RunContext) -> list[str]:
     if ctx.dry_run:
         return []
     allow = sorted(compute_allowlist(ctx.task.raw))
-    out_of_scope = sorted(
-        p for p in _committed_paths(ctx) if p not in allow and not is_coordination_path(p)
-    )
-    violations = [f"out-of-allowlist committed change: {p}" for p in out_of_scope]
+    out_of_scope: list[str] = []
+    bad_coord: list[str] = []
+    for p in _committed_paths(ctx):
+        if p in allow:
+            continue
+        if is_coordination_path(p):
+            blob = _committed_blob(ctx, p)
+            if blob is not None and not is_valid_coordination_payload(p, blob):
+                bad_coord.append(p)
+            continue
+        out_of_scope.append(p)
+    violations = [f"out-of-allowlist committed change: {p}" for p in sorted(out_of_scope)]
+    violations += [f"invalid coordination payload committed: {p}" for p in sorted(bad_coord)]
     violations += [
         f"symlink committed (file-lock bypass): {p}" for p in sorted(_committed_symlinks(ctx))
     ]

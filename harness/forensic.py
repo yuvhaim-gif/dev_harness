@@ -53,10 +53,12 @@ def _fmt_list(items: list[str]) -> str:
 
 
 def _fmt_attempts(attempts: list[dict[str, Any]], telemetry: dict[str, Any]) -> str:
+    # Each enforce attempt is followed by exactly one autorepair LLM step (the
+    # repair it triggered), recorded in order, so attempt i pairs with the i-th
+    # autorepair step. The final, cap-exceeding attempt has no following step and
+    # honestly shows zero usage rather than repeating an earlier attempt's cost.
     steps = telemetry.get("steps") or []
-    by_phase: dict[str, dict[str, Any]] = {}
-    for step in steps:
-        by_phase.setdefault(str(step.get("phase", "")), step)
+    repair_steps = [s for s in steps if str(s.get("phase", "")) == "autorepair"]
 
     if not attempts:
         return "_No autorepair attempts were recorded._\n"
@@ -65,8 +67,8 @@ def _fmt_attempts(attempts: list[dict[str, Any]], telemetry: dict[str, Any]) -> 
         "| # | at | state | status | tokens (in/out/total) | cost (USD) |",
         "|---|----|-------|--------|-----------------------|------------|",
     ]
-    for idx, att in enumerate(attempts, start=1):
-        usage = by_phase.get("autorepair") or {}
+    for idx, att in enumerate(attempts):
+        usage = repair_steps[idx] if idx < len(repair_steps) else {}
         tokens = (
             f"{usage.get('input_tokens', 0)}/"
             f"{usage.get('output_tokens', 0)}/"
@@ -74,7 +76,7 @@ def _fmt_attempts(attempts: list[dict[str, Any]], telemetry: dict[str, Any]) -> 
         )
         cost = f"{float(usage.get('cost_usd', 0.0)):.4f}"
         rows.append(
-            f"| {idx} | {att.get('at', '')} | {att.get('state', '')} "
+            f"| {idx + 1} | {att.get('at', '')} | {att.get('state', '')} "
             f"| {att.get('status', '')} | {tokens} | {cost} |"
         )
     return "\n".join(rows) + "\n"

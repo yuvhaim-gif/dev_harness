@@ -17,6 +17,7 @@ from lock_policy import (  # noqa: E402
     compute_allowlist,
     human_override_active,
     is_coordination_path,
+    is_valid_coordination_payload,
     symlink_paths,
 )
 
@@ -32,6 +33,13 @@ def _staged_files() -> list[str]:
         print(f"ERROR: could not read git index: {res.stderr.strip()}")
         sys.exit(1)
     return [line for line in res.stdout.splitlines() if line]
+
+
+def _staged_blob(path: str) -> str | None:
+    # The staged (index) content of ``path``; None when it is not in the index
+    # (e.g. a staged deletion), which carries no payload to validate.
+    res = subprocess.run(["git", "show", f":{path}"], capture_output=True, text=True)
+    return res.stdout if res.returncode == 0 else None
 
 
 def _staged_raw() -> str:
@@ -91,14 +99,33 @@ def main() -> None:
             print(f"  - {link}")
         sys.exit(1)
 
-    violations = sorted(
-        f for f in _staged_files() if f not in allowed and not is_coordination_path(f)
-    )
+    violations: list[str] = []
+    bad_payloads: list[str] = []
+    for staged in _staged_files():
+        if staged in allowed:
+            continue
+        if is_coordination_path(staged):
+            blob = _staged_blob(staged)
+            # A present coordination file is exempt only when it is a well-formed
+            # artifact; arbitrary content under the exempt prefix is rejected.
+            if blob is not None and not is_valid_coordination_payload(staged, blob):
+                bad_payloads.append(staged)
+            continue
+        violations.append(staged)
+    violations.sort()
+    bad_payloads.sort()
+
+    if bad_payloads:
+        print(f"ERROR: task '{task_id}' ({mode}) staged invalid coordination payload(s):")
+        for v in bad_payloads:
+            print(f"  - {v}")
+        print("Coordination paths must be the harness's own *.json lease/journal artifacts.")
     if violations:
         print(f"ERROR: task '{task_id}' ({mode}) staged files outside its allowlist:")
         for v in violations:
             print(f"  - {v}")
         print("Allowed:", ", ".join(sorted(allowed)) or "(none)")
+    if violations or bad_payloads:
         sys.exit(1)
 
     sys.exit(0)

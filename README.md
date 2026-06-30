@@ -246,10 +246,17 @@ After computing the allowlist, anything in `locked_files` is removed, and the
 AGENTS.md, .pre-commit-config.yaml
 ```
 
-**Coordination paths bypass the allowlist.** Files under `.harness/leases/` and
-`.harness/journal/` are written and committed by the orchestrator itself
-(never by the LLM mutation), so `is_coordination_path()` allows them through
-the lock hook regardless of the active task.
+**Coordination paths bypass the allowlist — but only when well-formed.** Files
+under `.harness/leases/` and `.harness/journal/` are written and committed by the
+orchestrator itself (never by the LLM mutation), so `is_coordination_path()`
+exempts them from the per-task allowlist. That exemption is **content-aware**:
+`is_valid_coordination_payload()` admits a path only when it is a flat `*.json`
+object directly under the coordination dir whose top-level keys are a subset of
+the known lease/journal schema. An arbitrary file (a stray `.py`), a nested path,
+or unknown-shaped JSON smuggled under the exempt prefix is **rejected** — by the
+pre-commit hook, the post-hoc containment gate, and the server-side CI re-check
+alike — so the exemption cannot be abused to land payload outside the allowlist
+(notably as a prompt-injection vector via poisoned journal entries).
 
 All ledger paths must be **POSIX** (forward-slash), repo-root-relative, because
 that is exactly what `git diff --cached --name-only` emits on every OS.
@@ -320,18 +327,37 @@ context:
 
 - **Leases** (`harness/leases.py`) — Isolate writes
   `.harness/leases/<task_id>.json` with the owning `agent_id`, branch, base
-  commit, declared targets, and a 3600s TTL. The file is written **atomically**
-  (a sibling temp file `os.replace`d into place), so a crash mid-write never
-  leaves a half-written lease. A second agent that finds a live lease held by
-  someone else aborts cleanly; an expired lease may be reclaimed. Reconcile (and
-  rollback) releases the lease.
+  commit, declared targets, and a 3600s TTL. A **fresh** claim is created with
+  `O_CREAT | O_EXCL` so two agents that both read "absent" cannot each believe
+  they won. **Reclaiming an expired lease** is serialised behind a short-lived
+  atomic mutex (`os.mkdir` on a sibling `.lock` directory, stolen if older than
+  30s): the winner re-reads under the lock before committing the claim, so two
+  agents that both saw the lease as expired can no longer both `os.replace` their
+  own copy and both return success — exactly one wins (the prior read→replace
+  reclaim had a real TOCTOU race here). The lease itself is still written
+  **atomically** (sibling temp file `os.replace`d into place, with a bounded
+  retry to ride out the Windows sharing window when another agent has it open for
+  reading). A corrupt or adversarial lease with a non-numeric `ttl_seconds` is
+  treated as **inactive (reclaimable)** rather than crashing the check the whole
+  coordination layer depends on. Reconcile (and rollback) releases the lease.
 - **Handover journal** (`harness/journal.py`) — every session writes an
   append-only JSON record to `.harness/journal/` containing each attempt's
   state, status, and hook-log excerpt, plus a terminal outcome
   (`in_progress` / `pushed` / `local` / `stale` / `escalated` / `error`).
   Initialize calls `latest_unresolved()` for the task and surfaces the
   previous session's context to the LLM via `AGENT_HANDOVER_FILE`, so a
-  rolled-back or escalated run is never lost.
+  rolled-back or escalated run is never lost. Because this content re-enters a
+  later agent's prompt, it is treated as **untrusted data** — see the
+  [coordination-state injection](#threat-model--failure-modes) note below.
+- **Coordination-payload validation** (`lock_policy.is_valid_coordination_payload`)
+  — `.harness/leases/` and `.harness/journal/` are exempt from the allowlist
+  because the orchestrator, not the LLM, writes them. That exemption is
+  **content-aware**, not path-blind: an exempt path is accepted only when it is a
+  flat `*.json` object directly under the coordination dir whose top-level keys
+  are a subset of the known lease/journal schema. An arbitrary file (a stray
+  `.py`), a nested path, or unknown-shaped JSON smuggled under the prefix is
+  rejected by **every** layer that honours the exemption (pre-commit hook,
+  post-hoc containment gate, and the server-side CI re-check).
 - **Shared state ref** (`harness/state_sync.py`) — leases and journal
   entries committed only on an abandoned work branch are invisible to a fresh
   clone of `main`. The orchestrator mirrors them onto a dedicated ref
@@ -347,8 +373,11 @@ context:
   [minimal mode](#minimal-mode) to switch it off entirely.
 - **Optimistic staleness guard** (`harness/staleness.py`) — before
   pushing, Reconcile diffs the **critical paths** (contracts, spec docs,
-  `locked_files`, the always-locked set, and `.harness/contracts.lock`) at
-  the agent's base commit against `AGENT_SHARED_REF` (default `origin/main`).
+  `locked_files`, the task's own **targets**, the always-locked set, and
+  `.harness/contracts.lock`) at the agent's base commit against
+  `AGENT_SHARED_REF` (default `origin/main`). Including the targets means that if
+  two agents race the lease for an isolated-mode task, the loser is still caught
+  here when a target it built on has since moved on the shared ref.
   Any difference means the shared truth moved while the agent worked; the run
   journals `stale`, refuses the push, and exits 1, handing the conflict to
   the next agent rather than landing work built on a superseded contract. On a
@@ -402,6 +431,15 @@ an arbitrary shell string, so the guard *flags* them (`GuardResult.suspicious`)
 and the run is penalised — but the **authoritative** defences are the post-hoc
 containment gate and the server-side CI re-check below, both of which inspect
 committed history and therefore hold regardless of which git the agent ran.
+
+A git bypass can also be buried inside a **shell interpreter's script argument**
+(`sh -c "git commit --no-verify"`, `bash -lc …`, `cmd /c …`): the quoted script
+is a single opaque token to the outer parse, so the structured strip never sees
+the inner `git`. The guard recursively sanitises that `-c` / `/c` script and
+*flags* any bypass flag, plumbing subcommand, or hooks-path override it finds
+inside (it cannot be rewritten in place from outside the quotes), charging the
+same `guard_penalties` hit — closing a hole where such a wrapped command
+previously passed through completely undetected.
 
 ### Token & cost budgeting
 
@@ -487,7 +525,9 @@ After the mutation/repair phase and before Reconcile, the orchestrator runs
 ignored) and flags three things —
 
 - a committed path outside the task's computed allowlist (coordination paths
-  excepted),
+  excepted **only when the committed content is a well-formed lease/journal
+  payload** — a smuggled `.py` or unknown-shaped JSON under the exempt prefix is
+  flagged as an *invalid coordination payload*),
 - a committed **symlink** (any tree entry with mode `120000` on `base..HEAD`),
   even when its path is itself allowlisted — catching an allowed path aliased
   onto a locked file, and
@@ -506,7 +546,11 @@ agent cannot influence (wired up in `.github/workflows/harness-ci.yml`):
 1. the hashed contract manifest must still verify (content-based, bypass-proof),
 2. every file changed on an `agent/<task_id>/…` branch (computed over the
    aggregate `base...head` diff) must fall inside that task's allowlist
-   (coordination paths excepted), and
+   (coordination paths excepted **only when well-formed** — this is the layer
+   with *no* SHA-based out-of-band backstop, so a branch pushed **directly** to
+   the runner that smuggles an arbitrary file under `.harness/journal/` or
+   `.harness/leases/` is rejected right here as an *invalid coordination
+   payload*), and
 3. no change on that branch may introduce a **symlink** — a `--raw` diff over
    the same range rejects any entry whose resulting mode is `120000`, so the
    alias-to-a-locked-file bypass is blocked remotely too, and
@@ -531,7 +575,10 @@ The report has four sections: (1) allowed scope vs. paths actually modified
 (the containment proof), (2) terminal error codes, the condensed failing
 assertions, and git policy warnings, (3) a chronological step log with token
 consumption and cost per attempt, and (4) confirmation that the local working
-tree was safely rolled back.
+tree was safely rolled back. The per-attempt costs in section 3 are **genuinely
+per-attempt** — each Enforce attempt is paired with the *i*-th autorepair LLM
+step it triggered (the final, cap-exceeding attempt has no following step and
+honestly shows zero), rather than repeating the first step's usage on every row.
 
 The scope evidence in sections 1–3 is compiled from the working tree **before**
 the rollback runs (so the containment proof is not erased by the `git reset
@@ -539,6 +586,14 @@ the rollback runs (so the containment proof is not erased by the `git reset
 post-rollback outcome: the report is built before the rollback and emitted after
 it, so the verdict (`CONFIRMED` / `NOT CONFIRMED`) is the real one rather than a
 stale default.
+
+**Rollback also cleans `.harness/`.** The hard reset plus untracked-file sweep
+removes agent-created junk *including* anything the LLM wrote under `.harness/`
+(a stray `.py`, malformed JSON), while deliberately **preserving the harness's
+own artifacts** there — the forensic logs (`.harness/logs/`), the telemetry sink
+(`.harness/telemetry/`), the hashed manifest (`.harness/contracts.lock`), and
+*well-formed* lease/journal payloads. Previously the sweep skipped everything
+under `.harness/`, so junk written there survived a "pristine" rollback.
 
 ### Diagnostics (`--doctor`)
 
@@ -609,7 +664,7 @@ sole line of defence:
 
 | Layer | Where it runs | Bypassable by the agent? | Role |
 |-------|---------------|--------------------------|------|
-| Command guard | before the LLM seam | yes (it only flags/strips) | raise the cost of an *accidental* bypass; penalise evasion (including bypass flags hidden behind command substitution / backticks / shell variables) |
+| Command guard | before the LLM seam | yes (it only flags/strips) | raise the cost of an *accidental* bypass; penalise evasion (including bypass flags hidden behind command substitution / backticks / shell variables, or buried inside a `sh -c` / `bash -lc` / `cmd /c` script) |
 | Pre-commit lock + contract hooks | agent's machine | yes (`core.hooksPath`, plumbing) | fast, local first line; transparent to humans |
 | **Post-hoc containment gate** | orchestrator, post-commit | no (inspects committed history) | authoritative local stop — **exit 4** |
 | **Server-side CI re-check** | trusted runner | no | authoritative remote stop before merge |
@@ -623,11 +678,14 @@ bypasses do not defeat them.
 | Failure mode | Symptom | Mitigation |
 |--------------|---------|------------|
 | Stale / orphaned lease | a crashed agent leaves a lease behind | TTL (3600s) makes it reclaimable; `--doctor` shows `expired`; rollback releases it |
+| Lease reclaim race | two agents both read one expired lease as free | reclaim is serialised behind an atomic `os.mkdir` mutex; the winner re-reads under the lock, so **exactly one** agent wins (was a real TOCTOU) |
+| Corrupt / adversarial lease TTL | `ttl_seconds` is non-numeric in a lease file | `is_active()` treats it as **inactive (reclaimable)** instead of crashing the coordination check with an uncaught `ValueError` |
+| Poisoned coordination state | a payload smuggled under the allowlist-exempt `.harness/leases/` or `.harness/journal/` (e.g. a `.py`, nested path, or unknown-shaped JSON) — a persistent prompt-injection vector, since journal content feeds the next agent's prompt | the exemption is **content-aware** (`is_valid_coordination_payload`): the pre-commit hook (exit 1), the post-hoc containment gate (exit 4), **and** the server-side CI re-check (the layer with no SHA backstop, so it stops a *directly pushed* branch) all reject anything that is not a flat well-formed lease/journal `*.json`; the immutable prompt rules additionally tag handover/journal text as **untrusted data** |
 | Corrupt `contracts.lock` | manifest file is not valid JSON | `CorruptLockError` ⇒ a clear "run `--update`" message, never a traceback; surfaced by `--doctor` and CI |
 | Shared-ref push race | concurrent `publish_files` non-fast-forward | bounded exponential backoff + jitter retry; `False` return is logged as a warning, never swallowed |
 | Shallow clone in CI | base-commit objects absent ⇒ staleness silently passes | auto `fetch --unshallow`; with `AGENT_STALENESS_STRICT=1`, an unresolvable ref **fails safe** |
 | Hook bypass (`core.hooksPath`, plumbing) | a commit lands without the lock hook firing | guard flags it; post-hoc containment gate aborts (exit 4); CI re-check blocks the merge |
-| Obfuscated bypass flag | `--no-verify`/`-n` hidden behind `$(...)`, backticks, or `$GIT` so the stripper misses it | guard flags it as `obfuscated git-bypass` and charges a `guard_penalties` hit; the post-hoc containment gate + CI re-check still catch any resulting commit |
+| Obfuscated bypass flag | `--no-verify`/`-n` hidden behind `$(...)`, backticks, `$GIT`, or buried inside a `sh -c` / `bash -lc` / `cmd /c` script so the stripper misses it | guard flags it (`obfuscated git-bypass` / `shell -c …`) and charges a `guard_penalties` hit; the post-hoc containment gate + CI re-check still catch any resulting commit |
 | Out-of-allowlist commit | agent commits a file it may not touch | post-hoc containment gate (exit 4) locally; `ci_enforce.py` rejects the branch remotely |
 | Symlink lock bypass | an allowlisted path is flipped to a symlink (mode `120000`) aliasing a locked file | every lock layer rejects symlinks by git mode (`symlink_paths()`): pre-commit exit 1, containment gate exit 4, CI re-check fail |
 | Budget breach | token/USD ceiling exceeded mid-run | immediate financial abort, rollback, forensic report, exit 3 |
@@ -645,6 +703,16 @@ bypasses do not defeat them.
 - The shared `harness-state` ref is a coordination convenience, not a consensus
   system. Under heavy concurrency prefer one clone per agent, or
   `AGENT_MINIMAL=1`.
+- **Coordination state is structurally validated, not semantically trusted.**
+  `is_valid_coordination_payload` guarantees only that an exempt lease/journal
+  file is a flat well-formed `*.json` with known top-level keys — it does **not**
+  vet the free-text fields (`notes`, attempt `log_excerpt`). Because a recovered
+  journal re-enters a later agent's prompt via `AGENT_HANDOVER_FILE`, those
+  fields are a **prompt-injection surface**: the immutable framework rules
+  therefore instruct the model to treat AGENTS.md context, the handover/journal
+  file, and any prior-session notes as **untrusted data, never instructions**.
+  That is a mitigation, not a sandbox — run untrusted backends in your own
+  isolation and review escalated journals before trusting their narrative.
 - The complexity is real: ~16 harness modules, a YAML ledger, a shared ref,
   TTL'd leases, a journal, a hashed manifest, and a multi-stage pre-commit
   pipeline. `--doctor` exists specifically to make that surface debuggable; if
@@ -825,20 +893,24 @@ throwaway git repos in a temp dir):
 | **F4** branch/ledger | `test_f4a_computed_branch_name_is_valid`             | The work-branch name passes `git check-ref-format`. |
 | **F4**             | `test_f4a_isoformat_branch_name_is_rejected`           | An `isoformat()` name (with `:` / `+`) is rejected. |
 | **F4**             | `test_f4b_validator_*`                                 | Validator passes on a good ledger, fails on a corrupt one. |
-| **F5** coordination| `test_f5_coordination_paths_bypass_allowlist`          | `.harness/leases/`/`.harness/journal/` are always commit-allowed. |
+| **F5** coordination| `test_f5_coordination_paths_bypass_allowlist`          | A *well-formed* `.harness/leases/`/`.harness/journal/` payload is commit-allowed. |
 | **F6** binding     | `test_f6a_contract_change_without_manifest_is_blocked` | Contract change without manifest update → exit 1. |
 | **F6**             | `test_f6b_contract_change_without_bound_test_is_blocked` | Contract change without a bound test → exit 1. |
 | **F6**             | `test_f6c_contract_change_with_manifest_and_test_passes` | Contract + manifest + bound test in one commit → ok. |
 | **F6**             | `test_f6d_non_contract_change_is_not_gated`            | Non-contract edits are not gated by the binding hook. |
 | **F7** manifest    | `test_f7_manifest_detects_drift`                       | `contract_manifest.verify()` reports a drifted hash. |
 | **F8** leases      | `test_f8_lease_blocks_second_agent_then_releases`      | A live lease blocks a second agent; release re-opens it. |
+| **F8**             | `test_acquire_single_winner_under_concurrent_reclaim`  | 30 threads racing one expired lease → **exactly one** wins (the reclaim-mutex fix; no TOCTOU). |
+| **F8**             | `test_is_active_nonnumeric_ttl_is_inactive`            | A non-numeric `ttl_seconds` is treated as inactive, not an uncaught `ValueError`. |
 | **F9** journal     | `test_f9_journal_records_unresolved_for_next_agent`    | Escalated sessions are recoverable via `latest_unresolved()`. |
 | **F10** staleness  | `test_f10_staleness_detects_moved_contract`            | A contract moved on the shared ref is reported as stale. |
+| **F10**            | `test_f10b_staleness_includes_task_targets`            | A task **target** moved on the shared ref is reported as stale (loser-of-lease backstop). |
 | **F11** state sync | `test_f11_state_sync_round_trips_across_clones`        | Coordination state pushed to the shared ref is readable from a fresh clone. |
 | **F12** state sync | `test_f12_publish_files_returns_false_on_unreachable_remote` | A push that cannot reach its remote returns `False` (no silent swallow). |
 | **F13** manifest   | `test_f13_corrupt_lock_reports_cleanly`               | A corrupt `contracts.lock` yields an actionable message, not a traceback. |
 | **F14** CI re-check| `test_f14a/b_ci_enforce_*_agent_branch`               | `ci_enforce.py` blocks an out-of-scope agent branch and passes an in-scope one. |
 | **F14** CI binding | `test_f14c/d_ci_enforce_*_bound_test`                 | `ci_enforce.py` blocks a contract change that omits its bound `contract_tests` and passes one that includes them. |
+| **F14** CI coord   | `test_f14e/f/g_ci_enforce_*_journal`                  | A **directly pushed** agent branch smuggling a `.py` or unknown-shaped JSON under `.harness/journal/` is rejected; a well-formed journal `*.json` passes (the no-SHA-backstop layer). |
 | **F15** bootstrap  | `test_f15a_init_writes_empty_skeleton_that_validates` | `--init` writes a project README + an empty `AGENTS.md` skeleton that validates. |
 | **F15**            | `test_f15b_init_example_recreates_shipped_ledger`     | `--init --example` reproduces the shipped example ledger byte-for-byte. |
 | **F15**            | `test_f15c_doctor_flags_template_readme_then_init_clears_it` | `--doctor` warns on the template README; `--init` clears the sentinel. |
@@ -849,15 +921,23 @@ throwaway git repos in a temp dir):
 `harness/tests/test_hardening.py` covers the LLM-execution hardening layer: token-usage
 normalisation and budget aborts (telemetry), log condensation, cache-ordered
 prompt assembly, bypass-flag stripping **and hook-evasion flagging** (command
-guard), the `SKIP_AGENT_HARNESS` override, forensic-report generation, an
-end-to-end financial-abort run that asserts the exit-3 path rolls back and writes
-`FAILED_AGENT_RUN.md`, and an end-to-end **containment-breach** run (H8) where an
-LLM that commits an out-of-band file via a hook bypass is caught by the post-hoc
-gate and aborts with **exit 4** plus a clean rollback. A dedicated **symlink
-bypass** group (H8b) covers the mode-aware lock: the `symlink_paths()` `--raw`
-parser, the pre-commit hook blocking an allowlisted path staged as a symlink to a
-locked file (exit 1), and the post-hoc gate reporting a committed symlink as a
-breach even when its path is itself allowlisted.
+guard — including the `sh -c` / `bash -lc` / `cmd /c` script-wrapped bypass that
+previously passed undetected, H4t–H4x), the `SKIP_AGENT_HARNESS` override,
+forensic-report generation (including H5c, which asserts the step log shows
+**genuinely per-attempt** costs rather than repeating the first repair step), the
+content-aware **coordination-payload validator** (`is_valid_coordination_payload`,
+H5d) and the immutable rule tagging handover/journal text as **untrusted data**
+(H5e), an end-to-end financial-abort run that asserts the exit-3 path rolls back
+and writes `FAILED_AGENT_RUN.md`, and an end-to-end **containment-breach** run
+(H8) where an LLM that commits an out-of-band file via a hook bypass is caught by
+the post-hoc gate and aborts with **exit 4** plus a clean rollback. A dedicated
+**symlink bypass** group (H8b) covers the mode-aware lock: the `symlink_paths()`
+`--raw` parser, the pre-commit hook blocking an allowlisted path staged as a
+symlink to a locked file (exit 1), and the post-hoc gate reporting a committed
+symlink as a breach even when its path is itself allowlisted. The **rollback**
+group (H9/H9b) asserts agent-created untracked files are removed — *including*
+LLM junk under `.harness/` (a stray `.py`, malformed JSON) — while the harness's
+own logs, telemetry, manifest, and well-formed coordination payloads are kept.
 
 `harness/tests/test_contracts.py::test_contracts_match_manifest` additionally asserts
 that the shipped `.harness/contracts.lock` matches every declared contract.
