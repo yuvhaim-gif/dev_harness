@@ -1,3 +1,11 @@
+---
+type: API Contract
+title: POST /payments
+description: Contract for creating a payment transaction in the billing service.
+resource: /payments
+tags: [billing, payments, contract]
+---
+
 # API Schema
 
 ## POST /payments

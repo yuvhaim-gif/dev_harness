@@ -35,6 +35,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import contract_manifest  # noqa: E402
+import okf  # noqa: E402
 from lock_policy import (  # noqa: E402
     UnknownMutationModeError,
     compute_allowlist,
@@ -129,6 +130,17 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  - {problem}")
     else:
         print("OK: contract manifest verifies.")
+
+    # 1b. OKF info-layer conformance re-check (ignores SKIP_AGENT_HARNESS, which
+    #     the local validate-okf hook honours; the trusted runner does not).
+    okf_problems = okf.verify()
+    if okf_problems:
+        failed = True
+        print("FAIL: OKF info-layer conformance failed:")
+        for problem in okf_problems:
+            print(f"  - {problem}")
+    else:
+        print("OK: all declared spec_docs are OKF-conformant.")
 
     # 2. Re-apply the allowlist to the aggregate diff of agent branches.
     head_branch = args.head if args.head != "HEAD" else _current_branch()

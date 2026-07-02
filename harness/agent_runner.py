@@ -36,6 +36,7 @@ import forensic  # noqa: E402
 import journal  # noqa: E402
 import leases  # noqa: E402
 import log_condenser  # noqa: E402
+import okf  # noqa: E402
 import prompt_builder  # noqa: E402
 import staleness  # noqa: E402
 import state_sync  # noqa: E402
@@ -915,7 +916,17 @@ def _emit_forensic_report(ctx: RunContext, report: forensic.ForensicReport | Non
         return
     report.rollback_ok = ctx.rollback_ok
     report.git_warnings = list(ctx.git_warnings)
-    path = forensic.write_report(report, repo_dir=_repo_dir(ctx))
+    repo_dir = _repo_dir(ctx)
+    path = forensic.write_report(report, repo_dir=repo_dir)
+    # Also persist the run to the durable OKF memory layer (an OKF Postmortem
+    # concept + a dated log.md entry). These live under the harness-managed,
+    # rollback-surviving .harness/logs/ tree, so they are never wiped by the
+    # abort's hard reset and never collide with the task allowlist.
+    try:
+        forensic.write_okf_postmortem(report, repo_dir=repo_dir)
+        forensic.append_log(report, repo_dir=repo_dir)
+    except OSError as exc:
+        log(f"WARNING: could not write OKF memory artifacts: {exc}")
     forensic.print_badge(report.outcome, path)
     ctx.forensic_written = True
 
@@ -1102,6 +1113,26 @@ def _committed_symlinks(ctx: RunContext) -> list[str]:
     return symlink_paths(raw)
 
 
+def _okf_violations(ctx: RunContext) -> list[str]:
+    """OKF conformance breaches in spec_docs committed on ``base..HEAD``.
+
+    The local ``validate-okf`` hook already fails a normal commit that breaks the
+    info layer; this re-check inspects committed blobs so a malformed spec_doc
+    that reached history via a hook-bypassing commit is still caught (exit 4).
+    """
+    if ctx.dry_run:
+        return []
+    spec = set(ctx.task.spec_docs)
+    contracts = set(ctx.task.contracts)
+    problems: list[str] = []
+    for path in sorted(spec & set(_committed_paths(ctx))):
+        blob = _committed_blob(ctx, path)
+        if blob is None:
+            continue
+        problems.extend(okf.validate_concept_text(blob, path=path, is_contract=path in contracts))
+    return problems
+
+
 def _containment_breach(ctx: RunContext) -> list[str]:
     """Authoritative post-hoc check that the agent stayed inside its scope.
 
@@ -1133,6 +1164,7 @@ def _containment_breach(ctx: RunContext) -> list[str]:
     violations += [
         f"out-of-band commit (hook-bypassed): {sha[:12]}" for sha in _unexpected_commits(ctx)
     ]
+    violations += [f"OKF info-layer violation: {p}" for p in _okf_violations(ctx)]
     return violations
 
 
@@ -1484,6 +1516,18 @@ def doctor() -> int:
             print(f"  PROBLEM: {p}")
     else:
         print("  OK: contracts.lock matches every declared contract.")
+
+    print("-- okf info layer --")
+    try:
+        okf_problems = okf.verify()
+    except (OSError, SystemExit) as exc:
+        okf_problems = [f"could not validate OKF info layer: {exc}"]
+    if okf_problems:
+        problems += 1
+        for p in okf_problems:
+            print(f"  PROBLEM: {p}")
+    else:
+        print("  OK: every declared spec_doc is an OKF-conformant concept.")
 
     print("-- leases --")
     leases_dir = leases.LEASES_DIR

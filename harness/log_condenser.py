@@ -23,6 +23,7 @@ _RUFF = re.compile(
     r"^(?P<file>[^\s:][^:\n]*\.py):(?P<line>\d+):(?P<col>\d+):\s*"
     r"(?P<code>[A-Z]+\d+)\s+(?P<msg>.+)$"
 )
+_OKF = re.compile(r"^\s*-?\s*(?P<file>[^\s:][^:\n]*\.md):\s*(?P<msg>.+)$")
 _PYTEST_E = re.compile(r"^E\s{2,}(?P<msg>.+)$")
 _FAILED = re.compile(r"^(?P<kind>FAILED|ERROR)\s+(?P<msg>.+)$")
 _LOC = re.compile(r"(?P<file>[\w./\\-]+\.py):(?P<line>\d+)")
@@ -99,6 +100,15 @@ def _extract_signals(lines: list[str]) -> _Signals:
                 _MAX_ERRORS,
             )
             _push_location(sig.locations, ruff.group("file"), int(ruff.group("line")))
+            continue
+
+        okf_err = _OKF.match(line)
+        if okf_err:
+            _push_unique(
+                sig.errors,
+                f"{okf_err.group('file')}: {okf_err.group('msg').strip()}",
+                _MAX_ERRORS,
+            )
             continue
 
         pe = _PYTEST_E.match(line)

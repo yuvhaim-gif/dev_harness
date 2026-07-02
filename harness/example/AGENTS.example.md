@@ -6,9 +6,11 @@ tasks:
       Add a POST /payments endpoint to the billing service.
       Accepts amount, currency, and user_id. Returns a transaction_id.
     mutation_mode: evolve          # evolve = may edit spec_docs, tests, targets
-    spec_docs:
+    spec_docs:                     # OKF concept bundle (each has a non-empty 'type')
       - harness/example/docs/IMPLEMENTATION.md
       - harness/example/docs/API_SCHEMA.md
+      - harness/example/docs/index.md
+      - harness/example/docs/log.md
     contracts:                     # stable, hash-pinned (subset of spec_docs)
       - harness/example/docs/API_SCHEMA.md
     tests:

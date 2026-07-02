@@ -7,10 +7,15 @@ the YAML-bearing ``AGENTS.md``. This dedicated hook closes that gap (plan.md D1/
 
 from __future__ import annotations
 
+import os
 import sys
 from typing import Any
 
 import yaml
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # noqa: E402
+
+import okf  # noqa: E402
 
 VALID_MODES = {"evolve", "isolated"}
 
@@ -78,6 +83,21 @@ def validate(path: str = "AGENTS.md") -> int:
             print(
                 f"ERROR: task '{task_id}' lists contracts not in spec_docs: "
                 f"{sorted(contracts - spec_docs)}."
+            )
+            ok = False
+
+        non_md = sorted(p for p in spec_docs if not p.endswith(".md"))
+        if non_md:
+            print(
+                f"ERROR: task '{task_id}' spec_docs must be OKF markdown concepts (.md): {non_md}."
+            )
+            ok = False
+
+        reserved_contracts = okf.reserved_paths(contracts)
+        if reserved_contracts:
+            print(
+                f"ERROR: task '{task_id}' contracts must be concept docs, not OKF reserved "
+                f"files (index.md/log.md): {reserved_contracts}."
             )
             ok = False
 

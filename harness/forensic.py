@@ -20,6 +20,9 @@ from typing import Any
 
 REPORT_DIR = ".harness/logs"
 REPORT_NAME = "FAILED_AGENT_RUN.md"
+POSTMORTEM_DIR = ".harness/logs/postmortems"
+LOG_NAME = "log.md"
+LOG_TITLE = "# Agent Run Log"
 
 
 @dataclass
@@ -151,6 +154,73 @@ def write_report(report: ForensicReport, repo_dir: str = ".") -> str:
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "w", encoding="utf-8", newline="\n") as fh:
         fh.write(render(report))
+    return path
+
+
+def _slug(value: str) -> str:
+    safe = "".join(c if c.isalnum() or c in "-_" else "-" for c in value)
+    return safe.strip("-") or "run"
+
+
+def render_okf_postmortem(report: ForensicReport) -> str:
+    """Render the report as an OKF concept document (``type: Postmortem``).
+
+    Frontmatter + markdown body == an OKF-conformant memory artifact, so the
+    forensic record joins the durable knowledge layer instead of being an
+    opaque one-off dump.
+    """
+    now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    desc = f"{report.outcome} on branch {report.work_branch or '(none)'}"
+    if report.reason:
+        desc += f" -- {report.reason}"
+    frontmatter = [
+        "---",
+        "type: Postmortem",
+        f"title: Failed run -- {report.task_id}",
+        f"description: {desc}",
+        f"timestamp: {now}",
+        f"tags: [postmortem, {report.mutation_mode}, {report.outcome}]",
+        "---",
+        "",
+    ]
+    return "\n".join(frontmatter) + render(report)
+
+
+def write_okf_postmortem(report: ForensicReport, repo_dir: str = ".") -> str:
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    name = f"{_slug(report.task_id)}-{stamp}.md"
+    path = os.path.join(repo_dir, POSTMORTEM_DIR, name)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(render_okf_postmortem(report))
+    return path
+
+
+def append_log(report: ForensicReport, repo_dir: str = ".") -> str:
+    """Append a dated, newest-first entry to the OKF ``log.md`` memory file."""
+    path = os.path.join(repo_dir, REPORT_DIR, LOG_NAME)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    date = datetime.now(UTC).strftime("%Y-%m-%d")
+    reason = report.reason or "no reason recorded"
+    entry = (
+        f"* **{report.outcome}**: task `{report.task_id}` on "
+        f"`{report.work_branch or '(none)'}` -- {reason}"
+    )
+    try:
+        with open(path, encoding="utf-8") as fh:
+            existing = fh.read()
+    except (FileNotFoundError, OSError):
+        existing = ""
+
+    lines = existing.splitlines()
+    body = [ln for ln in lines if ln.strip() and ln.strip() != LOG_TITLE]
+    heading = f"## {date}"
+    if body and body[0] == heading:
+        rebuilt = [LOG_TITLE, "", heading, entry, *body[1:]]
+    else:
+        rebuilt = [LOG_TITLE, "", heading, entry, "", *body]
+    with open(path, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write("\n".join(rebuilt) + "\n")
     return path
 
 

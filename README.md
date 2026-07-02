@@ -16,7 +16,9 @@ everything else is locked, and the orchestrator never leaves the repository in
 a half-broken state.
 
 This README documents what is actually implemented in the repository: the
-orchestrator, the file-lock and contract-binding hooks, the cross-agent
+orchestrator, the file-lock and contract-binding hooks, the **OKF information
+layer** (every task's `spec_docs` is an [Open Knowledge Format](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
+concept bundle, gated for conformance), the cross-agent
 coordination layer (leases, handover journal, shared state ref, staleness
 guard), the LLM-execution hardening layer (token/cost budgeting, log
 condensation, cache-ordered repair prompts, escape-hatch command interception,
@@ -42,6 +44,7 @@ when the local hooks are skipped).
 - [Repository layout](#repository-layout)
 - [The operational ledger (`AGENTS.md`)](#the-operational-ledger-agentsmd)
   - [Lock model](#lock-model)
+- [The OKF information layer](#the-okf-information-layer)
 - [Contract binding](#contract-binding)
 - [How enforcement works](#how-enforcement-works)
 - [Cross-agent coordination](#cross-agent-coordination)
@@ -131,7 +134,7 @@ dev_process/
 │   ├── leases/                        # <task_id>.json — active task leases (TTL'd)
 │   ├── journal/                       # Append-only handover records per session
 │   ├── telemetry/                     # Per-step usage.json + cache-ordered repair_prompt.txt (gitignored)
-│   └── logs/                          # FAILED_AGENT_RUN.md forensic post-mortems (gitignored)
+│   └── logs/                          # FAILED_AGENT_RUN.md + OKF postmortems/ + log.md memory (gitignored)
 └── harness/                           # THE FRAMEWORK (run via `python -m harness`)
     ├── __init__.py                    # Marks `harness` as an installable package
     ├── __main__.py                    # ← `python -m harness` entry point
@@ -139,7 +142,9 @@ dev_process/
     ├── README.md                      # This document (the framework's own docs)
     ├── lock_policy.py                 # Shared compute_allowlist() + symlink_paths() mode check + coordination bypass + human override
     ├── enforce_file_locks.py          # Pre-commit gate: aborts out-of-allowlist (and symlink) commits
-    ├── validate_agents_ledger.py      # Validates AGENTS.md (incl. contracts ⊆ spec_docs)
+    ├── validate_agents_ledger.py      # Validates AGENTS.md (incl. contracts ⊆ spec_docs, spec_docs are .md concepts)
+    ├── okf.py                         # OKF conformance for the spec_docs info layer (type gate + reserved-file rules)
+    ├── validate_okf.py                # Pre-commit gate: every declared spec_doc is an OKF concept
     ├── contract_manifest.py           # verify() / update() the hashed contracts manifest
     ├── enforce_contract_binding.py    # Contract change ⇒ manifest + bound-test co-touch
     ├── leases.py                      # acquire/release/is_active task leases
@@ -160,17 +165,20 @@ dev_process/
     │   │   │   └── routes.py          # POST /payments handler (framework-agnostic)
     │   │   └── db/
     │   │       └── queries.py         # N+1 vs. batched query demo
-    │   ├── docs/
-    │   │   ├── API_SCHEMA.md          # POST /payments contract (example)
-    │   │   └── IMPLEMENTATION.md      # Sample-app implementation notes (example)
+    │   ├── docs/                      # OKF concept bundle (each file has YAML frontmatter)
+    │   │   ├── index.md               # OKF bundle root (okf_version) + progressive-disclosure listing
+    │   │   ├── API_SCHEMA.md          # POST /payments contract concept (type: API Contract)
+    │   │   ├── IMPLEMENTATION.md      # Sample-app implementation notes (type: Implementation Notes)
+    │   │   └── log.md                 # OKF reserved history file (dated, newest-first)
     │   └── tests/
     │       ├── conftest.py            # Puts the flat sample-app modules on sys.path
     │       ├── test_payments.py       # Contract tests for the payments endpoint
     │       └── test_queries.py        # N+1 vs. batched behaviour tests
     └── tests/                         # FRAMEWORK SELF-TESTS
-        ├── test_contracts.py          # Asserts contracts.lock matches every contract
+        ├── test_contracts.py          # Asserts contracts.lock matches every contract (+ whole-file hash covers frontmatter)
+        ├── test_okf.py                # OKF conformance: type gate, reserved-file rules, contract no-timestamp
         ├── test_harness.py            # F2–F18: framework self-tests (incl. --init/doctor, drive machine, packaging)
-        └── test_hardening.py          # Telemetry, condenser, prompt, guard, forensic, override, symlink locks
+        └── test_hardening.py          # Telemetry, condenser, prompt, guard, forensic, override, symlink + OKF locks
 ```
 
 > Everything under `harness/example/` is a **sample workload** used to exercise
@@ -195,7 +203,9 @@ tasks:
     description: >
       Add a POST /payments endpoint to the billing service.
     mutation_mode: evolve          # evolve = may edit spec_docs, tests, targets
-    spec_docs:    [harness/example/docs/IMPLEMENTATION.md, harness/example/docs/API_SCHEMA.md]
+    spec_docs:                     # OKF concept bundle (each file carries a non-empty 'type')
+      [harness/example/docs/IMPLEMENTATION.md, harness/example/docs/API_SCHEMA.md,
+       harness/example/docs/index.md, harness/example/docs/log.md]
     contracts:    [harness/example/docs/API_SCHEMA.md]  # stable, hash-pinned (⊆ spec_docs)
     tests:        [harness/example/tests/test_payments.py]
     contract_tests: [harness/example/tests/test_payments.py]  # pins the contract (⊆ tests)
@@ -221,7 +231,10 @@ tasks:
 Recognised task fields: `description`, `mutation_mode`, `spec_docs`, `contracts`,
 `tests`, `contract_tests`, `targets`, `locked_files`, `commit_prefix`,
 `max_autorepair_attempts`, `pr_labels`. The ledger validator additionally
-requires `contracts ⊆ spec_docs` and `contract_tests ⊆ tests`.
+requires `contracts ⊆ spec_docs`, `contract_tests ⊆ tests`, every `spec_docs`
+entry to be an OKF markdown concept (`.md`), and no `contracts` entry to be an
+OKF reserved file (`index.md` / `log.md`). See
+[The OKF information layer](#the-okf-information-layer).
 
 ### Lock model
 
@@ -274,11 +287,72 @@ history on a CI runner where the link is never materialised on disk.
 
 ---
 
+## The OKF information layer
+
+Every task's `spec_docs` is treated as an **[Open Knowledge Format](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
+(OKF v0.1) concept bundle** — the durable *information/memory layer* the harness
+reasons over, distinct from the machine-coordination state (leases, journal,
+`contracts.lock`) which stays strict JSON. A bundle is just a directory of
+markdown files (one per task's `spec_docs`), each carrying YAML frontmatter, so
+the knowledge stays human-readable, git-diffable, and maximally interoperable
+with any other OKF consumer.
+
+`harness/okf.py` defines the conformance rules, deliberately **minimal** so the
+corpus stays portable (OKF mandates permissive consumption):
+
+- **Concept files** — every non-reserved `spec_doc` MUST carry a YAML frontmatter
+  block with a **non-empty `type`**. That is the only hard gate on an ordinary
+  concept; any other keys (`title`, `description`, `tags`, `timestamp`, …) are
+  free-form and tolerated.
+- **Reserved files** follow OKF's own rules and are exempt from the `type` gate:
+  - **`index.md`** — the bundle root / progressive-disclosure map. Its
+    frontmatter, if present, may contain **only** `okf_version`; a stray typed
+    key is rejected. It may also omit frontmatter entirely.
+  - **`log.md`** — the dated, newest-first history file. It is validated
+    **leniently** (no frontmatter required) so an append-only log never trips the
+    gate.
+- **Contract concepts** additionally MUST NOT declare a volatile **`timestamp`**.
+  The contract hash in `.harness/contracts.lock` is taken over the **whole file**
+  (frontmatter included), so an edit-time timestamp would churn the pinned hash
+  on every touch and defeat the drift check — see [Contract binding](#contract-binding).
+
+The reserved `index.md` / `log.md` are declared as ordinary `spec_docs`, which
+puts them inside the **`evolve` allowlist**: an agent (or a human) may curate the
+bundle's map and history in-band, while a task in `isolated` mode cannot touch
+them at all.
+
+**Enforcement mirrors the file-lock model — advisory hook + authoritative
+re-checks.** The same conformance rule is applied at four layers so a
+frontmatter-stripping edit cannot reach a merged branch:
+
+| Layer | Where | Bypassable? |
+|-------|-------|-------------|
+| `validate-okf` pre-commit hook (`harness/validate_okf.py`) | agent's machine | yes — honours `SKIP_AGENT_HARNESS` for human restructures |
+| Post-hoc containment gate (`_okf_violations` → exit 4) | orchestrator, post-commit | no — inspects committed blobs on `base..HEAD` |
+| Server-side CI re-check (`ci_enforce.py`, ignores the override) | trusted runner | no |
+| `--doctor` info-layer report | on demand | n/a (read-only) |
+
+Because the last three inspect *committed content* rather than trusting the hook
+to have fired, an agent that strips the OKF frontmatter off a committed
+`spec_doc` — keeping its path inside the allowlist so the file-lock gates pass it
+— is still caught as an **OKF info-layer violation** (exit 4 locally, CI failure
+remotely).
+
+Forensic post-mortems also join this layer: a rejected/crashed run is written as
+an OKF `Postmortem` concept plus a `log.md` entry under `.harness/logs/` — see
+[Forensic post-mortem diagnostics](#forensic-post-mortem-diagnostics).
+
+---
+
 ## Contract binding
 
 A task's `contracts` are the subset of its `spec_docs` that are treated as
 **stable surface area**. Their content is hash-pinned in
-`.harness/contracts.lock`, and two pre-commit hooks keep the binding honest:
+`.harness/contracts.lock` — the sha256 is taken over the **whole file, OKF
+frontmatter included**, so a `type` rename or any frontmatter edit is itself a
+contract change (which is why contract concepts may not carry a volatile
+`timestamp`; see [The OKF information layer](#the-okf-information-layer)). Two
+pre-commit hooks keep the binding honest:
 
 - **`verify-contract-manifest`** (`harness/contract_manifest.py`) — for
   every contract declared anywhere in the ledger, the file's sha256 must match
@@ -485,7 +559,8 @@ most-static → most-dynamic so provider prompt caches reuse the unchanging head
 across recursive repair cycles:
 
 1. **Static** — immutable framework rules (edit only the allowlist, never the
-   always-locked files, no bypass flags, smallest change, …).
+   always-locked files, no bypass flags, smallest change, keep every `spec_doc`'s
+   OKF frontmatter with a non-empty `type` and no contract `timestamp`, …).
 2. **Semi-static** — the task schema, allowlist arrays, and `AGENTS.md`
    boundaries.
 3. **Dynamic** — the current working diff, the condensed failure log, and the
@@ -522,7 +597,7 @@ history* instead of trusting a hook to have fired, so the usual
 After the mutation/repair phase and before Reconcile, the orchestrator runs
 `_containment_breach()`: it inspects only **committed** state on `base..HEAD`
 (the history a push would publish, so benign uncommitted scratch files are
-ignored) and flags three things —
+ignored) and flags four things —
 
 - a committed path outside the task's computed allowlist (coordination paths
   excepted **only when the committed content is a well-formed lease/journal
@@ -532,7 +607,11 @@ ignored) and flags three things —
   even when its path is itself allowlisted — catching an allowed path aliased
   onto a locked file, and
 - an **out-of-band commit** the orchestrator did not author itself (i.e. a SHA
-  not in its `runner_commits` set — the signature of a hook-bypassed commit).
+  not in its `runner_commits` set — the signature of a hook-bypassed commit), and
+- an **OKF info-layer violation** — a committed `spec_doc` whose OKF frontmatter
+  was stripped or broken (e.g. a contract that lost its `type`), re-validated
+  from the committed blob so a `validate-okf` hook that was skipped cannot let it
+  through.
 
 Any one is a breach: the run logs `CONTAINMENT BREACH`, writes a forensic
 report, hard-rolls-back, journals `escalated`, and exits **4**. This is the gate
@@ -544,17 +623,20 @@ that makes the `core.hooksPath` bypass moot on the agent's own machine.
 agent cannot influence (wired up in `.github/workflows/harness-ci.yml`):
 
 1. the hashed contract manifest must still verify (content-based, bypass-proof),
-2. every file changed on an `agent/<task_id>/…` branch (computed over the
+2. every declared `spec_doc` must still be **OKF-conformant** (the same
+   `okf.verify()` the local `validate-okf` hook runs, re-checked here immediately
+   after the manifest and ignoring `SKIP_AGENT_HARNESS`),
+3. every file changed on an `agent/<task_id>/…` branch (computed over the
    aggregate `base...head` diff) must fall inside that task's allowlist
    (coordination paths excepted **only when well-formed** — this is the layer
    with *no* SHA-based out-of-band backstop, so a branch pushed **directly** to
    the runner that smuggles an arbitrary file under `.harness/journal/` or
    `.harness/leases/` is rejected right here as an *invalid coordination
    payload*), and
-3. no change on that branch may introduce a **symlink** — a `--raw` diff over
+4. no change on that branch may introduce a **symlink** — a `--raw` diff over
    the same range rejects any entry whose resulting mode is `120000`, so the
    alias-to-a-locked-file bypass is blocked remotely too, and
-4. a contract changed on an agent branch must carry a change to at least one of
+5. a contract changed on an agent branch must carry a change to at least one of
    that task's bound `contract_tests` — the same binding the local
    `enforce_contract_binding` hook applies, re-checked here so it survives a
    branch pushed without the local hook (this runner ignores `SKIP_AGENT_HARNESS`).
@@ -587,6 +669,15 @@ post-rollback outcome: the report is built before the rollback and emitted after
 it, so the verdict (`CONFIRMED` / `NOT CONFIRMED`) is the real one rather than a
 stale default.
 
+**The post-mortem also joins the OKF memory layer.** Alongside the human-readable
+`FAILED_AGENT_RUN.md`, the same report is written as an OKF concept document
+(`type: Postmortem`, with frontmatter + body) under `.harness/logs/postmortems/`,
+and a one-line, dated, newest-first summary is appended to `.harness/logs/log.md`
+— an OKF reserved history file. These artifacts live under the gitignored
+`.harness/logs/` tree, so they **survive the rollback** (the sweep preserves
+`.harness/logs/`) and give the next agent a durable, format-consistent record of
+why the previous run failed.
+
 **Rollback also cleans `.harness/`.** The hard reset plus untracked-file sweep
 removes agent-created junk *including* anything the LLM wrote under `.harness/`
 (a stray `.py`, malformed JSON), while deliberately **preserving the harness's
@@ -604,6 +695,9 @@ runs a single read-only health pass and prints, in one place:
 
 - the repo path and whether an `origin` remote / minimal mode is in effect,
 - the **contract manifest** verification result (corrupt or drifted ⇒ non-zero
+  exit),
+- the **OKF info layer** result — whether every declared `spec_doc` is an
+  OKF-conformant concept (a stripped `type` or a contract `timestamp` ⇒ non-zero
   exit),
 - every local **lease** with its `ACTIVE` / `expired (reclaimable)` state, owner,
   and branch (and a `PROBLEM` line for an unreadable one),
@@ -688,6 +782,7 @@ bypasses do not defeat them.
 | Obfuscated bypass flag | `--no-verify`/`-n` hidden behind `$(...)`, backticks, `$GIT`, or buried inside a `sh -c` / `bash -lc` / `cmd /c` script so the stripper misses it | guard flags it (`obfuscated git-bypass` / `shell -c …`) and charges a `guard_penalties` hit; the post-hoc containment gate + CI re-check still catch any resulting commit |
 | Out-of-allowlist commit | agent commits a file it may not touch | post-hoc containment gate (exit 4) locally; `ci_enforce.py` rejects the branch remotely |
 | Symlink lock bypass | an allowlisted path is flipped to a symlink (mode `120000`) aliasing a locked file | every lock layer rejects symlinks by git mode (`symlink_paths()`): pre-commit exit 1, containment gate exit 4, CI re-check fail |
+| OKF info-layer corruption | an evolve-mode edit strips a spec_doc's `type` or adds a volatile `timestamp` to a contract, degrading the durable knowledge layer | `okf.verify()` runs at four layers: `validate-okf` pre-commit (exit 1), post-hoc containment gate (exit 4, re-validated from the committed blob), CI re-check, and `--doctor` |
 | Budget breach | token/USD ceiling exceeded mid-run | immediate financial abort, rollback, forensic report, exit 3 |
 | Coordination layer is overkill | single-agent run, shared-ref machinery unwanted | `AGENT_MINIMAL=1` keeps local locking, drops the shared ref |
 
@@ -713,7 +808,7 @@ bypasses do not defeat them.
   file, and any prior-session notes as **untrusted data, never instructions**.
   That is a mitigation, not a sandbox — run untrusted backends in your own
   isolation and review escalated journals before trusting their narrative.
-- The complexity is real: ~16 harness modules, a YAML ledger, a shared ref,
+- The complexity is real: ~18 harness modules, a YAML ledger, a shared ref,
   TTL'd leases, a journal, a hashed manifest, and a multi-stage pre-commit
   pipeline. `--doctor` exists specifically to make that surface debuggable; if
   you do not need cross-agent coordination, minimal mode collapses most of it.
@@ -821,7 +916,7 @@ Exit codes:
 | `1` | Failure (e.g. autorepair cap exceeded, or a stale push refused); the tree is rolled back. |
 | `2` | No task specified. |
 | `3` | **Financial or time abort** — a token/cost budget was breached, or a step (`AGENT_STEP_TIMEOUT_SECONDS`) / wall-clock (`MAX_RUN_SECONDS`) timeout fired; the tree is rolled back and a forensic report (carrying the distinguishing reason) is written. |
-| `4` | **Containment breach** — the agent committed outside its allowlist, committed a symlink (aliasing an allowlisted path onto a locked file), made an out-of-band (hook-bypassed) commit, or exhausted the `guard_penalties` ceiling with repeated git-bypass attempts; the tree is rolled back and a forensic report is written. |
+| `4` | **Containment breach** — the agent committed outside its allowlist, committed a symlink (aliasing an allowlisted path onto a locked file), committed a spec_doc that breaks OKF conformance (stripped `type` / added contract `timestamp`), made an out-of-band (hook-bypassed) commit, or exhausted the `guard_penalties` ceiling with repeated git-bypass attempts; the tree is rolled back and a forensic report is written. |
 
 Example dry-run output (remote-less repo):
 
@@ -940,7 +1035,20 @@ LLM junk under `.harness/` (a stray `.py`, malformed JSON) — while the harness
 own logs, telemetry, manifest, and well-formed coordination payloads are kept.
 
 `harness/tests/test_contracts.py::test_contracts_match_manifest` additionally asserts
-that the shipped `.harness/contracts.lock` matches every declared contract.
+that the shipped `.harness/contracts.lock` matches every declared contract, and
+`test_hash_is_stable_and_covers_okf_frontmatter` pins that the contract hash is
+whole-file (OKF frontmatter included), so silently editing a contract's `type`
+still trips the manifest.
+
+`harness/tests/test_okf.py` covers the OKF info layer directly: the frontmatter
+parser, the `type` gate, malformed-YAML handling, the contract `timestamp`
+prohibition, the reserved-file rules (`index.md` `okf_version`-only, `log.md`
+lenient), `spec_map_from_ledger`, and live-ledger conformance. `test_hardening.py`
+adds the forensic-memory checks (H5f: the post-mortem is a valid OKF `Postmortem`
+concept; H5g: `log.md` stays dated and newest-first) and the drive-machine
+containment checks (H14/H14b: a committed spec_doc with stripped frontmatter is
+caught by `_okf_violations` + the post-hoc gate with **exit 4**, while a
+conformant doc is not flagged).
 
 The remaining tests (`test_payments.py`, `test_queries.py`) cover the sample
 workload's contracts.
@@ -963,7 +1071,9 @@ workload's contracts.
    - `verify-contract-manifest` (every declared contract still matches
      `.harness/contracts.lock`),
    - `enforce-contract-binding` (a staged contract change must co-stage the
-     manifest and a bound test).
+     manifest and a bound test),
+   - `validate-okf` (every declared `spec_doc` must be an OKF-conformant concept
+     — a non-empty `type`, no contract `timestamp`, reserved-file rules honoured).
 
 ---
 
@@ -994,6 +1104,11 @@ workload's contracts.
   `120000`) so an allowlisted path cannot be aliased onto a locked file. Mode is
   read from git's recorded tree entry, not `os.path.islink`, so it holds against
   committed history on a CI runner.
+- **OKF information layer** — every task's `spec_docs` is an Open Knowledge
+  Format concept bundle; `okf.verify()` enforces a non-empty `type` (and no
+  volatile `timestamp` on contracts) at four layers (pre-commit, post-hoc
+  containment gate, CI re-check, `--doctor`), and forensic post-mortems join the
+  same layer as an OKF `Postmortem` concept plus a dated `log.md` history file.
 - **Financial & time circuit-breaker** — cumulative token and USD budgets are
   checked after every LLM step, alongside per-step (`AGENT_STEP_TIMEOUT_SECONDS`)
   and wall-clock (`MAX_RUN_SECONDS`) time ceilings; a breach hard-rolls-back and

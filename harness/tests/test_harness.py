@@ -42,6 +42,8 @@ from agent_runner import compute_branch_name  # noqa: E402
 REFERENCED_PATHS = [
     "harness/example/docs/IMPLEMENTATION.md",
     "harness/example/docs/API_SCHEMA.md",
+    "harness/example/docs/index.md",
+    "harness/example/docs/log.md",
     "harness/example/tests/test_payments.py",
     "harness/example/tests/test_queries.py",
     "harness/example/src/billing/routes.py",
@@ -87,7 +89,13 @@ def harness_repo(tmp_path: Path) -> Path:
     ledger = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
     _write(repo, "AGENTS.md", ledger)
     for rel in REFERENCED_PATHS:
-        _write(repo, rel, f"# placeholder for {rel}\n")
+        # Spec_docs are OKF concept files the info-layer gate validates; copy the
+        # real (frontmatter-bearing) bundle so the fixture is OKF-conformant.
+        src = REPO_ROOT / rel
+        if rel.endswith(".md") and src.exists():
+            _write(repo, rel, src.read_text(encoding="utf-8"))
+        else:
+            _write(repo, rel, f"# placeholder for {rel}\n")
 
     _git(repo, "add", "-A")
     _git(repo, "commit", "-m", "seed")

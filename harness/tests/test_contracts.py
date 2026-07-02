@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import sys
+from pathlib import Path
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(REPO_ROOT, "harness"))
@@ -22,3 +23,16 @@ def test_contracts_match_manifest() -> None:
     lock = os.path.join(REPO_ROOT, ".harness", "contracts.lock")
     problems = contract_manifest.verify(ledger_path=ledger, lock_path=lock)
     assert problems == [], "contract drift:\n" + "\n".join(problems)
+
+
+def test_hash_is_stable_and_covers_okf_frontmatter(tmp_path: Path) -> None:
+    # The pinned hash is whole-file, so it includes the OKF frontmatter. Editing
+    # a frontmatter field (e.g. a type rename) is therefore a contract change and
+    # drifts the hash -- exactly why contracts forbid a volatile timestamp.
+    contract = tmp_path / "API_SCHEMA.md"
+    contract.write_text("---\ntype: API Contract\ntitle: X\n---\n\nbody\n", encoding="utf-8")
+    baseline = contract_manifest.sha256_of(str(contract))
+    assert contract_manifest.sha256_of(str(contract)) == baseline  # deterministic
+
+    contract.write_text("---\ntype: Renamed Contract\ntitle: X\n---\n\nbody\n", encoding="utf-8")
+    assert contract_manifest.sha256_of(str(contract)) != baseline

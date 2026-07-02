@@ -1,3 +1,11 @@
+---
+type: Implementation Notes
+title: Billing service implementation
+description: How the payments endpoint and query layer are wired.
+tags: [billing, implementation]
+timestamp: 2026-07-01T00:00:00Z
+---
+
 # Implementation Notes
 
 ## Billing service (`example/src/billing/`)

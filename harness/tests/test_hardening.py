@@ -28,6 +28,7 @@ import forensic  # noqa: E402
 import git  # noqa: E402
 import lock_policy  # noqa: E402
 import log_condenser  # noqa: E402
+import okf  # noqa: E402
 import prompt_builder  # noqa: E402
 import telemetry  # noqa: E402
 
@@ -422,6 +423,44 @@ def test_h5c_attempts_show_distinct_per_attempt_cost() -> None:
     assert "0.2000" in rows[1] and "4/5/9" in rows[1]  # attempt 2 -> 2nd repair step
     assert "0.0000" in rows[2]  # attempt 3 -> no following step, honest zero
     assert "5.0000" not in table  # the mutate step never leaks into an attempt row
+
+
+def test_h5f_postmortem_is_an_okf_concept(tmp_path: Path) -> None:
+    # The durable memory artifact is itself OKF-conformant (type: Postmortem)
+    # so a failed run joins the knowledge layer instead of being an opaque dump.
+    report = forensic.ForensicReport(
+        task_id="add_payments_endpoint",
+        mutation_mode="evolve",
+        outcome="escalated",
+        reason="cap exceeded",
+        work_branch="agent/add_payments_endpoint",
+    )
+    path = forensic.write_okf_postmortem(report, repo_dir=str(tmp_path))
+    assert Path(path).exists()
+    text = Path(path).read_text(encoding="utf-8")
+    doc = okf.parse_document(text)
+    assert doc.frontmatter is not None and doc.frontmatter.get("type") == "Postmortem"
+    # A postmortem is not a contract, so its volatile timestamp is allowed.
+    assert okf.validate_concept_text(text, path=path, is_contract=False) == []
+
+
+def test_h5g_append_log_is_dated_newest_first(tmp_path: Path) -> None:
+    first = forensic.ForensicReport(
+        task_id="t1", mutation_mode="isolated", outcome="escalated", reason="one"
+    )
+    second = forensic.ForensicReport(
+        task_id="t2", mutation_mode="evolve", outcome="aborted", reason="two"
+    )
+    forensic.append_log(first, repo_dir=str(tmp_path))
+    log_path = Path(forensic.append_log(second, repo_dir=str(tmp_path)))
+
+    assert log_path.name == forensic.LOG_NAME
+    body = log_path.read_text(encoding="utf-8")
+    assert body.startswith(forensic.LOG_TITLE)
+    # Newest entry precedes the older one in the same-day section.
+    assert body.index("`t2`") < body.index("`t1`")
+    # The log file is OKF-lenient (reserved name), so it always validates.
+    assert okf.validate_concept_text(body, path=str(log_path), is_contract=False) == []
 
 
 # --------------------------------------------------------------------------- #
@@ -1005,3 +1044,44 @@ def test_h13b_guard_ceiling_exits_four_with_bypass_reason(seeded_repo: Path) -> 
     assert "git-bypass" in body.lower()
     assert "financial abort" not in body.lower()
     assert "autorepair cap" not in body.lower()
+
+
+# --------------------------------------------------------------------------- #
+# H14. OKF info-layer breach is caught by the post-hoc containment gate
+# --------------------------------------------------------------------------- #
+# An agent that strips the OKF frontmatter off a committed spec_doc keeps the
+# path inside its allowlist, so the path/symlink gates pass it. The info-layer
+# re-check must still flag the malformed concept as a containment breach.
+def _okf_ctx(repo_path: Path) -> tuple[agent_runner.RunContext, Path]:
+    repo = git.Repo(str(repo_path))
+    repo.git.checkout("-b", "agent/add_payments_endpoint/test")
+    base = repo.head.commit.hexsha
+    docs = repo_path / "harness" / "example" / "docs"
+    docs.mkdir(parents=True, exist_ok=True)
+    schema = docs / "API_SCHEMA.md"
+    schema.write_text("---\ntype: API Contract\ntitle: X\n---\n\nbody\n", encoding="utf-8")
+    task = agent_runner._parse_task("add_payments_endpoint")
+    ctx = agent_runner.RunContext(
+        repo=repo, task=task, dry_run=False, agent_id="a", base_commit=base
+    )
+    return ctx, schema
+
+
+def test_h14_stripped_frontmatter_is_okf_violation(seeded_repo: Path) -> None:
+    ctx, schema = _okf_ctx(seeded_repo)
+    schema.write_text("# API Schema\n\nno frontmatter here\n", encoding="utf-8")
+    _git(seeded_repo, "add", "-A")
+    _git(seeded_repo, "commit", "-m", "strip okf frontmatter")
+
+    problems = agent_runner._okf_violations(ctx)
+    assert any("API_SCHEMA.md" in p for p in problems), problems
+    breaches = agent_runner._containment_breach(ctx)
+    assert any("OKF info-layer violation" in b for b in breaches), breaches
+
+
+def test_h14b_conformant_spec_doc_is_not_a_violation(seeded_repo: Path) -> None:
+    ctx, _ = _okf_ctx(seeded_repo)
+    _git(seeded_repo, "add", "-A")
+    _git(seeded_repo, "commit", "-m", "add conformant spec doc")
+
+    assert agent_runner._okf_violations(ctx) == []

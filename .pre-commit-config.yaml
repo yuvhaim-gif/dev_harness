@@ -66,3 +66,11 @@ repos:
         additional_dependencies: ["pyyaml>=6.0"]
         pass_filenames: false
         always_run: true
+
+      - id: validate-okf
+        name: "Enforce OKF conformance of the spec_docs info layer"
+        language: python
+        entry: python harness/validate_okf.py
+        additional_dependencies: ["pyyaml>=6.0"]
+        pass_filenames: false
+        always_run: true
