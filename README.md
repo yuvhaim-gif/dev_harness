@@ -80,22 +80,50 @@ This README documents what is actually implemented in the repository:
 
 ```mermaid
 flowchart TD
-    A[Initialize: parse ledger, recover handover] --> B[Isolate: claim lease, then create branch]
-    B -->|lease held by another agent| R0[Abort: refuse to collide]
-    B --> C[Mutate: invoke AGENT_LLM_CMD]
-    C --> G{Post-step safety checks}
-    G -->|token/cost or time ceiling breached| X3[Forensic + rollback, exit 3]
-    G -->|hook-bypass or out-of-scope commit| X4[Containment breach: forensic + rollback, exit 4]
-    G -->|clear| D[Enforce: scoped stage + gated commit]
-    D -->|mechanical fix| C2[Re-stage and retry once] --> D
-    D -->|semantic failure| E[Autorepair: condense log + cache-ordered prompt to LLM]
+    A["<b>1 · Initialize</b><br/>parse ledger<br/>recover handover"]
+    B["<b>2 · Isolate</b><br/>claim lease<br/>create branch"]
+    C["<b>3 · Mutate</b><br/>invoke AGENT_LLM_CMD"]
+    D["<b>4 · Enforce</b><br/>scoped stage<br/>gated commit"]
+    E["<b>Autorepair</b><br/>condense log<br/>cache-ordered prompt to LLM"]
+    F["<b>5 · Reconcile</b><br/>push · PR · release lease<br/>journal 'pushed'"]
+
+    G{"Post-step<br/>safety checks"}
+    P{"Containment gate<br/>base..HEAD"}
+    S{"Staleness check<br/>vs shared ref"}
+    C2["Re-stage and<br/>retry once"]
+
+    R0(["<b>Abort</b><br/>refuse to collide"])
+    X3(["<b>exit 3</b><br/>forensic + rollback"])
+    X4(["<b>exit 4</b><br/>containment breach<br/>forensic + rollback"])
+    R1(["<b>exit 1</b><br/>journal 'escalated'<br/>forensic + rollback"])
+    R2(["<b>exit 1</b><br/>journal 'stale'<br/>refuse push"])
+
+    A --> B
+    B -->|lease held by another agent| R0
+    B --> C
+    C --> G
+    G -->|token/cost or time ceiling breached| X3
+    G -->|hook-bypass or out-of-scope commit| X4
+    G -->|clear| D
+    D -->|mechanical fix| C2 --> D
+    D -->|semantic failure| E
     E -->|attempts left| C
-    E -->|cap exceeded| R1[Journal 'escalated' + forensic + rollback, exit 1]
-    D -->|passed| P{Containment gate on base..HEAD}
+    E -->|cap exceeded| R1
+    D -->|passed| P
     P -->|breach| X4
-    P -->|clean| S{Staleness check vs shared ref}
-    S -->|stale| R2[Journal 'stale' + refuse push, exit 1]
-    S -->|fresh| F[Reconcile: push, PR, release lease, journal 'pushed']
+    P -->|clean| S
+    S -->|stale| R2
+    S -->|fresh| F
+
+    classDef state fill:#1f6feb,stroke:#0d419d,color:#ffffff;
+    classDef decision fill:#9e6a03,stroke:#7d5300,color:#ffffff;
+    classDef success fill:#238636,stroke:#196c2e,color:#ffffff;
+    classDef abort fill:#da3633,stroke:#b62324,color:#ffffff;
+
+    class A,B,C,D,E state;
+    class G,P,S decision;
+    class F success;
+    class R0,X3,X4,R1,R2 abort;
 ```
 
 | State | What it does |
