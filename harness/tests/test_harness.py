@@ -887,6 +887,101 @@ def test_f14g_ci_enforce_allows_valid_journal_json(harness_repo: Path) -> None:
     assert res.returncode == 0, res.stdout + res.stderr
 
 
+def test_f14h_ci_enforce_fails_closed_on_non_agent_branch(harness_repo: Path) -> None:
+    # F1 regression: an agent could dodge the file-scope re-check by pushing its
+    # work on a branch that does not match agent/<task>/... . With no trusted
+    # task id supplied that must now FAIL closed rather than SKIP-and-pass.
+    base = _seed_contract_lock(harness_repo)
+    _git(harness_repo, "checkout", "-b", "sneaky")
+    with (harness_repo / "harness/example/src/billing/routes.py").open("a", encoding="utf-8") as fh:
+        fh.write("# out-of-scope edit on a non-agent branch\n")
+    _git(harness_repo, "add", "-A")
+    _git(harness_repo, "commit", "-m", "sneaky")
+
+    env = os.environ.copy()
+    env.pop("HARNESS_NON_AGENT_OK", None)
+    env.pop("AGENT_TASK_ID", None)
+    res = subprocess.run(
+        [sys.executable, str(CI_ENFORCE), "--base", base, "--head", "HEAD"],
+        cwd=str(harness_repo),
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert res.returncode == 1, res.stdout + res.stderr
+    assert "cannot determine task" in res.stdout
+
+
+def test_f14i_ci_enforce_trusts_injected_task_over_branch_name(harness_repo: Path) -> None:
+    # A CI-injected task id is authoritative regardless of the branch name, so an
+    # out-of-scope change is still caught on an arbitrarily named branch.
+    base = _seed_contract_lock(harness_repo)
+    _git(harness_repo, "checkout", "-b", "sneaky")
+    with (harness_repo / "harness/example/src/billing/routes.py").open("a", encoding="utf-8") as fh:
+        fh.write("# out-of-scope edit\n")
+    _git(harness_repo, "add", "-A")
+    _git(harness_repo, "commit", "-m", "sneaky")
+
+    res = subprocess.run(
+        [
+            sys.executable,
+            str(CI_ENFORCE),
+            "--base",
+            base,
+            "--head",
+            "HEAD",
+            "--task",
+            "optimise_query_layer",
+        ],
+        cwd=str(harness_repo),
+        capture_output=True,
+        text=True,
+    )
+    assert res.returncode == 1, res.stdout + res.stderr
+    assert "outside its allowlist" in res.stdout
+
+
+def test_f14j_ci_enforce_allows_declared_human_branch(harness_repo: Path) -> None:
+    # A genuine human PR opts out of file-scope via the trusted, workflow-set
+    # HARNESS_NON_AGENT_OK flag (the agent cannot set it); the manifest check
+    # still runs, but the branch is not held to a task allowlist.
+    base = _seed_contract_lock(harness_repo)
+    _git(harness_repo, "checkout", "-b", "feature/manual")
+    with (harness_repo / "harness/example/src/billing/routes.py").open("a", encoding="utf-8") as fh:
+        fh.write("# human change\n")
+    _git(harness_repo, "add", "-A")
+    _git(harness_repo, "commit", "-m", "human work")
+
+    env = os.environ.copy()
+    env["HARNESS_NON_AGENT_OK"] = "1"
+    res = subprocess.run(
+        [sys.executable, str(CI_ENFORCE), "--base", base, "--head", "HEAD"],
+        cwd=str(harness_repo),
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert "human-authored" in res.stdout
+
+
+def test_f14k_resolve_base_falls_back_to_origin(monkeypatch: pytest.MonkeyPatch) -> None:
+    # F6 regression: GITHUB_BASE_REF is a bare name (e.g. `main`) that may not
+    # resolve in a shallow/detached checkout; _resolve_base must fall back to
+    # origin/<name> so the diff range is never silently empty.
+    import ci_enforce
+
+    def fake_git(*args: str) -> subprocess.CompletedProcess[str]:
+        if args[:2] == ("rev-parse", "--verify"):
+            ok = args[-1].startswith("origin/main")
+            return subprocess.CompletedProcess(list(args), 0 if ok else 1, "", "")
+        return subprocess.CompletedProcess(list(args), 0, "", "")
+
+    monkeypatch.setattr(ci_enforce, "_git", fake_git)
+    assert ci_enforce._resolve_base("main") == "origin/main"
+    assert ci_enforce._resolve_base("origin/main") == "origin/main"
+
+
 # --------------------------------------------------------------------------- #
 # F15. Bootstrap (--init) and the doctor README sentinel
 # --------------------------------------------------------------------------- #

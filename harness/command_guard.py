@@ -73,6 +73,21 @@ _SHELL_INTERPRETERS = frozenset(
 # the Windows ``/c``.
 _RUN_STRING_FLAG = re.compile(r"^(?:-[a-z]*c|/c)$", re.IGNORECASE)
 
+# Non-shell interpreters that can equally spawn git from an inline script; their
+# eval flag is ``-c`` (python) or ``-e``/``-E``/``--eval`` (perl/ruby/node).
+_CODE_INTERPRETERS = frozenset(
+    {"python", "python2", "python3", "py", "perl", "ruby", "node", "deno"}
+)
+_EVAL_FLAG = re.compile(r"^(?:-[a-z]*c|-[eE]|--eval|--command)$")
+
+# git commit/push boolean short flags that may stack ahead of ``-n`` inside one
+# combined token (``-an`` == ``-a -n``). Any other char takes an argument and
+# ends the boolean run, so its ``n`` is a value, not no-verify (``-mn`` == ``-m n``).
+_STACKABLE_SHORT_BOOLS = frozenset("nasevqp")
+
+# git's dashed builtins: the git name and its subcommand fused into one token.
+_GIT_DASHED = frozenset({"git-commit", "git-commit.exe", "git-push", "git-push.exe"})
+
 
 @dataclass
 class GuardResult:
@@ -183,6 +198,77 @@ def _shell_c_evasion(tokens: list[str]) -> list[str]:
     return sorted(set(found))
 
 
+def _strip_short_no_verify(tok: str) -> tuple[str | None, bool]:
+    """Remove a stacked boolean ``-n`` (no-verify) from a combined short token.
+
+    Returns ``(rewritten, stripped)``. ``rewritten`` is the token minus the
+    ``n`` (``-nm`` -> ``-m``), or ``None`` when only ``-n`` remained. A token
+    whose ``n`` is really an argument value (``-mn`` == ``-m n``), or that does
+    not combine, is returned untouched with ``stripped=False``.
+    """
+    if len(tok) < 2 or not tok.startswith("-") or tok.startswith("--"):
+        return tok, False
+    kept: list[str] = []
+    stripped = False
+    for idx, ch in enumerate(tok[1:]):
+        if ch == "n" and not stripped:
+            stripped = True
+            continue
+        if ch not in _STACKABLE_SHORT_BOOLS:
+            # An argument-taking short flag; it and the rest are its value.
+            kept.append(tok[1 + idx :])
+            break
+        kept.append(ch)
+    if not stripped:
+        return tok, False
+    rest = "".join(kept)
+    return (f"-{rest}" if rest else None), True
+
+
+def _scan_inline_script(script: str) -> list[str]:
+    """Surface a git bypass hidden in a code interpreter's inline script.
+
+    The script is opaque to the outer parse and is often *not* shell (e.g.
+    Python), so besides the recursive shell scan it is split on code punctuation
+    to catch a bypass flag quoted as a string literal
+    (``subprocess.run(["git", "commit", "--no-verify"])``).
+    """
+    found: list[str] = []
+    inner = sanitize_command(script)
+    found += [f"interpreter git-bypass: {f}" for f in inner.stripped]
+    found += [f"interpreter {f}" for f in inner.flagged]
+    pieces = set(re.split(r"[\s'\"(),\[\]]+", script))
+    for flag in sorted(_BYPASS_FLAGS):
+        if flag in pieces:
+            found.append(f"interpreter git-bypass: {flag}")
+    found += [f"interpreter {f}" for f in _literal_flagged(script)]
+    return found
+
+
+def _code_interpreter_evasion(tokens: list[str]) -> list[str]:
+    """Flag a git bypass buried in ``python -c`` / ``perl -e`` / ``node -e`` ...
+
+    Mirrors ``_shell_c_evasion`` for non-shell interpreters, whose inline-eval
+    flag is ``-c`` or ``-e``/``-E``/``--eval`` rather than only ``-c``/``/c``.
+    """
+    found: list[str] = []
+    for i, tok in enumerate(tokens):
+        if os.path.basename(tok).lower() not in _CODE_INTERPRETERS:
+            continue
+        j = i + 1
+        while j < len(tokens):
+            nxt = tokens[j]
+            if _EVAL_FLAG.match(nxt):
+                if j + 1 < len(tokens):
+                    found += _scan_inline_script(tokens[j + 1])
+                break
+            if nxt.startswith(("-", "/")):
+                j += 1
+                continue
+            break
+    return sorted(set(found))
+
+
 def sanitize_command(cmd: str | None) -> GuardResult:
     """Strip git bypass flags from ``cmd`` and flag unstrippable evasion."""
     if not cmd:
@@ -204,6 +290,7 @@ def sanitize_command(cmd: str | None) -> GuardResult:
     in_git = False
     git_sub = ""
     skip_value = False  # the previous token was a value-taking global flag
+    pending_config = False  # ...and that flag was -c/--config-env (alias probe)
 
     for tok in tokens:
         if _HOOKSPATH_NEEDLE in tok.lower():
@@ -212,6 +299,7 @@ def sanitize_command(cmd: str | None) -> GuardResult:
             in_git = False
             git_sub = ""
             skip_value = False
+            pending_config = False
             out.append(tok)
             continue
         base = os.path.basename(tok).lower()
@@ -219,16 +307,33 @@ def sanitize_command(cmd: str | None) -> GuardResult:
             in_git = True
             git_sub = ""
             skip_value = False
+            pending_config = False
+            out.append(tok)
+            continue
+        if not in_git and base in _GIT_DASHED:
+            # ``git-commit``/``git-push`` fuse the git name and its subcommand
+            # into one token; treat them as an in-git commit/push segment so the
+            # bypass strip below still applies.
+            in_git = True
+            git_sub = base.split(".", 1)[0].split("-", 1)[1]
+            skip_value = False
+            pending_config = False
             out.append(tok)
             continue
         if in_git and not git_sub:
             # Still scanning git's global options, before the subcommand.
             if skip_value:
                 skip_value = False
+                if pending_config and tok.lower().startswith("alias."):
+                    # ``git -c alias.x=commit x`` smuggles a commit/push through
+                    # an alias the structured strip cannot follow; flag it.
+                    flagged.append("git alias override")
+                pending_config = False
                 out.append(tok)
                 continue
             if tok in _GIT_VALUE_FLAGS:
                 skip_value = True
+                pending_config = tok in {"-c", "--config-env"}
                 out.append(tok)
                 continue
             if tok.startswith("-"):
@@ -241,13 +346,23 @@ def sanitize_command(cmd: str | None) -> GuardResult:
                 flagged.append(f"low-level git: {git_sub}")
             out.append(tok)
             continue
-        if in_git and git_sub in _GIT_SUBCOMMANDS and tok in _BYPASS_FLAGS:
-            stripped.append(tok)
-            continue
+        if in_git and git_sub in _GIT_SUBCOMMANDS:
+            if tok == "--no-verify":
+                stripped.append(tok)
+                continue
+            rewritten, was_stripped = _strip_short_no_verify(tok)
+            if was_stripped:
+                # Report the logical flag; the rewritten token keeps the rest of
+                # a combined cluster (``-nm`` -> stripped ``-n``, kept ``-m``).
+                stripped.append("-n")
+                if rewritten is not None:
+                    out.append(rewritten)
+                continue
         out.append(tok)
 
     flagged.extend(f"obfuscated git-bypass: {f}" for f in _obfuscated_bypass(tokens))
     flagged.extend(_shell_c_evasion(tokens))
+    flagged.extend(_code_interpreter_evasion(tokens))
     flagged = sorted(set(flagged))
     if not stripped:
         return GuardResult(original=cmd, sanitized=cmd, flagged=flagged)

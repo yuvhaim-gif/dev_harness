@@ -495,7 +495,11 @@ any `--no-verify` / `-n` appended to a `git commit` / `git push` segment is
 stripped, the run continues with the sanitized command, and a **separate
 `guard_penalties` counter** takes a penalty — it has its own exit-4 ceiling and
 leaves the autorepair budget untouched, so a tamper-once agent keeps its full
-repair allowance while a persistent escape attempt is still contained.
+repair allowance while a persistent escape attempt is still contained. The strip
+also unpacks **combined short flags** (`-nm` == `-n -m`, so the stacked `-n` is
+removed while `-m` and its message survive), recognises git's **dashed builtins**
+(`git-commit` / `git-push`), and preserves a genuine value that merely looks like
+a flag (`-mn` == `-m n`).
 
 The guard is explicitly **not a security boundary**. Stripping two literal flags
 only raises the cost of an *accidental* bypass; a determined agent can still skip
@@ -513,7 +517,12 @@ the inner `git`. The guard recursively sanitises that `-c` / `/c` script and
 *flags* any bypass flag, plumbing subcommand, or hooks-path override it finds
 inside (it cannot be rewritten in place from outside the quotes), charging the
 same `guard_penalties` hit — closing a hole where such a wrapped command
-previously passed through completely undetected.
+previously passed through completely undetected. The same treatment extends to
+**non-shell interpreters** (`python -c …`, `perl -e …`, `ruby`, `node`, `deno`):
+their inline-eval string is scanned for a git bypass even when it is quoted code
+rather than a shell command. Finally, an **alias indirection**
+(`git -c alias.x=commit x …`) that smuggles a commit/push past the structured
+strip is likewise flagged.
 
 ### Token & cost budgeting
 
@@ -641,8 +650,17 @@ agent cannot influence (wired up in `.github/workflows/harness-ci.yml`):
    `enforce_contract_binding` hook applies, re-checked here so it survives a
    branch pushed without the local hook (this runner ignores `SKIP_AGENT_HARNESS`).
 
-A non-agent (human) branch only gets the manifest check; its file scope and
-bound-test discipline are the reviewer's responsibility. Run it locally with
+The task id is resolved from a **trusted** source first — an explicit `--task`
+or the CI-injected `AGENT_TASK_ID` — because the branch *name* is agent-chosen
+and only ever a fallback for *locating* the task, never for deciding whether the
+file-scope check applies. If no task can be resolved the re-check **fails
+closed** (a mislabeled branch can no longer skip-and-pass); a genuine human PR
+opts out explicitly by setting the trusted, workflow-set `HARNESS_NON_AGENT_OK=1`
+(which the agent cannot set), after which the branch gets only the manifest check
+and its file scope is the reviewer's responsibility. The base ref is resolved
+before diffing — a bare `GITHUB_BASE_REF` (e.g. `main`) that does not exist in a
+shallow/detached checkout falls back to `origin/<name>` (fetched if needed), so
+the diff range is never silently empty. Run it locally with
 `python harness/ci_enforce.py --base <ref> --head <ref> [--task <id>]`.
 
 ---
@@ -685,6 +703,15 @@ own artifacts** there — the forensic logs (`.harness/logs/`), the telemetry si
 (`.harness/telemetry/`), the hashed manifest (`.harness/contracts.lock`), and
 *well-formed* lease/journal payloads. Previously the sweep skipped everything
 under `.harness/`, so junk written there survived a "pristine" rollback.
+
+**Rollback fails loud when it cannot leave the work branch.** The final
+`git checkout` back to the original branch is retried once (a lingering
+GitPython/Windows file handle can transiently pin the work tree); if it still
+fails, `rollback_ok` is set `False`, section 4 reports **NOT CONFIRMED**, and an
+`ERROR` line names the stranded branch with the manual-recovery command rather
+than swallowing the failure as a quiet warning. Containment (**exit 4**) is
+unaffected — that verdict is derived from *committed* state, not from where the
+local `HEAD` ends up.
 
 ### Diagnostics (`--doctor`)
 
@@ -758,7 +785,7 @@ sole line of defence:
 
 | Layer | Where it runs | Bypassable by the agent? | Role |
 |-------|---------------|--------------------------|------|
-| Command guard | before the LLM seam | yes (it only flags/strips) | raise the cost of an *accidental* bypass; penalise evasion (including bypass flags hidden behind command substitution / backticks / shell variables, or buried inside a `sh -c` / `bash -lc` / `cmd /c` script) |
+| Command guard | before the LLM seam | yes (it only flags/strips) | raise the cost of an *accidental* bypass; penalise evasion (including bypass flags hidden behind command substitution / backticks / shell variables, combined short flags like `-nm`, dashed builtins like `git-commit`, alias indirection, or buried inside a `sh -c` / `bash -lc` / `cmd /c` / `python -c` / `perl -e` script) |
 | Pre-commit lock + contract hooks | agent's machine | yes (`core.hooksPath`, plumbing) | fast, local first line; transparent to humans |
 | **Post-hoc containment gate** | orchestrator, post-commit | no (inspects committed history) | authoritative local stop — **exit 4** |
 | **Server-side CI re-check** | trusted runner | no | authoritative remote stop before merge |
@@ -779,8 +806,11 @@ bypasses do not defeat them.
 | Shared-ref push race | concurrent `publish_files` non-fast-forward | bounded exponential backoff + jitter retry; `False` return is logged as a warning, never swallowed |
 | Shallow clone in CI | base-commit objects absent ⇒ staleness silently passes | auto `fetch --unshallow`; with `AGENT_STALENESS_STRICT=1`, an unresolvable ref **fails safe** |
 | Hook bypass (`core.hooksPath`, plumbing) | a commit lands without the lock hook firing | guard flags it; post-hoc containment gate aborts (exit 4); CI re-check blocks the merge |
-| Obfuscated bypass flag | `--no-verify`/`-n` hidden behind `$(...)`, backticks, `$GIT`, or buried inside a `sh -c` / `bash -lc` / `cmd /c` script so the stripper misses it | guard flags it (`obfuscated git-bypass` / `shell -c …`) and charges a `guard_penalties` hit; the post-hoc containment gate + CI re-check still catch any resulting commit |
+| Obfuscated bypass flag | `--no-verify`/`-n` hidden behind `$(...)`, backticks, `$GIT`, a combined short flag (`-nm` == `-n -m`), a dashed builtin (`git-commit`), a `git -c alias.x=commit` indirection, or buried inside a `sh -c` / `bash -lc` / `cmd /c` / `python -c` / `perl -e` script so the stripper misses it | guard unpacks the combined-short/dashed forms and strips the `-n`, and flags what it cannot rewrite (`obfuscated git-bypass` / `shell -c …` / `interpreter …` / `git alias override`), charging a `guard_penalties` hit; the post-hoc containment gate + CI re-check still catch any resulting commit |
 | Out-of-allowlist commit | agent commits a file it may not touch | post-hoc containment gate (exit 4) locally; `ci_enforce.py` rejects the branch remotely |
+| Branch-name allowlist dodge | agent pushes its work on a branch that does not match `agent/<task>/…` so the CI file-scope re-check finds no task | `ci_enforce.py` **fails closed** — the task id is trusted from `AGENT_TASK_ID`/`--task` first (the branch name only *locates* a task, never decides whether the check applies); an unresolved task rejects the branch unless the trusted, workflow-set `HARNESS_NON_AGENT_OK=1` opts a genuine human PR out |
+| Empty CI diff range | a bare `GITHUB_BASE_REF` (e.g. `main`) does not resolve in a shallow/detached checkout, silently emptying the diff and passing a rogue branch | `_resolve_base()` falls back bare → `origin/<name>` → shallow fetch before diffing, so the range is never silently empty |
+| Stranded rollback | a lingering file handle (Windows) pins the work tree and the final `git checkout` back to the original branch fails | retried once after `gc.collect()`; on final failure `rollback_ok` flips **False**, section 4 reports **NOT CONFIRMED**, and an `ERROR` names the stranded branch + manual-recovery command (not a swallowed warning) — containment (exit 4) is unaffected, being derived from *committed* state |
 | Symlink lock bypass | an allowlisted path is flipped to a symlink (mode `120000`) aliasing a locked file | every lock layer rejects symlinks by git mode (`symlink_paths()`): pre-commit exit 1, containment gate exit 4, CI re-check fail |
 | OKF info-layer corruption | an evolve-mode edit strips a spec_doc's `type` or adds a volatile `timestamp` to a contract, degrading the durable knowledge layer | `okf.verify()` runs at four layers: `validate-okf` pre-commit (exit 1), post-hoc containment gate (exit 4, re-validated from the committed blob), CI re-check, and `--doctor` |
 | Budget breach | token/USD ceiling exceeded mid-run | immediate financial abort, rollback, forensic report, exit 3 |

@@ -12,6 +12,7 @@ part this framework hardens.
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import os
 import shutil
@@ -836,13 +837,29 @@ def _rollback(ctx: RunContext) -> None:
     except git.exc.GitCommandError as exc:
         log(f"WARNING: hard reset during rollback failed: {exc}")
         ctx.git_warnings.append(f"hard reset failed: {exc}")
-    try:
-        ctx.repo.git.checkout(ctx.original_branch)
-        log(f"rolled back to original branch '{ctx.original_branch}'.")
-        ctx.rollback_ok = reset_ok
-    except git.exc.GitCommandError as exc:
-        log(f"WARNING: rollback checkout failed: {exc}")
-        ctx.git_warnings.append(f"rollback checkout failed: {exc}")
+    last_exc: git.exc.GitCommandError | None = None
+    for attempt in range(2):
+        try:
+            ctx.repo.git.checkout(ctx.original_branch)
+            log(f"rolled back to original branch '{ctx.original_branch}'.")
+            ctx.rollback_ok = reset_ok
+            return
+        except git.exc.GitCommandError as exc:
+            last_exc = exc
+            if attempt == 0:
+                # A lingering GitPython/Windows file handle can pin the work
+                # tree; drop caches and retry once before giving up.
+                gc.collect()
+    # Fail loud: leaving the workspace on the breach branch is an operational
+    # hazard, so record it unambiguously (not a swallowed warning) with the
+    # manual recovery step. Containment (exit 4) is unaffected -- that verdict
+    # is based on committed state, not on where the local HEAD ends up.
+    ctx.rollback_ok = False
+    log(
+        "ERROR: rollback checkout FAILED; workspace may be stranded on the work "
+        f"branch. Recover manually with: git checkout {ctx.original_branch} ({last_exc})"
+    )
+    ctx.git_warnings.append(f"rollback checkout failed (workspace may be stranded): {last_exc}")
 
 
 def _modified_paths(ctx: RunContext) -> list[str]:

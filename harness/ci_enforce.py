@@ -52,9 +52,20 @@ except ModuleNotFoundError:  # pragma: no cover - yaml is a declared dependency
 
 _AGENT_BRANCH = re.compile(r"^agent/(?P<task_id>.+)/[^/]+$")
 
+# A branch name is agent-controllable, so it may only *locate* a task, never
+# decide whether the file-scope re-check applies. When no task can be resolved
+# the check fails closed unless this trusted, workflow-set flag opts a genuine
+# human branch out (the agent cannot set it -- it lives in CI config, not the
+# branch name).
+_NON_AGENT_OK_ENV = "HARNESS_NON_AGENT_OK"
+
 
 def _git(*args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(["git", *args], capture_output=True, text=True)
+
+
+def _env_flag(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _current_branch() -> str:
@@ -65,6 +76,30 @@ def _current_branch() -> str:
 def _task_from_branch(branch: str) -> str | None:
     match = _AGENT_BRANCH.match(branch)
     return match.group("task_id") if match else None
+
+
+def _rev_parse_ok(ref: str) -> bool:
+    return _git("rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}").returncode == 0
+
+
+def _resolve_base(base: str) -> str:
+    """Resolve ``base`` to a ref git can actually diff against.
+
+    ``GITHUB_BASE_REF`` is a *bare* branch name (e.g. ``main``) that does not
+    resolve in a shallow or detached CI checkout, which would make the diff
+    range silently empty and pass a rogue branch. Fall back to ``origin/<base>``
+    and, as a last resort, fetch it shallowly before giving up.
+    """
+    if _rev_parse_ok(base):
+        return base
+    branch = base.split("/", 1)[1] if base.startswith("origin/") else base
+    candidate = f"origin/{branch}"
+    if _rev_parse_ok(candidate):
+        return candidate
+    _git("fetch", "--no-tags", "--depth", "1", "origin", branch)
+    if _rev_parse_ok(candidate):
+        return candidate
+    return base
 
 
 def _changed_files(base: str, head: str) -> list[str]:
@@ -119,6 +154,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--task", default=os.getenv("AGENT_TASK_ID"))
     args = parser.parse_args(argv)
 
+    base = _resolve_base(args.base)
+
     failed = False
 
     # 1. Contract manifest must still verify (content-based; bypass-proof).
@@ -144,11 +181,27 @@ def main(argv: list[str] | None = None) -> int:
 
     # 2. Re-apply the allowlist to the aggregate diff of agent branches.
     head_branch = args.head if args.head != "HEAD" else _current_branch()
+    # Trust the CI-injected task id first; the branch name is only a fallback for
+    # *locating* the task, never for deciding whether the check applies.
     task_id = args.task or _task_from_branch(head_branch)
 
     if task_id is None:
-        print(f"SKIP: '{head_branch}' is not an agent branch; file-scope check skipped.")
-        return 1 if failed else 0
+        # Fail closed: a branch that resolves to no task must not silently skip
+        # the allowlist re-check, or an agent could evade it just by choosing a
+        # non-``agent/...`` branch name. A genuine human PR opts out explicitly
+        # via a trusted, workflow-set flag the agent cannot influence.
+        if _env_flag(_NON_AGENT_OK_ENV):
+            print(
+                f"SKIP: '{head_branch}' declared human-authored "
+                f"({_NON_AGENT_OK_ENV} set); file-scope check skipped."
+            )
+            return 1 if failed else 0
+        print(
+            f"FAIL: cannot determine task for '{head_branch}'. Provide AGENT_TASK_ID "
+            f"(or a --task) for agent branches, or set {_NON_AGENT_OK_ENV}=1 for a "
+            "trusted human branch."
+        )
+        return 1
 
     task = _load_task(task_id)
     if task is None:
@@ -161,14 +214,14 @@ def main(argv: list[str] | None = None) -> int:
         print(f"FAIL: task '{task_id}' has unknown mutation_mode '{exc}'.")
         return 1
 
-    links = sorted(_changed_symlinks(args.base, args.head))
+    links = sorted(_changed_symlinks(base, args.head))
     if links:
         failed = True
         print(f"FAIL: task '{task_id}' introduced symlink(s) (file-lock bypass):")
         for path in links:
             print(f"  - {path}")
 
-    changed = _changed_files(args.base, args.head)
+    changed = _changed_files(base, args.head)
     violations: list[str] = []
     bad_payloads: list[str] = []
     for f in changed:
