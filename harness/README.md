@@ -6,17 +6,20 @@ commit time. An agent may only touch the files a task explicitly declares;
 everything else is locked, and the orchestrator never leaves the repository in
 a half-broken state.
 
-This README documents what is actually implemented in the repository: the
-orchestrator, the file-lock and contract-binding hooks, the **OKF information
-layer** (every task's `spec_docs` is an [Open Knowledge Format](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
-concept bundle, gated for conformance), the cross-agent
-coordination layer (leases, handover journal, shared state ref, staleness
-guard), the LLM-execution hardening layer (token/cost budgeting, log
-condensation, cache-ordered repair prompts, escape-hatch command interception,
-the human override switch, and forensic post-mortem diagnostics), and the
-out-of-band containment defences (a post-hoc commit gate, a `--doctor` health
-report, an optional minimal mode, and a server-side CI re-check that holds even
-when the local hooks are skipped).
+This README documents what is actually implemented in the repository:
+
+- the **orchestrator** and its five-state loop;
+- the **file-lock and contract-binding hooks**;
+- the **OKF information layer** — every task's `spec_docs` is an [Open Knowledge Format](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
+  concept bundle, gated for conformance;
+- the **cross-agent coordination layer** — leases, handover journal, shared
+  state ref, and staleness guard;
+- the **LLM-execution hardening layer** — token/cost budgeting, log
+  condensation, cache-ordered repair prompts, escape-hatch command interception,
+  the human override switch, and forensic post-mortem diagnostics; and
+- the **out-of-band containment defences** — a post-hoc commit gate, a
+  `--doctor` health report, an optional minimal mode, and a server-side CI
+  re-check that holds even when the local hooks are skipped.
 
 > **Honest threat model.** The local pre-commit hooks are the *first* line of
 > defence, not the last. An LLM that spawns its own git can skip them
@@ -68,19 +71,21 @@ when the local hooks are skipped).
 
 ```mermaid
 flowchart TD
-    A[Initialize: parse ledger, recover handover] --> B[Isolate: branch + claim lease]
-    B -->|lease held by other agent| R0[Abort: refuse to collide]
+    A[Initialize: parse ledger, recover handover] --> B[Isolate: claim lease, then create branch]
+    B -->|lease held by another agent| R0[Abort: refuse to collide]
     B --> C[Mutate: invoke AGENT_LLM_CMD]
-    C --> D[Enforce: scoped stage + gated commit]
-    C -->|token/cost budget breached| B0[Financial abort: forensic + rollback + exit 3]
-    C -->|out-of-band / out-of-scope commit| CB[Containment breach: forensic + rollback + exit 4]
-    D -->|passed| S[Staleness check vs shared ref]
-    D -->|mechanical fix| C2[Re-stage and retry once]
-    C2 --> S
+    C --> G{Post-step safety checks}
+    G -->|token/cost or time ceiling breached| X3[Forensic + rollback, exit 3]
+    G -->|hook-bypass or out-of-scope commit| X4[Containment breach: forensic + rollback, exit 4]
+    G -->|clear| D[Enforce: scoped stage + gated commit]
+    D -->|mechanical fix| C2[Re-stage and retry once] --> D
     D -->|semantic failure| E[Autorepair: condense log + cache-ordered prompt to LLM]
     E -->|attempts left| C
-    E -->|cap exceeded| R[Journal 'escalated' + forensic + rollback + exit 1]
-    S -->|stale| R2[Journal 'stale' + refuse push + exit 1]
+    E -->|cap exceeded| R1[Journal 'escalated' + forensic + rollback, exit 1]
+    D -->|passed| P{Containment gate on base..HEAD}
+    P -->|breach| X4
+    P -->|clean| S{Staleness check vs shared ref}
+    S -->|stale| R2[Journal 'stale' + refuse push, exit 1]
     S -->|fresh| F[Reconcile: push, PR, release lease, journal 'pushed']
 ```
 
