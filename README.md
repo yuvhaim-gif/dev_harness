@@ -322,6 +322,13 @@ history on a CI runner where the link is never materialised on disk.
 
 ## The OKF information layer
 
+OKF conformance is **opt-in and scoped**: it applies only to files a task
+explicitly lists under `spec_docs` (of which `contracts` is a subset).
+`spec_docs` is optional — a task may declare none — and every other Markdown
+file in the repo is ignored by the gate. Adopting the harness does **not**
+require converting existing documentation; you add a one-line `type:`
+frontmatter only to the specific docs you hand an agent as its knowledge bundle.
+
 Every task's `spec_docs` is treated as an **[Open Knowledge Format](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
 (OKF v0.1) concept bundle** — the durable *information/memory layer* the harness
 reasons over, distinct from the machine-coordination state (leases, journal,
@@ -803,6 +810,10 @@ git commit -m "chore: prune resolved handover journals"
 Keep any journal whose outcome is still unresolved (`escalated` / `error` /
 `stale`) — those are exactly the records the next agent recovers. Automatic
 shared-ref retention is a known, deferred enhancement.
+
+Un-pruned resolved journals are harmless to correctness — recovery filters by
+task and unresolved outcome, so stale files are ignored; the only cost is
+repository size.
 
 ---
 
