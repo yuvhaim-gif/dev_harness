@@ -830,26 +830,32 @@ sole line of defence:
 | Layer | Where it runs | Bypassable by the agent? | Role |
 |-------|---------------|--------------------------|------|
 | Command guard | before the LLM seam | yes (it only flags/strips) | raise the cost of an *accidental* bypass; penalise evasion (including bypass flags hidden behind command substitution / backticks / shell variables, combined short flags like `-nm`, dashed builtins like `git-commit`, alias indirection, or buried inside a `sh -c` / `bash -lc` / `cmd /c` / `python -c` / `perl -e` script) |
-| Pre-commit lock + contract hooks | agent's machine | yes (`core.hooksPath`, plumbing) | fast, local first line; transparent to humans |
+| Pre-commit lock + contract hooks | agent's machine | yes (`core.hooksPath`, plumbing, or dropping `AGENT_TASK_ID` / setting `SKIP_AGENT_HARNESS` in the agent's own git) | fast, local first line; transparent to humans |
 | **Post-hoc containment gate** | orchestrator, post-commit | no (inspects committed history) | authoritative local stop — **exit 4** |
 | **Server-side CI re-check** | trusted runner | no | authoritative remote stop before merge |
 
 Because the last two layers inspect *committed history* rather than trusting the
 hook to have fired, the well-known `git -c core.hooksPath=…` / `commit-tree`
-bypasses do not defeat them.
+bypasses do not defeat them. The containment gate also **fails closed**: if the
+`base..HEAD` inspection cannot run at all (e.g. the agent deletes the base
+commit's objects to make `git diff` error), the un-runnable check is treated as
+a breach — **exit 4** — rather than a clean pass, mirroring the fail-safe used by
+`ci_enforce.py` and the strict staleness guard.
 
 ### Known failure modes & how they are handled
 
 | Failure mode | Symptom | Mitigation |
 |--------------|---------|------------|
 | Stale / orphaned lease | a crashed agent leaves a lease behind | TTL (3600s) makes it reclaimable; `--doctor` shows `expired`; rollback releases it |
-| Lease reclaim race | two agents both read one expired lease as free | reclaim is serialised behind an atomic `os.mkdir` mutex; the winner re-reads under the lock, so **exactly one** agent wins (was a real TOCTOU) |
+| Lease reclaim race | two agents both read one expired lease as free | reclaim is serialised behind an atomic `os.mkdir` mutex; the winner re-reads under the lock, so **exactly one** agent wins (was a real TOCTOU). Taking over a *stale* mutex left by a crashed reclaimer uses an atomic `os.rename` (not `rmdir`+`mkdir`, two syscalls that let a second racer clobber the winner's fresh lock) plus a second age check, so a lock recreated between the mtime read and the steal is restored, never double-held |
 | Corrupt / adversarial lease TTL | `ttl_seconds` is non-numeric in a lease file | `is_active()` treats it as **inactive (reclaimable)** instead of crashing the coordination check with an uncaught `ValueError` |
 | Poisoned coordination state | a payload smuggled under the allowlist-exempt `.harness/leases/` or `.harness/journal/` (e.g. a `.py`, nested path, or unknown-shaped JSON) — a persistent prompt-injection vector, since journal content feeds the next agent's prompt | the exemption is **content-aware** (`is_valid_coordination_payload`): the pre-commit hook (exit 1), the post-hoc containment gate (exit 4), **and** the server-side CI re-check (the layer with no SHA backstop, so it stops a *directly pushed* branch) all reject anything that is not a flat well-formed lease/journal `*.json`; the immutable prompt rules additionally tag handover/journal text as **untrusted data** |
 | Corrupt `contracts.lock` | manifest file is not valid JSON | `CorruptLockError` ⇒ a clear "run `--update`" message, never a traceback; surfaced by `--doctor` and CI |
 | Shared-ref push race | concurrent `publish_files` non-fast-forward | bounded exponential backoff + jitter retry; `False` return is logged as a warning, never swallowed |
 | Shallow clone in CI | base-commit objects absent ⇒ staleness silently passes | auto `fetch --unshallow`; with `AGENT_STALENESS_STRICT=1`, an unresolvable ref **fails safe** |
 | Hook bypass (`core.hooksPath`, plumbing) | a commit lands without the lock hook firing | guard flags it; post-hoc containment gate aborts (exit 4); CI re-check blocks the merge |
+| Hook bypass (env var) | the local hooks gate on `AGENT_TASK_ID` and skip on the human-only `SKIP_AGENT_HARNESS`, so the agent's own git subprocess can run `env -u AGENT_TASK_ID git commit …` (or set `SKIP_AGENT_HARNESS=1` itself) to no-op the *local* hook — same severity class as `core.hooksPath` | the orchestrator's own commits always re-assert `AGENT_TASK_ID` and drop `SKIP_AGENT_HARNESS`; any commit the agent makes out of band still lands on `base..HEAD`, so the post-hoc containment gate catches it by SHA (`_unexpected_commits`, exit 4) and the CI re-check blocks the merge |
+| Containment check cannot run | the agent tampers with git so the `base..HEAD` inspection itself errors (e.g. deletes the base commit's loose object) — a naive `except: return []` would read as "no violations" | the probes **fail closed**: an un-runnable check raises `ContainmentCheckError`, which the gate reports as a breach (exit 4) instead of a clean pass; a genuine deletion of a committed path still reads as benign (`None`), so this adds no false positives |
 | Obfuscated bypass flag | `--no-verify`/`-n` hidden behind `$(...)`, backticks, `$GIT`, a combined short flag (`-nm` == `-n -m`), a dashed builtin (`git-commit`), a `git -c alias.x=commit` indirection, or buried inside a `sh -c` / `bash -lc` / `cmd /c` / `python -c` / `perl -e` script so the stripper misses it | guard unpacks the combined-short/dashed forms and strips the `-n`, and flags what it cannot rewrite (`obfuscated git-bypass` / `shell -c …` / `interpreter …` / `git alias override`), charging a `guard_penalties` hit; the post-hoc containment gate + CI re-check still catch any resulting commit |
 | Out-of-allowlist commit | agent commits a file it may not touch | post-hoc containment gate (exit 4) locally; `ci_enforce.py` rejects the branch remotely |
 | Branch-name allowlist dodge | agent pushes its work on a branch that does not match `agent/<task>/…` so the CI file-scope re-check finds no task | `ci_enforce.py` **fails closed** — the task id is trusted from `AGENT_TASK_ID`/`--task` first (the branch name only *locates* a task, never decides whether the check applies); an unresolved task rejects the branch unless the trusted, workflow-set `HARNESS_NON_AGENT_OK=1` opts a genuine human PR out |
@@ -857,7 +863,7 @@ bypasses do not defeat them.
 | Stranded rollback | a lingering file handle (Windows) pins the work tree and the final `git checkout` back to the original branch fails | retried once after `gc.collect()`; on final failure `rollback_ok` flips **False**, section 4 reports **NOT CONFIRMED**, and an `ERROR` names the stranded branch + manual-recovery command (not a swallowed warning) — containment (exit 4) is unaffected, being derived from *committed* state |
 | Symlink lock bypass | an allowlisted path is flipped to a symlink (mode `120000`) aliasing a locked file | every lock layer rejects symlinks by git mode (`symlink_paths()`): pre-commit exit 1, containment gate exit 4, CI re-check fail |
 | OKF info-layer corruption | an evolve-mode edit strips a spec_doc's `type` or adds a volatile `timestamp` to a contract, degrading the durable knowledge layer | `okf.verify()` runs at four layers: `validate-okf` pre-commit (exit 1), post-hoc containment gate (exit 4, re-validated from the committed blob), CI re-check, and `--doctor` |
-| Budget breach | token/USD ceiling exceeded mid-run | immediate financial abort, rollback, forensic report, exit 3 |
+| Budget breach | token/USD ceiling exceeded mid-run | immediate financial abort, rollback, forensic report, exit 3. **Caveat:** the token/cost figures are **self-reported** by `AGENT_LLM_CMD` via `usage.json`; a backend that reports zero (malicious or broken) never trips `MAX_TOTAL_TOKENS` / `MAX_RUN_COST_USD`. Budgeting is an accounting aid over a *trusted input*, not a metered control — meter spend at your provider/proxy if the backend is untrusted |
 | Coordination layer is overkill | single-agent run, shared-ref machinery unwanted | `AGENT_MINIMAL=1` keeps local locking, drops the shared ref |
 
 ### Honest limitations
