@@ -807,6 +807,43 @@ def test_h8d_committed_symlink_is_containment_breach(
 
 
 # --------------------------------------------------------------------------- #
+# H8e/H8f. Containment gate fails CLOSED when a committed-state probe cannot run
+# --------------------------------------------------------------------------- #
+# The post-hoc gate inspects ``base..HEAD``. If git itself errors (e.g. the base
+# commit's loose object was deleted), the probes must NOT silently return "clean"
+# -- an un-runnable containment check is a breach, so the gate stays authoritative.
+def test_h8e_containment_check_git_error_fails_closed(
+    seeded_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(seeded_repo)
+    ctx = _enforce_ctx(seeded_repo)
+    # A base commit whose objects git cannot resolve (the reproduction: the base
+    # loose object was deleted). ``git diff <bad>..HEAD`` then exits 128, which
+    # the probe must surface as a breach rather than swallow as "clean".
+    ctx.base_commit = "0" * 40
+
+    violations = agent_runner._containment_breach(ctx)
+    assert violations, "un-runnable containment check must be treated as a breach"
+    assert any("could not run" in v for v in violations), violations
+
+
+def test_h8f_containment_abort_on_git_error_exits_four(
+    seeded_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(seeded_repo)
+    ctx = _enforce_ctx(seeded_repo)
+
+    def raise_check(_ctx: object) -> list[str]:
+        raise agent_runner.ContainmentCheckError("cannot diff base..HEAD")
+
+    monkeypatch.setattr(agent_runner, "_committed_paths", raise_check)
+
+    assert agent_runner._containment_abort(ctx) is True
+    report = seeded_repo / ".harness" / "logs" / "FAILED_AGENT_RUN.md"
+    assert report.exists()
+
+
+# --------------------------------------------------------------------------- #
 # H9. Rollback removes agent-created untracked files (T01)
 # --------------------------------------------------------------------------- #
 # A containment abort must leave the original branch pristine, including the

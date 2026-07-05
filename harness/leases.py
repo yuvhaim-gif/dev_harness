@@ -18,6 +18,7 @@ import json
 import os
 import tempfile
 import time
+import uuid
 from datetime import UTC, datetime
 from typing import Any
 
@@ -100,7 +101,11 @@ def _acquire_reclaim_mutex(lock_dir: str) -> bool:
 
     ``os.mkdir`` is atomic and fails if the directory exists, so exactly one
     racer enters. A mutex left behind by a crashed holder is stolen once it is
-    older than ``_RECLAIM_LOCK_STALE_SECONDS``.
+    older than ``_RECLAIM_LOCK_STALE_SECONDS``. The stale takeover uses an
+    atomic ``os.rename`` (not rmdir+mkdir, which is two syscalls and lets a
+    second racer clobber the winner's fresh lock) so exactly one racer can move
+    the stale directory aside, plus a second age check to avoid stealing a lock
+    a racer recreated between our mtime read and the rename.
     """
     try:
         os.mkdir(lock_dir)
@@ -112,8 +117,29 @@ def _acquire_reclaim_mutex(lock_dir: str) -> bool:
             return False
         if age <= _RECLAIM_LOCK_STALE_SECONDS:
             return False
+        stealing = f"{lock_dir}.stealing-{os.getpid()}-{uuid.uuid4().hex[:8]}"
         try:
-            os.rmdir(lock_dir)
+            os.rename(lock_dir, stealing)
+        except OSError:
+            # Another racer already stole/cleared it; do not double-claim.
+            return False
+        try:
+            fresh = time.time() - os.path.getmtime(stealing) <= _RECLAIM_LOCK_STALE_SECONDS
+        except OSError:
+            fresh = False
+        if fresh:
+            # A racer recreated the lock after our first mtime read; restore it
+            # rather than steal a live mutex, then back off.
+            try:
+                os.rename(stealing, lock_dir)
+            except OSError:
+                pass
+            return False
+        try:
+            os.rmdir(stealing)
+        except OSError:
+            pass
+        try:
             os.mkdir(lock_dir)
             return True
         except OSError:

@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -589,6 +590,57 @@ def test_acquire_single_winner_under_concurrent_reclaim(
     # No reclaim mutex dir and no temp files left behind.
     leftovers = os.listdir(leases.LEASES_DIR)
     assert not any(p.endswith((".tmp", ".lock")) for p in leftovers), leftovers
+
+
+def test_reclaim_mutex_stale_takeover_is_atomic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The stale-lock takeover must not use rmdir+mkdir (two syscalls) which lets
+    # a second racer clobber the winner's fresh lock and both believe they hold
+    # the mutex. A fresh lock is never stealable; a genuinely stale one is stolen
+    # by exactly one racer.
+    lock_dir = str(tmp_path / "t.json.lock")
+
+    # Fresh lock: not stale -> cannot be taken over.
+    os.mkdir(lock_dir)
+    assert leases._acquire_reclaim_mutex(lock_dir) is False
+
+    # Make it look stale by backdating its mtime past the staleness window.
+    old = time.time() - (leases._RECLAIM_LOCK_STALE_SECONDS + 10)
+    os.utime(lock_dir, (old, old))
+    assert leases._acquire_reclaim_mutex(lock_dir) is True  # exactly one steal
+    assert os.path.isdir(lock_dir)
+    # The transient steal directory is cleaned up.
+    assert not any(".stealing-" in p for p in os.listdir(tmp_path))
+
+
+def test_reclaim_mutex_restores_lock_recreated_after_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Simulate the compound race: our first mtime read saw the lock as stale, but
+    # a racer recreated it (fresh) before our rename. The second age check must
+    # detect the fresh lock, restore it, and back off rather than double-claim.
+    lock_dir = str(tmp_path / "t.json.lock")
+    os.mkdir(lock_dir)
+    old = time.time() - (leases._RECLAIM_LOCK_STALE_SECONDS + 10)
+    os.utime(lock_dir, (old, old))
+
+    real_getmtime = leases.os.path.getmtime
+    calls = {"n": 0}
+
+    def flaky_getmtime(path: str) -> float:
+        calls["n"] += 1
+        # 1st call (pre-rename age check): report stale.
+        # 2nd call (post-rename freshness check): report fresh.
+        return old if calls["n"] == 1 else time.time()
+
+    monkeypatch.setattr(leases.os.path, "getmtime", flaky_getmtime)
+
+    assert leases._acquire_reclaim_mutex(lock_dir) is False
+    monkeypatch.setattr(leases.os.path, "getmtime", real_getmtime)
+    # The lock was restored, not stolen; no transient steal dir left behind.
+    assert os.path.isdir(lock_dir)
+    assert not any(".stealing-" in p for p in os.listdir(tmp_path))
 
 
 # --------------------------------------------------------------------------- #

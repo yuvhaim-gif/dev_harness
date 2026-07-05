@@ -59,6 +59,17 @@ REPAIR_PROMPT_FILE = ".harness/telemetry/repair_prompt.txt"
 BUDGET_ABORT_EXIT = 3
 CONTAINMENT_ABORT_EXIT = 4
 
+
+class ContainmentCheckError(RuntimeError):
+    """A committed-state containment probe could not run (git error).
+
+    Raised by the ``base..HEAD`` probes when git itself fails (e.g. the base
+    commit's objects were deleted). It is caught in ``_containment_breach`` and
+    turned into an explicit violation so the gate fails *closed* -- an
+    un-runnable containment check is a breach, never a clean bill of health.
+    """
+
+
 VERSION = "0.1.0"
 
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
@@ -1090,8 +1101,10 @@ def _unexpected_commits(ctx: RunContext) -> list[str]:
         return []
     try:
         out = ctx.repo.git.rev_list(f"{ctx.base_commit}..HEAD")
-    except git.exc.GitCommandError:
-        return []
+    except git.exc.GitCommandError as exc:
+        raise ContainmentCheckError(
+            f"cannot list commits on {ctx.base_commit[:12]}..HEAD: {exc}"
+        ) from exc
     shas = [s for s in out.splitlines() if s]
     return [s for s in shas if s not in ctx.runner_commits]
 
@@ -1102,8 +1115,10 @@ def _committed_paths(ctx: RunContext) -> list[str]:
         return []
     try:
         out = ctx.repo.git.diff("--name-only", f"{ctx.base_commit}..HEAD")
-    except git.exc.GitCommandError:
-        return []
+    except git.exc.GitCommandError as exc:
+        raise ContainmentCheckError(
+            f"cannot diff {ctx.base_commit[:12]}..HEAD --name-only: {exc}"
+        ) from exc
     return [p for p in out.splitlines() if p]
 
 
@@ -1125,8 +1140,10 @@ def _committed_symlinks(ctx: RunContext) -> list[str]:
         return []
     try:
         raw = str(ctx.repo.git.diff("--raw", f"{ctx.base_commit}..HEAD"))
-    except git.exc.GitCommandError:
-        return []
+    except git.exc.GitCommandError as exc:
+        raise ContainmentCheckError(
+            f"cannot read --raw diff {ctx.base_commit[:12]}..HEAD: {exc}"
+        ) from exc
     return symlink_paths(raw)
 
 
@@ -1161,10 +1178,22 @@ def _containment_breach(ctx: RunContext) -> list[str]:
     """
     if ctx.dry_run:
         return []
+    # Fail closed: if any committed-state probe cannot run (git error), treat the
+    # un-runnable check as a breach rather than a clean bill of health. This
+    # mirrors the fail-safe patterns in ci_enforce._changed_files (exit 1) and
+    # the strict staleness guard, so a deleted base object cannot silence the
+    # gate. Deletions still map to _committed_blob -> None (benign), not an error.
+    try:
+        committed = _committed_paths(ctx)
+        symlinks = _committed_symlinks(ctx)
+        unexpected = _unexpected_commits(ctx)
+        okf_bad = _okf_violations(ctx)
+    except ContainmentCheckError as exc:
+        return [f"containment check could not run (fail-closed): {exc}"]
     allow = sorted(compute_allowlist(ctx.task.raw))
     out_of_scope: list[str] = []
     bad_coord: list[str] = []
-    for p in _committed_paths(ctx):
+    for p in committed:
         if p in allow:
             continue
         if is_coordination_path(p):
@@ -1175,13 +1204,9 @@ def _containment_breach(ctx: RunContext) -> list[str]:
         out_of_scope.append(p)
     violations = [f"out-of-allowlist committed change: {p}" for p in sorted(out_of_scope)]
     violations += [f"invalid coordination payload committed: {p}" for p in sorted(bad_coord)]
-    violations += [
-        f"symlink committed (file-lock bypass): {p}" for p in sorted(_committed_symlinks(ctx))
-    ]
-    violations += [
-        f"out-of-band commit (hook-bypassed): {sha[:12]}" for sha in _unexpected_commits(ctx)
-    ]
-    violations += [f"OKF info-layer violation: {p}" for p in _okf_violations(ctx)]
+    violations += [f"symlink committed (file-lock bypass): {p}" for p in sorted(symlinks)]
+    violations += [f"out-of-band commit (hook-bypassed): {sha[:12]}" for sha in unexpected]
+    violations += [f"OKF info-layer violation: {p}" for p in okf_bad]
     return violations
 
 
