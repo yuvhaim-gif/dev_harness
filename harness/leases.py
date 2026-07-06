@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 import time
 import uuid
@@ -23,6 +24,23 @@ from datetime import UTC, datetime
 from typing import Any
 
 LEASES_DIR = ".harness/leases"
+
+# A task id is fused into filesystem paths (the lease/journal file name) and into
+# the work-branch name. Constrain it to a conservative slug so it can never
+# traverse out of ``.harness/leases`` / ``.harness/journal`` or smuggle path or
+# ref metacharacters. Rejecting ``..`` outright is belt-and-braces on top of the
+# character class (which already excludes ``/`` and ``\``).
+_VALID_TASK_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def is_valid_task_id(task_id: str) -> bool:
+    return (
+        isinstance(task_id, str)
+        and bool(_VALID_TASK_ID.fullmatch(task_id))
+        and task_id not in {".", ".."}
+        and ".." not in task_id
+    )
+
 
 DEFAULT_TTL_SECONDS = 3600
 
@@ -67,6 +85,8 @@ def _parse_stamp(value: str) -> datetime | None:
 
 
 def lease_path(task_id: str, leases_dir: str = LEASES_DIR) -> str:
+    if not is_valid_task_id(task_id):
+        raise ValueError(f"unsafe task_id for lease path: {task_id!r}")
     return os.path.join(leases_dir, f"{task_id}.json")
 
 

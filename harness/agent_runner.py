@@ -183,10 +183,14 @@ def _load_ledger(path: str = "AGENTS.md") -> dict[str, Any]:
     if not isinstance(data, dict):
         raise SystemExit("ERROR: AGENTS.md must be a YAML mapping.")
     schema_version = data.get("schema_version", 1)
-    if not isinstance(schema_version, int) or schema_version > SUPPORTED_SCHEMA_VERSION:
+    if (
+        not isinstance(schema_version, int)
+        or isinstance(schema_version, bool)
+        or schema_version != SUPPORTED_SCHEMA_VERSION
+    ):
         raise SystemExit(
             f"ERROR: unsupported schema_version {schema_version!r} "
-            f"(this runner supports <= {SUPPORTED_SCHEMA_VERSION})."
+            f"(this runner supports {SUPPORTED_SCHEMA_VERSION})."
         )
     return data
 
@@ -194,6 +198,10 @@ def _load_ledger(path: str = "AGENTS.md") -> dict[str, Any]:
 def _parse_task(task_id: str) -> TaskSpec:
     ledger = _load_ledger()
     tasks = ledger.get("tasks") or {}
+    if not leases.is_valid_task_id(task_id):
+        raise SystemExit(
+            f"ERROR: task id '{task_id}' is not a safe slug ([A-Za-z0-9][A-Za-z0-9._-]*, no '..')."
+        )
     raw = tasks.get(task_id)
     if not isinstance(raw, dict):
         raise SystemExit(f"ERROR: task '{task_id}' not found in AGENTS.md.")
@@ -427,7 +435,14 @@ def _harden_git_env(env: dict[str, str]) -> None:
     requires running the seam in a container; see the README threat model.
     """
     env["GIT_CONFIG_NOSYSTEM"] = "1"
-    env.pop("GIT_CONFIG_GLOBAL", None)
+    for key in ("GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_PARAMETERS"):
+        env.pop(key, None)
+    # Drop the env-var form of ``git -c`` (GIT_CONFIG_COUNT + GIT_CONFIG_KEY_*/
+    # GIT_CONFIG_VALUE_*): an inherited core.hooksPath override injected this way
+    # never appears in the command string the guard scans, so strip it here.
+    env.pop("GIT_CONFIG_COUNT", None)
+    for key in [k for k in env if k.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"))]:
+        env.pop(key, None)
 
 
 def _seam_base_env() -> dict[str, str]:
@@ -435,9 +450,12 @@ def _seam_base_env() -> dict[str, str]:
 
     Default (no AGENT_ENV_ALLOWLIST) is a full copy, preserving setups that rely
     on inherited vars. When AGENT_ENV_ALLOWLIST is set (comma/newline-separated
-    var names), start from only those vars plus the AGENT_*/GIT_* keys the
-    harness manages, so the seam no longer inherits every secret in the parent
-    environment. _harden_git_env still runs last in _llm_env.
+    var names), start from ONLY those explicitly named vars -- no AGENT_*/GIT_*
+    prefix carve-out, so a secret like AGENT_AWS_SECRET_KEY is not leaked past the
+    allowlist. The harness re-injects the AGENT_* task context it needs in
+    _llm_env, and _harden_git_env pins git config there, so neither family needs a
+    blanket exemption; an operator who genuinely needs a var (e.g. GIT_ASKPASS)
+    lists it in the allowlist.
 
     SKIP_AGENT_HARNESS is always dropped, even in full-copy mode: it is a
     human-only override that disables the local lock/contract hooks, and must
@@ -448,11 +466,7 @@ def _seam_base_env() -> dict[str, str]:
         env = os.environ.copy()
     else:
         names = {n.strip() for n in raw.replace(",", "\n").splitlines() if n.strip()}
-        env = {
-            k: v
-            for k, v in os.environ.items()
-            if k in names or k.startswith("AGENT_") or k.startswith("GIT_")
-        }
+        env = {k: v for k, v in os.environ.items() if k in names}
     env.pop("SKIP_AGENT_HARNESS", None)
     return env
 
@@ -1302,7 +1316,11 @@ def _open_pr(ctx: RunContext) -> None:
         subprocess.run(cmd, check=False)
         log("requested PR creation via 'gh'.")
     else:
-        hint = "gh pr create --fill" + (f" --label {labels}" if labels else "")
+        # The real invocation above is a list (no shell), so this only guards the
+        # log line: strip CR/LF from operator-supplied labels so an embedded
+        # newline cannot spoof a fake '[agent_runner]' log record.
+        safe_labels = labels.replace("\r", " ").replace("\n", " ")
+        hint = "gh pr create --fill" + (f" --label {safe_labels}" if labels else "")
         log(f"GitHub CLI 'gh' not found. Manual PR: {hint}")
 
 
@@ -1743,6 +1761,9 @@ def report_json() -> int:
 
 def release_lease(task_id: str, assume_yes: bool = False) -> int:
     """Operator escape hatch: force-release a stranded lease for ``task_id``."""
+    if not leases.is_valid_task_id(task_id):
+        print(f"ERROR: refusing to release unsafe task id '{task_id}'.")
+        return 2
     lease = leases.read_lease(task_id)
     if lease is None:
         print(f"  no local lease recorded for '{task_id}'.")

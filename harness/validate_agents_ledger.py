@@ -15,6 +15,7 @@ import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # noqa: E402
 
+import leases  # noqa: E402
 import okf  # noqa: E402
 
 VALID_MODES = {"evolve", "isolated"}
@@ -47,6 +48,13 @@ def validate(path: str = "AGENTS.md") -> int:
 
     ok = True
     for task_id, task in tasks.items():
+        if not leases.is_valid_task_id(str(task_id)):
+            print(
+                f"ERROR: task id '{task_id}' is not a safe slug "
+                "([A-Za-z0-9][A-Za-z0-9._-]*, no '..')."
+            )
+            ok = False
+            continue
         if not isinstance(task, dict):
             print(f"ERROR: task '{task_id}' must be a mapping.")
             ok = False

@@ -26,11 +26,14 @@ import agent_runner  # noqa: E402
 import command_guard  # noqa: E402
 import forensic  # noqa: E402
 import git  # noqa: E402
+import journal  # noqa: E402
+import leases  # noqa: E402
 import lock_policy  # noqa: E402
 import log_condenser  # noqa: E402
 import okf  # noqa: E402
 import prompt_builder  # noqa: E402
 import telemetry  # noqa: E402
+import validate_agents_ledger  # noqa: E402
 
 
 # --------------------------------------------------------------------------- #
@@ -1033,13 +1036,28 @@ def test_h11a_allowlist_scopes_seam_env(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setenv("FOO", "1")
     monkeypatch.setenv("BAR", "2")
     monkeypatch.setenv("SECRET", "leak")
-    monkeypatch.setenv("AGENT_CUSTOM", "kept")  # AGENT_* keys carry through
+    # F2: no AGENT_*/GIT_* prefix carve-out -- a secret named with those prefixes
+    # is NOT auto-inherited; only explicitly allowlisted names pass through.
+    monkeypatch.setenv("AGENT_AWS_SECRET_KEY", "leak")
+    monkeypatch.setenv("GIT_ASKPASS", "leak")
 
     env = agent_runner._seam_base_env()
     assert env.get("FOO") == "1"
     assert env.get("BAR") == "2"
-    assert env.get("AGENT_CUSTOM") == "kept"
     assert "SECRET" not in env
+    assert "AGENT_AWS_SECRET_KEY" not in env
+    assert "GIT_ASKPASS" not in env
+
+
+def test_h11a2_allowlist_admits_named_git_var(monkeypatch: pytest.MonkeyPatch) -> None:
+    # An operator who genuinely needs an inherited var lists it explicitly.
+    monkeypatch.setenv("AGENT_ENV_ALLOWLIST", "GIT_ASKPASS")
+    monkeypatch.setenv("GIT_ASKPASS", "/usr/bin/askpass")
+    monkeypatch.setenv("AGENT_AWS_SECRET_KEY", "leak")
+
+    env = agent_runner._seam_base_env()
+    assert env.get("GIT_ASKPASS") == "/usr/bin/askpass"
+    assert "AGENT_AWS_SECRET_KEY" not in env
 
 
 def test_h11b_no_allowlist_is_full_copy(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1237,3 +1255,172 @@ def test_h14b_conformant_spec_doc_is_not_a_violation(seeded_repo: Path) -> None:
     _git(seeded_repo, "commit", "-m", "add conformant spec doc")
 
     assert agent_runner._okf_violations(ctx) == []
+
+
+# --------------------------------------------------------------------------- #
+# H15. F1 -- task id is validated before it reaches a filesystem path / branch
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize(
+    "task_id",
+    ["add_payments_endpoint", "t", "t-1", "a.b", "Task_9", "x.y-z_1"],
+)
+def test_h15a_valid_task_ids_accepted(task_id: str) -> None:
+    assert leases.is_valid_task_id(task_id)
+
+
+@pytest.mark.parametrize(
+    "task_id",
+    [
+        "../contracts",
+        "../../tmp/evil",
+        "..",
+        ".",
+        "a/b",
+        "a\\b",
+        "",
+        "a b",
+        "$(x)",
+        "a\nb",
+        ".hidden",
+        "-leading",
+    ],
+)
+def test_h15b_unsafe_task_ids_rejected(task_id: str) -> None:
+    assert not leases.is_valid_task_id(task_id)
+
+
+def test_h15c_lease_path_rejects_traversal() -> None:
+    with pytest.raises(ValueError):
+        leases.lease_path("../../tmp/evil")
+
+
+def test_h15d_release_lease_refuses_unsafe_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A traversal id must be rejected before any os.remove / read fires.
+    def _boom(*_a: object, **_k: object) -> None:
+        raise AssertionError("release must not touch the filesystem for an unsafe id")
+
+    monkeypatch.setattr(leases, "release", _boom)
+    monkeypatch.setattr(leases, "read_lease", _boom)
+    rc = agent_runner.release_lease("../../etc/passwd", assume_yes=True)
+    assert rc == 2
+    assert "unsafe task id" in capsys.readouterr().out
+
+
+def test_h15e_parse_task_rejects_unsafe_id(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "AGENTS.md").write_text(
+        "schema_version: 1\ntasks:\n  good:\n    mutation_mode: isolated\n    targets: []\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(SystemExit):
+        agent_runner._parse_task("../evil")
+
+
+def test_h15f_validate_ledger_rejects_unsafe_task_key(tmp_path: Path) -> None:
+    ledger = tmp_path / "AGENTS.md"
+    ledger.write_text(
+        "schema_version: 1\ntasks:\n  ../evil:\n    mutation_mode: isolated\n    targets: []\n",
+        encoding="utf-8",
+    )
+    assert validate_agents_ledger.validate(str(ledger)) == 1
+
+
+# --------------------------------------------------------------------------- #
+# H16. F3 -- the GIT_CONFIG_* env-var family is stripped from the seam env
+# --------------------------------------------------------------------------- #
+def test_h16_harden_git_env_drops_config_env_family() -> None:
+    env = {
+        "GIT_CONFIG_GLOBAL": "/x",
+        "GIT_CONFIG_SYSTEM": "/x",
+        "GIT_CONFIG_PARAMETERS": "'core.hooksPath=/x'",
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "core.hooksPath",
+        "GIT_CONFIG_VALUE_0": "/tmp/evil",
+        "PATH": "/usr/bin",
+    }
+    agent_runner._harden_git_env(env)
+    assert env["GIT_CONFIG_NOSYSTEM"] == "1"
+    assert env["PATH"] == "/usr/bin"
+    for gone in (
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_SYSTEM",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_KEY_0",
+        "GIT_CONFIG_VALUE_0",
+    ):
+        assert gone not in env
+
+
+# --------------------------------------------------------------------------- #
+# H17. F5 -- schema_version must equal the supported version exactly
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("bad", ["0", "-1", "2", "true"])
+def test_h17a_load_ledger_rejects_off_version(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bad: str
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "AGENTS.md").write_text(f"schema_version: {bad}\ntasks: {{}}\n", encoding="utf-8")
+    with pytest.raises(SystemExit):
+        agent_runner._load_ledger()
+
+
+def test_h17b_load_ledger_accepts_supported_version(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "AGENTS.md").write_text("schema_version: 1\ntasks: {}\n", encoding="utf-8")
+    assert agent_runner._load_ledger()["tasks"] == {}
+
+
+# --------------------------------------------------------------------------- #
+# H18. F6 -- journal free-text is control-char stripped and length capped
+# --------------------------------------------------------------------------- #
+def test_h18a_finalize_caps_and_strips_notes() -> None:
+    entry = journal.start_session("t", "agent/t/1", "base")
+    noisy = "a\x00b\x07c\ndone" + "x" * 5000
+    journal.finalize(entry, "escalated", notes=noisy)
+    notes = entry["notes"]
+    assert "\x00" not in notes and "\x07" not in notes
+    assert "\n" in notes  # newlines are preserved
+    assert len(notes) <= journal._NOTES_CHARS
+
+
+def test_h18b_record_attempt_cleans_log_excerpt() -> None:
+    entry = journal.start_session("t", "agent/t/1", "base")
+    journal.record_attempt(entry, "enforce", "semantic", "line1\x1b[2Jline2" + "y" * 5000)
+    excerpt = entry["attempts"][-1]["log_excerpt"]
+    assert "\x1b" not in excerpt
+    assert len(excerpt) <= journal._LOG_EXCERPT_CHARS
+
+
+# --------------------------------------------------------------------------- #
+# H19. F4 -- operator label newlines cannot spoof a runner log line
+# --------------------------------------------------------------------------- #
+def test_h19_open_pr_manual_hint_strips_newlines(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(agent_runner.shutil, "which", lambda _name: None)
+    task = agent_runner.TaskSpec(
+        task_id="t",
+        description="",
+        mutation_mode="isolated",
+        spec_docs=[],
+        tests=[],
+        targets=[],
+        locked_files=[],
+        commit_prefix="feat",
+        contracts=[],
+        contract_tests=[],
+        pr_labels=["ok\n[agent_runner] spoofed"],
+        max_autorepair_attempts=3,
+        raw={},
+    )
+    ctx = agent_runner.RunContext(
+        repo=None, task=task, dry_run=False, agent_id="a", base_commit="b"
+    )
+    agent_runner._open_pr(ctx)
+    out = capsys.readouterr().out
+    assert "\n[agent_runner] spoofed" not in out

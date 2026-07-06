@@ -24,6 +24,20 @@ UNRESOLVED_OUTCOMES = frozenset({"escalated", "error", "stale"})
 
 _LOG_EXCERPT_CHARS = 2000
 
+_NOTES_CHARS = 2000
+
+
+def _clean(text: str, limit: int = _NOTES_CHARS) -> str:
+    """Cap and strip control chars from free-text that re-enters an LLM prompt.
+
+    ``notes`` and attempt ``log_excerpt`` are untrusted (they can carry an agent's
+    output) yet a recovered journal feeds the next agent's context via
+    ``AGENT_HANDOVER_FILE``. Removing control characters (newline excepted) and
+    bounding length blunts terminal/prompt-spoofing without touching the immutable
+    prompt rules that already tag this text as data, not instructions.
+    """
+    return "".join(ch for ch in (text or "") if ch == "\n" or ch >= " ")[:limit]
+
 
 def _now() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -58,7 +72,7 @@ def record_attempt(entry: dict[str, Any], state: str, status: str, hook_log: str
             "at": _now(),
             "state": state,
             "status": status,
-            "log_excerpt": (hook_log or "")[:_LOG_EXCERPT_CHARS],
+            "log_excerpt": _clean(hook_log, _LOG_EXCERPT_CHARS),
         }
     )
 
@@ -67,7 +81,7 @@ def finalize(entry: dict[str, Any], outcome: str, notes: str = "") -> None:
     entry["outcome"] = outcome
     entry["finished_at"] = _now()
     if notes:
-        entry["notes"] = notes
+        entry["notes"] = _clean(notes)
 
 
 def write(entry: dict[str, Any], journal_dir: str = JOURNAL_DIR) -> str:

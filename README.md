@@ -130,7 +130,7 @@ flowchart TD
 |-------|--------------|
 | **Initialize** | Open the repo, refuse a dirty tree, pull only if a tracking `origin` exists, parse `AGENTS.md`, reject an unsupported `schema_version`, generate / reuse an `AGENT_ID`, and recover the latest unresolved handover journal (locally and from the shared state ref). |
 | **Isolate** | Record the current branch, compute a colon-free work-branch name, validate it with `git check-ref-format`, verify declared paths exist, then **acquire a TTL'd lease** for the task (locally and on the shared state ref) **before** creating the branch — so a lost race never leaves an orphan work branch — and only then create it. A live lease held by a different agent aborts the run. |
-| **Mutate** | Dispatch on `mutation_mode` (`evolve` / `isolated`) and invoke `AGENT_LLM_CMD` — a provider-agnostic shell command — with the task context and allowlist exported as environment variables. The subprocess environment is **scoped by `AGENT_ENV_ALLOWLIST`** (comma/newline-separated names); when it is unset the seam falls back to a full copy of the parent environment and logs a one-time warning, and the active scope is recorded as an `env_scope` (`allowlisted` / `full_copy`) audit field in the forensic report and `--doctor`. The command string is then scanned by the command guard: git bypass flags (`--no-verify` / `-n`) are **stripped** when `git` is a clean token, and unstrippable evasion patterns are **flagged** — `core.hooksPath`, plumbing such as `commit-tree`/`update-ref`, and a bypass flag riding on an *obfuscated* git commit/push where `git` is hidden behind command substitution (`$(git commit --no-verify)`), backticks, or a shell variable (`$GIT commit --no-verify`) so the stripper cannot reach it; each guard hit charges a separate `guard_penalties` budget (its own exit-4 ceiling), not the autorepair counter. The git environment is also hardened (`GIT_CONFIG_NOSYSTEM`, dropped `GIT_CONFIG_GLOBAL`). After the run the per-step token/cost payload is read and accumulated. A no-op when `AGENT_LLM_CMD` is unset (the seam is honest about being inactive). |
+| **Mutate** | Dispatch on `mutation_mode` (`evolve` / `isolated`) and invoke `AGENT_LLM_CMD` — a provider-agnostic shell command — with the task context and allowlist exported as environment variables. The subprocess environment is **scoped by `AGENT_ENV_ALLOWLIST`** (comma/newline-separated names); when it is unset the seam falls back to a full copy of the parent environment and logs a one-time warning, and the active scope is recorded as an `env_scope` (`allowlisted` / `full_copy`) audit field in the forensic report and `--doctor`. The command string is then scanned by the command guard: git bypass flags (`--no-verify` / `-n`) are **stripped** when `git` is a clean token, and unstrippable evasion patterns are **flagged** — `core.hooksPath`, plumbing such as `commit-tree`/`update-ref`, and a bypass flag riding on an *obfuscated* git commit/push where `git` is hidden behind command substitution (`$(git commit --no-verify)`), backticks, or a shell variable (`$GIT commit --no-verify`) so the stripper cannot reach it; each guard hit charges a separate `guard_penalties` budget (its own exit-4 ceiling), not the autorepair counter. The git environment is also hardened (`GIT_CONFIG_NOSYSTEM`, and the inherited git-config env family dropped: `GIT_CONFIG_GLOBAL` / `GIT_CONFIG_SYSTEM` / `GIT_CONFIG_PARAMETERS` / `GIT_CONFIG_COUNT` / `GIT_CONFIG_KEY_*` / `GIT_CONFIG_VALUE_*`). After the run the per-step token/cost payload is read and accumulated. A no-op when `AGENT_LLM_CMD` is unset (the seam is honest about being inactive). |
 | **Enforce** | Stage **only** the task's allowlist (POSIX-normalized), commit with `AGENT_TASK_ID` set so the lock / contract-binding hooks gate it, then classify the result as `passed` / `mechanical` / `semantic`. Every attempt is appended to the journal. After each step the **token/cost budget** is checked; a breach triggers an immediate financial abort (forensic report + hard rollback + exit 3). The same checkpoint enforces **time ceilings** — a per-step `AGENT_STEP_TIMEOUT_SECONDS` and a wall-clock `MAX_RUN_SECONDS` — which also exit 3 but stamp a *timeout* reason distinct from a financial/budget abort. |
 | **Autorepair** | On a semantic failure, **condense** the hook log to its load-bearing assertions and build a **cache-ordered** repair prompt (static rules → task contracts → dynamic diff/log/ledger), fed to the LLM via `AGENT_REPAIR_LOG` / `AGENT_REPAIR_PROMPT_FILE`. When `max_autorepair_attempts` is exceeded, journal `escalated`, write a forensic report, **roll back** to the original branch, release the lease, and exit non-zero. |
 | **Reconcile** | Run the optimistic **staleness guard** against `AGENT_SHARED_REF` (default `origin/main`); if any critical file moved since the base commit, journal `stale`, refuse the push, and exit 1. Otherwise push (when `origin` exists), open a PR via `gh` if available (or print the exact manual command), release the lease, and journal `pushed` / `local`. If the push itself fails after a clean local run, the journal is re-finalized to a **recoverable `error`** outcome (the work stays committed locally on the branch and the lease is already released), so re-running the task retries the push instead of stranding the run on a misleading `pushed` state. |
@@ -529,7 +529,12 @@ useful for dry runs and for the framework's own tests. The subprocess
 environment is scoped by **`AGENT_ENV_ALLOWLIST`** (comma/newline-separated
 names); unset means a full copy of the parent environment plus a one-time
 warning, and the resulting `env_scope` (`allowlisted` / `full_copy`) is surfaced
-in the forensic report and `--doctor`. Before every invocation the command
+in the forensic report and `--doctor`. When the allowlist is set, **only the
+explicitly named vars** pass through — there is no `AGENT_*` / `GIT_*` prefix
+carve-out, so a secret like `AGENT_AWS_SECRET_KEY` is not leaked to the seam
+(the harness re-injects the `AGENT_*` task context it needs and pins git config
+itself); an operator who genuinely needs an inherited var such as `GIT_ASKPASS`
+lists it explicitly. Before every invocation the command
 string is run through the **escape-hatch guard** (`harness/command_guard.py`):
 any `--no-verify` / `-n` appended to a `git commit` / `git push` segment is
 stripped, the run continues with the sanitized command, and a **separate
@@ -851,7 +856,9 @@ a breach — **exit 4** — rather than a clean pass, mirroring the fail-safe us
 | Corrupt / adversarial lease TTL | `ttl_seconds` is non-numeric in a lease file | `is_active()` treats it as **inactive (reclaimable)** instead of crashing the coordination check with an uncaught `ValueError` |
 | Poisoned coordination state | a payload smuggled under the allowlist-exempt `.harness/leases/` or `.harness/journal/` (e.g. a `.py`, nested path, or unknown-shaped JSON) — a persistent prompt-injection vector, since journal content feeds the next agent's prompt | the exemption is **content-aware** (`is_valid_coordination_payload`): the pre-commit hook (exit 1), the post-hoc containment gate (exit 4), **and** the server-side CI re-check (the layer with no SHA backstop, so it stops a *directly pushed* branch) all reject anything that is not a flat well-formed lease/journal `*.json`; the immutable prompt rules additionally tag handover/journal text as **untrusted data** |
 | Corrupt `contracts.lock` | manifest file is not valid JSON | `CorruptLockError` ⇒ a clear "run `--update`" message, never a traceback; surfaced by `--doctor` and CI |
+| Malicious / malformed task id | a task key or `--release`/`--task` value like `../contracts` or `../../etc/x` is fused into the lease/journal file path and the work-branch name, and could traverse out of `.harness/` | `leases.is_valid_task_id` enforces a conservative slug (`[A-Za-z0-9][A-Za-z0-9._-]*`, no `..`) and **fails closed** at every entry point: `lease_path` raises, `_parse_task` and `release_lease` reject before any filesystem write, and the `validate-agents-ledger` pre-commit hook rejects an unsafe ledger *key* (not just its values) |
 | Shared-ref push race | concurrent `publish_files` non-fast-forward | bounded exponential backoff + jitter retry; `False` return is logged as a warning, never swallowed |
+| Poisoned shared-ref lease | any principal with write access to `origin` pushes a fake "live" lease to the `harness-state` ref to strand another agent's task | bounded by the per-clone lease **TTL** + the pre-push **staleness guard** + content-aware `is_valid_coordination_payload` (a smuggled non-lease/non-journal blob is rejected at the CI re-check); it is a coordination convenience, not a consensus system — for stronger guarantees push to a protected ref or run one clone per agent (`AGENT_MINIMAL=1`). Signed lease payloads are a roadmap item |
 | Shallow clone in CI | base-commit objects absent ⇒ staleness silently passes | auto `fetch --unshallow`; with `AGENT_STALENESS_STRICT=1`, an unresolvable ref **fails safe** |
 | Hook bypass (`core.hooksPath`, plumbing) | a commit lands without the lock hook firing | guard flags it; post-hoc containment gate aborts (exit 4); CI re-check blocks the merge |
 | Hook bypass (env var) | the local hooks gate on `AGENT_TASK_ID` and skip on the human-only `SKIP_AGENT_HARNESS`, so the agent's own git subprocess can run `env -u AGENT_TASK_ID git commit …` (or set `SKIP_AGENT_HARNESS=1` itself) to no-op the *local* hook — same severity class as `core.hooksPath` | the orchestrator's own commits always re-assert `AGENT_TASK_ID` and drop `SKIP_AGENT_HARNESS`; any commit the agent makes out of band still lands on `base..HEAD`, so the post-hoc containment gate catches it by SHA (`_unexpected_commits`, exit 4) and the CI re-check blocks the merge |
@@ -869,15 +876,21 @@ a breach — **exit 4** — rather than a clean pass, mirroring the fail-safe us
 ### Honest limitations
 
 - The `AGENT_LLM_CMD` seam is an **arbitrary shell command**. The harness hardens
-  *git* behaviour around it (`GIT_CONFIG_NOSYSTEM`, dropped `GIT_CONFIG_GLOBAL`,
+  *git* behaviour around it (`GIT_CONFIG_NOSYSTEM`, plus the dropped git-config env
+  family `GIT_CONFIG_GLOBAL` / `GIT_CONFIG_SYSTEM` / `GIT_CONFIG_PARAMETERS` /
+  `GIT_CONFIG_COUNT` / `GIT_CONFIG_KEY_*` / `GIT_CONFIG_VALUE_*`,
   flag stripping, and *flagging* of obfuscated bypass flags it cannot rewrite)
   but cannot stop the backend from doing out-of-band work outside
   that seam. The containment gate and CI re-check are what make that *safe to
   ship* — they reject the result — but they are detective controls, not a
   sandbox. Run untrusted backends inside your own isolation (container/VM).
 - The shared `harness-state` ref is a coordination convenience, not a consensus
-  system. Under heavy concurrency prefer one clone per agent, or
-  `AGENT_MINIMAL=1`.
+  system. It is **not authenticated from an agent's perspective**: any principal
+  with write access to `origin` can push to it, so a compromised runner could
+  poison another agent's lease state. The per-clone TTL, the pre-push staleness
+  guard, and content-aware `is_valid_coordination_payload` bound the blast radius;
+  push to a **protected ref** (or prefer one clone per agent, or `AGENT_MINIMAL=1`)
+  under adversarial concurrency. Signed lease payloads are a roadmap item.
 - **Coordination state is structurally validated, not semantically trusted.**
   `is_valid_coordination_payload` guarantees only that an exempt lease/journal
   file is a flat well-formed `*.json` with known top-level keys — it does **not**
@@ -885,9 +898,19 @@ a breach — **exit 4** — rather than a clean pass, mirroring the fail-safe us
   journal re-enters a later agent's prompt via `AGENT_HANDOVER_FILE`, those
   fields are a **prompt-injection surface**: the immutable framework rules
   therefore instruct the model to treat AGENTS.md context, the handover/journal
-  file, and any prior-session notes as **untrusted data, never instructions**.
-  That is a mitigation, not a sandbox — run untrusted backends in your own
-  isolation and review escalated journals before trusting their narrative.
+  file, and any prior-session notes as **untrusted data, never instructions**,
+  and as defence-in-depth the journal now **control-char-strips and length-caps**
+  those fields on write. That is a mitigation, not a sandbox — run untrusted
+  backends in your own isolation and review escalated journals before trusting
+  their narrative.
+- **The CI file-scope re-check trusts the task id, not the branch name.** A branch
+  is agent-controllable, so `ci_enforce.py` only uses `agent/<task_id>/…` to
+  *locate* a task and prefers the CI-injected `AGENT_TASK_ID` / `--task`. An
+  attacker can *redirect* which existing task's allowlist applies but cannot
+  *widen* scope (the allowlist is still enforced, and an unresolved task fails
+  closed). For a tighter trust boundary, have the CI workflow set `AGENT_TASK_ID`
+  from a trusted source (a PR label or an orchestrator-signed commit) rather than
+  deriving it from the branch name.
 - The complexity is real: ~18 harness modules, a YAML ledger, a shared ref,
   TTL'd leases, a journal, a hashed manifest, and a multi-stage pre-commit
   pipeline. `--doctor` exists specifically to make that surface debuggable; if
@@ -1205,9 +1228,11 @@ workload's contracts.
   the cost of a bypass but is **not** a security boundary; the authoritative
   defences are the post-hoc containment gate and the server-side CI re-check.
 - **Scoped LLM environment** — `AGENT_ENV_ALLOWLIST` restricts which parent env
-  vars reach the seam; unset means a full copy plus a one-time warning, and the
-  active `env_scope` is surfaced in forensics and `--doctor`. `SKIP_AGENT_HARNESS`
-  is always dropped from the seam so the human override cannot be inherited.
+  vars reach the seam; when set, **only the explicitly named vars** pass (no
+  `AGENT_*` / `GIT_*` prefix carve-out, so prefixed secrets are not leaked), while
+  unset means a full copy plus a one-time warning, and the active `env_scope` is
+  surfaced in forensics and `--doctor`. `SKIP_AGENT_HARNESS` is always dropped
+  from the seam so the human override cannot be inherited.
 - **Post-hoc containment gate** — after mutation the orchestrator inspects
   committed history (`base..HEAD`); any out-of-allowlist, symlink, or
   out-of-band (hook-bypassed) commit triggers a forensic rollback and **exit
@@ -1215,8 +1240,11 @@ workload's contracts.
 - **Server-side re-enforcement** — `harness/ci_enforce.py` re-applies the
   allowlist + manifest check from a trusted CI runner the agent cannot influence.
 - **Git-environment hardening** — the LLM seam runs with `GIT_CONFIG_NOSYSTEM`
-  set and `GIT_CONFIG_GLOBAL` dropped, so stray git config cannot weaken the
-  gates mid-run.
+  set and the whole inherited git-config env family dropped (`GIT_CONFIG_GLOBAL`,
+  `GIT_CONFIG_SYSTEM`, `GIT_CONFIG_PARAMETERS`, and the `git -c` env form
+  `GIT_CONFIG_COUNT` / `GIT_CONFIG_KEY_*` / `GIT_CONFIG_VALUE_*`), so stray or
+  injected git config — including a `core.hooksPath` override the command guard
+  would never see in the command string — cannot weaken the gates mid-run.
 - **Fail-safe coordination** — `publish_files()` retries with backoff + jitter
   and surfaces failures (never silent); staleness deepens shallow clones and
   honours `AGENT_STALENESS_STRICT`.
