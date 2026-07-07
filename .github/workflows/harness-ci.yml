@@ -44,4 +44,5 @@ jobs:
         env:
           GITHUB_BASE_REF: ${{ github.event.pull_request.base.ref || 'origin/main' }}
           GITHUB_HEAD_REF: ${{ github.event.pull_request.head.ref || github.ref_name }}
+          HARNESS_NON_AGENT_OK: ${{ github.event_name == 'push' && '1' || '' }}
         run: python harness/ci_enforce.py
