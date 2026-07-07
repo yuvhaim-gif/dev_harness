@@ -174,6 +174,8 @@ dev_process/
     ├── agent_runner.py                # Orchestrator: the 5-state loop (+ --init / --doctor)
     ├── README.md                      # This document (the framework's own docs)
     ├── lock_policy.py                 # Shared compute_allowlist() + symlink_paths() mode check + coordination bypass + human override
+    ├── ledger.py                      # Shared AGENTS.md loader (load_ledger/get_task/LedgerError) for hooks, runner & CI
+    ├── hook_context.py                # Shared gated-hook preamble (override/skip/resolve task) + staged-files reader
     ├── enforce_file_locks.py          # Pre-commit gate: aborts out-of-allowlist (and symlink) commits
     ├── validate_agents_ledger.py      # Validates AGENTS.md (incl. contracts ⊆ spec_docs, spec_docs are .md concepts)
     ├── okf.py                         # OKF conformance for the spec_docs info layer (type gate + reserved-file rules)
