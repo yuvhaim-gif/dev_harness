@@ -6,33 +6,17 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
-from typing import Any
-
-import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from hook_context import hook_task_context, staged_files  # noqa: E402
 from lock_policy import (  # noqa: E402
     UnknownMutationModeError,
     compute_allowlist,
-    human_override_active,
     is_coordination_path,
     is_valid_coordination_payload,
     symlink_paths,
 )
-
-
-def _staged_files() -> list[str]:
-    # git emits POSIX-style, repo-root-relative paths on every OS.
-    res = subprocess.run(
-        ["git", "diff", "--cached", "--name-only"],
-        capture_output=True,
-        text=True,
-    )
-    if res.returncode != 0:
-        print(f"ERROR: could not read git index: {res.stderr.strip()}")
-        sys.exit(1)
-    return [line for line in res.stdout.splitlines() if line]
 
 
 def _staged_blob(path: str) -> str | None:
@@ -56,31 +40,11 @@ def _staged_raw() -> str:
 
 
 def main() -> None:
-    # Explicit human override: a developer disabling the gates for sweeping work.
-    if human_override_active():
-        print("SKIP_AGENT_HARNESS set: human override -- file-lock gate bypassed.")
+    # Human override / no-agent-context / ledger + task resolution (shared gate).
+    context = hook_task_context("file-lock gate")
+    if context is None:
         sys.exit(0)
-
-    # Humans committing normally (no agent context) are not gated.
-    task_id = os.getenv("AGENT_TASK_ID")
-    if not task_id:
-        sys.exit(0)
-
-    try:
-        with open("AGENTS.md", encoding="utf-8") as f:
-            ledger = yaml.safe_load(f) or {}
-    except FileNotFoundError:
-        print("ERROR: Missing operational ledger: AGENTS.md")
-        sys.exit(1)
-    except yaml.YAMLError as exc:
-        # A malformed ledger must abort cleanly, not dump a traceback.
-        print(f"ERROR: AGENTS.md is not valid YAML: {exc}")
-        sys.exit(1)
-
-    task: Any = (ledger.get("tasks") or {}).get(task_id)
-    if not task:
-        print(f"ERROR: Task '{task_id}' not found in AGENTS.md.")
-        sys.exit(1)
+    task_id, task = context
 
     try:
         allowed = compute_allowlist(task)
@@ -101,7 +65,7 @@ def main() -> None:
 
     violations: list[str] = []
     bad_payloads: list[str] = []
-    for staged in _staged_files():
+    for staged in staged_files():
         if staged in allowed:
             continue
         if is_coordination_path(staged):

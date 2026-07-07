@@ -27,7 +27,6 @@ from datetime import UTC, datetime
 from typing import Any
 
 import git
-import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -36,6 +35,7 @@ import contract_manifest  # noqa: E402
 import forensic  # noqa: E402
 import journal  # noqa: E402
 import leases  # noqa: E402
+import ledger as ledger_io  # noqa: E402
 import log_condenser  # noqa: E402
 import okf  # noqa: E402
 import prompt_builder  # noqa: E402
@@ -44,6 +44,7 @@ import state_sync  # noqa: E402
 import telemetry  # noqa: E402
 from lock_policy import (  # noqa: E402
     compute_allowlist,
+    env_flag,
     human_override_active,
     is_coordination_path,
     is_valid_coordination_payload,
@@ -72,8 +73,6 @@ class ContainmentCheckError(RuntimeError):
 
 VERSION = "0.1.0"
 
-_TRUTHY = frozenset({"1", "true", "yes", "on"})
-
 # Marker stamped into the template README the harness ships at the repo root.
 # ``--doctor`` warns while it is still present so an operator replaces the
 # framework's landing page with their own project README before starting.
@@ -97,10 +96,6 @@ python -m harness --task <task_id>
 """
 
 
-def _env_flag(name: str) -> bool:
-    return (os.getenv(name) or "").strip().lower() in _TRUTHY
-
-
 def _env_float(name: str) -> float | None:
     raw = (os.getenv(name) or "").strip()
     if not raw:
@@ -119,7 +114,7 @@ def _minimal_mode() -> bool:
     operators who only want local locking are not exposed to the cross-clone
     git-plumbing machinery.
     """
-    return _env_flag("AGENT_MINIMAL") or _env_flag("AGENT_DISABLE_STATE_SYNC")
+    return env_flag("AGENT_MINIMAL") or env_flag("AGENT_DISABLE_STATE_SYNC")
 
 
 def log(msg: str) -> None:
@@ -178,10 +173,10 @@ class RunContext:
 # Ledger parsing
 # --------------------------------------------------------------------------- #
 def _load_ledger(path: str = "AGENTS.md") -> dict[str, Any]:
-    with open(path, encoding="utf-8") as f:
-        data = yaml.safe_load(f)
-    if not isinstance(data, dict):
-        raise SystemExit("ERROR: AGENTS.md must be a YAML mapping.")
+    try:
+        data = ledger_io.load_ledger(path)
+    except ledger_io.LedgerError as exc:
+        raise SystemExit(f"ERROR: {exc}") from exc
     schema_version = data.get("schema_version", 1)
     if (
         not isinstance(schema_version, int)
@@ -197,13 +192,12 @@ def _load_ledger(path: str = "AGENTS.md") -> dict[str, Any]:
 
 def _parse_task(task_id: str) -> TaskSpec:
     ledger = _load_ledger()
-    tasks = ledger.get("tasks") or {}
     if not leases.is_valid_task_id(task_id):
         raise SystemExit(
             f"ERROR: task id '{task_id}' is not a safe slug ([A-Za-z0-9][A-Za-z0-9._-]*, no '..')."
         )
-    raw = tasks.get(task_id)
-    if not isinstance(raw, dict):
+    raw = ledger_io.get_task(ledger, task_id)
+    if raw is None:
         raise SystemExit(f"ERROR: task '{task_id}' not found in AGENTS.md.")
     attempts_raw = raw.get("max_autorepair_attempts", 3)
     if isinstance(attempts_raw, bool):
@@ -984,6 +978,30 @@ def _write_forensics(ctx: RunContext, outcome: str, reason: str, exit_code: int 
     _emit_forensic_report(ctx, _build_forensic_report(ctx, outcome, reason, exit_code))
 
 
+def _abort_with_forensics(
+    ctx: RunContext,
+    *,
+    reason: str,
+    notes: str,
+    exit_code: int,
+    warning: str | None = None,
+    outcome: str = "escalated",
+) -> None:
+    """Shared abort tail for the circuit-breakers and the autorepair cap.
+
+    Builds the forensic report against the *current* (pre-rollback) tree, finalizes
+    the journal, hard-rolls-back, then emits the report -- the build-before /
+    emit-after ordering that lets section 4 reflect the real rollback verdict.
+    When ``warning`` is given it is appended to ``git_warnings`` first.
+    """
+    if warning is not None:
+        ctx.git_warnings.append(warning)
+    report = _build_forensic_report(ctx, outcome, reason, exit_code=exit_code)
+    _persist_journal(ctx, outcome, notes=notes)
+    _rollback(ctx)
+    _emit_forensic_report(ctx, report)
+
+
 def autorepair(ctx: RunContext) -> bool:
     """Return True to retry the loop, False to escalate (caller should stop)."""
     journal.record_attempt(
@@ -1001,10 +1019,7 @@ def autorepair(ctx: RunContext) -> bool:
             "should decide whether to fix the implementation or revise the "
             "test/contract that keeps failing."
         )
-        report = _build_forensic_report(ctx, "escalated", reason, exit_code=1)
-        _persist_journal(ctx, "escalated", notes=reason)
-        _rollback(ctx)
-        _emit_forensic_report(ctx, report)
+        _abort_with_forensics(ctx, reason=reason, notes=reason, exit_code=1)
         return False
 
     # Condense the raw hook log and build a cache-ordered repair prompt so the
@@ -1046,13 +1061,13 @@ def _budget_abort(ctx: RunContext) -> bool:
     if reason is None:
         return False
     log(f"FINANCIAL ABORT: {reason}; {ctx.ledger.summary()}. Rolling back.")
-    ctx.git_warnings.append(f"financial abort: {reason}")
-    report = _build_forensic_report(
-        ctx, "escalated", f"financial abort -- {reason}", exit_code=BUDGET_ABORT_EXIT
+    _abort_with_forensics(
+        ctx,
+        warning=f"financial abort: {reason}",
+        reason=f"financial abort -- {reason}",
+        notes=f"financial abort: {reason}. {ctx.ledger.summary()}.",
+        exit_code=BUDGET_ABORT_EXIT,
     )
-    _persist_journal(ctx, "escalated", notes=f"financial abort: {reason}. {ctx.ledger.summary()}.")
-    _rollback(ctx)
-    _emit_forensic_report(ctx, report)
     return True
 
 
@@ -1066,15 +1081,13 @@ def _timeout_abort(ctx: RunContext) -> bool:
     if not ctx.timed_out:
         return False
     log(f"TIMEOUT ABORT: {ctx.timed_out}; {ctx.ledger.summary()}. Rolling back.")
-    ctx.git_warnings.append(f"timeout abort: {ctx.timed_out}")
-    report = _build_forensic_report(
-        ctx, "escalated", f"timeout abort -- {ctx.timed_out}", exit_code=BUDGET_ABORT_EXIT
+    _abort_with_forensics(
+        ctx,
+        warning=f"timeout abort: {ctx.timed_out}",
+        reason=f"timeout abort -- {ctx.timed_out}",
+        notes=f"timeout abort: {ctx.timed_out}. {ctx.ledger.summary()}.",
+        exit_code=BUDGET_ABORT_EXIT,
     )
-    _persist_journal(
-        ctx, "escalated", notes=f"timeout abort: {ctx.timed_out}. {ctx.ledger.summary()}."
-    )
-    _rollback(ctx)
-    _emit_forensic_report(ctx, report)
     return True
 
 
@@ -1093,13 +1106,13 @@ def _guard_abort(ctx: RunContext) -> bool:
         f"{ctx.task.max_autorepair_attempts})"
     )
     log(f"GUARD ABORT: {reason}. Rolling back.")
-    ctx.git_warnings.append(f"guard abort: {reason}")
-    report = _build_forensic_report(
-        ctx, "escalated", f"guard abort -- {reason}", exit_code=CONTAINMENT_ABORT_EXIT
+    _abort_with_forensics(
+        ctx,
+        warning=f"guard abort: {reason}",
+        reason=f"guard abort -- {reason}",
+        notes=f"guard abort: {reason}.",
+        exit_code=CONTAINMENT_ABORT_EXIT,
     )
-    _persist_journal(ctx, "escalated", notes=f"guard abort: {reason}.")
-    _rollback(ctx)
-    _emit_forensic_report(ctx, report)
     return True
 
 
@@ -1233,11 +1246,13 @@ def _containment_abort(ctx: RunContext) -> bool:
     for v in violations:
         log(f"  - {v}")
     reason = "containment breach -- " + "; ".join(violations)
-    ctx.git_warnings.append(reason)
-    report = _build_forensic_report(ctx, "escalated", reason, exit_code=CONTAINMENT_ABORT_EXIT)
-    _persist_journal(ctx, "escalated", notes=reason)
-    _rollback(ctx)
-    _emit_forensic_report(ctx, report)
+    _abort_with_forensics(
+        ctx,
+        warning=reason,
+        reason=reason,
+        notes=reason,
+        exit_code=CONTAINMENT_ABORT_EXIT,
+    )
     return True
 
 
@@ -1296,7 +1311,7 @@ def _staleness_guard(ctx: RunContext) -> list[str]:
         log(f"WARNING: fetch before staleness check failed: {exc}")
     working_dir = str(ctx.repo.working_tree_dir or ".")
     if not _ref_exists(ctx.repo, SHARED_REF):
-        if _env_flag("AGENT_STALENESS_STRICT"):
+        if env_flag("AGENT_STALENESS_STRICT"):
             log(
                 f"shared ref '{SHARED_REF}' does not resolve and "
                 "AGENT_STALENESS_STRICT is set; refusing to push (fail-safe)."

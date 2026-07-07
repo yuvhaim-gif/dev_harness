@@ -9,31 +9,21 @@ from __future__ import annotations
 
 import os
 import sys
-from typing import Any
-
-import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # noqa: E402
 
 import leases  # noqa: E402
 import okf  # noqa: E402
+from ledger import LedgerError, load_ledger  # noqa: E402
 
 VALID_MODES = {"evolve", "isolated"}
 
 
 def validate(path: str = "AGENTS.md") -> int:
     try:
-        with open(path, encoding="utf-8") as f:
-            ledger: Any = yaml.safe_load(f)
-    except FileNotFoundError:
-        print(f"ERROR: Missing operational ledger: {path}")
-        return 1
-    except yaml.YAMLError as exc:
-        print(f"ERROR: {path} is not valid YAML: {exc}")
-        return 1
-
-    if not isinstance(ledger, dict):
-        print(f"ERROR: {path} must be a YAML mapping at the top level.")
+        ledger = load_ledger(path)
+    except LedgerError as exc:
+        print(f"ERROR: {exc}")
         return 1
 
     tasks = ledger.get("tasks")

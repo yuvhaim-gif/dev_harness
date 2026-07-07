@@ -16,13 +16,23 @@ ALWAYS_LOCKED: frozenset[str] = frozenset({"AGENTS.md", ".pre-commit-config.yaml
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 
 
+def is_truthy(value: str | None) -> bool:
+    """True when ``value`` is one of the accepted truthy tokens (case-insensitive)."""
+    return (value or "").strip().lower() in _TRUTHY
+
+
+def env_flag(name: str) -> bool:
+    """True when environment variable ``name`` holds a truthy token."""
+    return is_truthy(os.getenv(name))
+
+
 def human_override_active() -> bool:
     """True when a human has explicitly disabled the agent gates.
 
     Set ``SKIP_AGENT_HARNESS=1`` to let a developer make sweeping structural or
     configuration changes without the autonomous-agent allowlist blocking them.
     """
-    return (os.getenv("SKIP_AGENT_HARNESS") or "").strip().lower() in _TRUTHY
+    return env_flag("SKIP_AGENT_HARNESS")
 
 
 CONTRACT_LOCK_PATH = ".harness/contracts.lock"

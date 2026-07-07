@@ -31,24 +31,21 @@ import os
 import re
 import subprocess
 import sys
+from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import contract_manifest  # noqa: E402
 import okf  # noqa: E402
+from ledger import LedgerError, get_task, load_ledger  # noqa: E402
 from lock_policy import (  # noqa: E402
     UnknownMutationModeError,
     compute_allowlist,
+    env_flag,
     is_coordination_path,
     is_valid_coordination_payload,
     symlink_paths,
 )
-
-try:
-    import yaml
-except ModuleNotFoundError:  # pragma: no cover - yaml is a declared dependency
-    print("ERROR: PyYAML is required to run ci_enforce.")
-    sys.exit(1)
 
 _AGENT_BRANCH = re.compile(r"^agent/(?P<task_id>.+)/[^/]+$")
 
@@ -62,10 +59,6 @@ _NON_AGENT_OK_ENV = "HARNESS_NON_AGENT_OK"
 
 def _git(*args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(["git", *args], capture_output=True, text=True)
-
-
-def _env_flag(name: str) -> bool:
-    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _current_branch() -> str:
@@ -131,18 +124,13 @@ def _changed_symlinks(base: str, head: str) -> list[str]:
     return symlink_paths(res.stdout)
 
 
-def _load_task(task_id: str) -> dict[str, object] | None:
+def _load_task(task_id: str) -> dict[str, Any] | None:
     try:
-        with open("AGENTS.md", encoding="utf-8") as fh:
-            ledger = yaml.safe_load(fh) or {}
-    except FileNotFoundError:
-        print("ERROR: Missing operational ledger: AGENTS.md")
+        ledger = load_ledger()
+    except LedgerError as exc:
+        print(f"ERROR: {exc}")
         sys.exit(1)
-    except yaml.YAMLError as exc:
-        print(f"ERROR: AGENTS.md is not valid YAML: {exc}")
-        sys.exit(1)
-    task = (ledger.get("tasks") or {}).get(task_id)
-    return task if isinstance(task, dict) else None
+    return get_task(ledger, task_id)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -190,7 +178,7 @@ def main(argv: list[str] | None = None) -> int:
         # the allowlist re-check, or an agent could evade it just by choosing a
         # non-``agent/...`` branch name. A genuine human PR opts out explicitly
         # via a trusted, workflow-set flag the agent cannot influence.
-        if _env_flag(_NON_AGENT_OK_ENV):
+        if env_flag(_NON_AGENT_OK_ENV):
             print(
                 f"SKIP: '{head_branch}' declared human-authored "
                 f"({_NON_AGENT_OK_ENV} set); file-scope check skipped."

@@ -15,56 +15,23 @@ Humans (no ``AGENT_TASK_ID``) are never gated.
 from __future__ import annotations
 
 import os
-import subprocess
 import sys
-from typing import Any
-
-import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from lock_policy import CONTRACT_LOCK_PATH, human_override_active  # noqa: E402
-
-
-def _staged_files() -> set[str]:
-    res = subprocess.run(
-        ["git", "diff", "--cached", "--name-only"],
-        capture_output=True,
-        text=True,
-    )
-    if res.returncode != 0:
-        print(f"ERROR: could not read git index: {res.stderr.strip()}")
-        sys.exit(1)
-    return {line for line in res.stdout.splitlines() if line}
+from hook_context import hook_task_context, staged_files  # noqa: E402
+from lock_policy import CONTRACT_LOCK_PATH  # noqa: E402
 
 
 def main() -> None:
-    if human_override_active():
-        print("SKIP_AGENT_HARNESS set: human override -- contract-binding gate bypassed.")
+    context = hook_task_context("contract-binding gate")
+    if context is None:
         sys.exit(0)
-
-    task_id = os.getenv("AGENT_TASK_ID")
-    if not task_id:
-        sys.exit(0)
-
-    try:
-        with open("AGENTS.md", encoding="utf-8") as f:
-            ledger = yaml.safe_load(f) or {}
-    except FileNotFoundError:
-        print("ERROR: Missing operational ledger: AGENTS.md")
-        sys.exit(1)
-    except yaml.YAMLError as exc:
-        print(f"ERROR: AGENTS.md is not valid YAML: {exc}")
-        sys.exit(1)
-
-    task: Any = (ledger.get("tasks") or {}).get(task_id)
-    if not task:
-        print(f"ERROR: Task '{task_id}' not found in AGENTS.md.")
-        sys.exit(1)
+    task_id, task = context
 
     contracts = set(task.get("contracts") or [])
     contract_tests = set(task.get("contract_tests") or [])
-    staged = _staged_files()
+    staged = set(staged_files())
 
     touched_contracts = sorted(staged & contracts)
     if not touched_contracts:
