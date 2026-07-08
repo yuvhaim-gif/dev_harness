@@ -13,6 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - Resync the root landing README with the harness docs.
+- Refactor the orchestrator: split `agent_runner.py` into focused `runner_*`
+  modules (`runner_core`, `runner_llm`, `runner_states`, `runner_recovery`,
+  `runner_containment`, `runner_reconcile`, `runner_drive`, `runner_cli`) with
+  `agent_runner.py` kept as a thin re-exporting facade (public surface and
+  entry points unchanged).
 
 ### Security
 - Remediate red-team findings across security, leases, honesty, and rollback paths.

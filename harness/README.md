@@ -162,7 +162,15 @@ dev_process/
 └── harness/                           # THE FRAMEWORK (run via `python -m harness`)
     ├── __init__.py                    # Marks `harness` as an installable package
     ├── __main__.py                    # ← `python -m harness` entry point
-    ├── agent_runner.py                # Orchestrator: the 5-state loop (+ --init / --doctor)
+    ├── agent_runner.py                # Thin facade: re-exports the runner_* surface (entry point)
+    ├── runner_core.py                 # Data models (TaskSpec/RunContext), ledger parsing, shared helpers
+    ├── runner_llm.py                  # The LLM integration seam (_run_llm) + hardened subprocess env
+    ├── runner_states.py               # States 1-4: initialize, isolate, mutate, enforce
+    ├── runner_recovery.py             # Rollback, forensics, circuit-breakers, autorepair step
+    ├── runner_containment.py          # Post-hoc committed-state containment gate (base..HEAD probes)
+    ├── runner_reconcile.py            # State 5: honest reconcile, staleness guard, PR open
+    ├── runner_drive.py                # Drive model: the outer mutate/enforce/autorepair loop
+    ├── runner_cli.py                  # argparse CLI, --init/--doctor, report_json, release-lease
     ├── README.md                      # This document (the framework's own docs)
     ├── lock_policy.py                 # Shared compute_allowlist() + symlink_paths() mode check + coordination bypass + human override
     ├── ledger.py                      # Shared AGENTS.md loader (load_ledger/get_task/LedgerError) for hooks, runner & CI
@@ -1259,6 +1267,8 @@ workload's contracts.
 
 - **Add a task** — add an entry under `tasks:` in `AGENTS.md` and run
   `validate-agents-ledger` (or commit) to confirm it parses.
-- **Wire in an LLM** — implement the body of `mutate()` (and the fix step inside
-  `autorepair()`) in `harness/agent_runner.py`; everything around those seams
-  already handles isolation, enforcement, classification, rollback, and reconcile.
+- **Wire in an LLM** — implement the body of `_run_llm()` in
+  `harness/runner_llm.py`; both `mutate()` (in `harness/runner_states.py`) and
+  the fix step inside `autorepair()` (in `harness/runner_recovery.py`) funnel
+  through it, and everything around those seams already handles isolation,
+  enforcement, classification, rollback, and reconcile.
