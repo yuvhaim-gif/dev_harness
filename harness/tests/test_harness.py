@@ -36,6 +36,8 @@ import contract_manifest  # noqa: E402
 import git  # noqa: E402
 import journal  # noqa: E402
 import leases  # noqa: E402
+import runner_reconcile  # noqa: E402
+import runner_recovery  # noqa: E402
 import staleness  # noqa: E402
 import state_sync  # noqa: E402
 from agent_runner import compute_branch_name  # noqa: E402
@@ -1335,9 +1337,9 @@ def test_reconcile_success_pushes_and_journals_pushed(
 ) -> None:
     monkeypatch.chdir(harness_repo)
     monkeypatch.setenv("AGENT_MINIMAL", "1")  # local-only: skip shared-ref publish
-    monkeypatch.setattr(agent_runner, "_has_origin", lambda repo: True)
-    monkeypatch.setattr(agent_runner, "_staleness_guard", lambda ctx: [])
-    monkeypatch.setattr(agent_runner, "_open_pr", lambda ctx: None)
+    monkeypatch.setattr(runner_reconcile, "_has_origin", lambda repo: True)
+    monkeypatch.setattr(runner_reconcile, "_staleness_guard", lambda ctx: [])
+    monkeypatch.setattr(runner_reconcile, "_open_pr", lambda ctx: None)
 
     ctx = _reconcile_ctx(harness_repo)
     calls = {"n": 0}
@@ -1358,9 +1360,9 @@ def test_reconcile_failed_push_marks_error_and_returns_1(
 ) -> None:
     monkeypatch.chdir(harness_repo)
     monkeypatch.setenv("AGENT_MINIMAL", "1")
-    monkeypatch.setattr(agent_runner, "_has_origin", lambda repo: True)
-    monkeypatch.setattr(agent_runner, "_staleness_guard", lambda ctx: [])
-    monkeypatch.setattr(agent_runner, "_open_pr", lambda ctx: None)
+    monkeypatch.setattr(runner_reconcile, "_has_origin", lambda repo: True)
+    monkeypatch.setattr(runner_reconcile, "_staleness_guard", lambda ctx: [])
+    monkeypatch.setattr(runner_reconcile, "_open_pr", lambda ctx: None)
 
     ctx = _reconcile_ctx(harness_repo)
     calls = {"n": 0}
@@ -1418,7 +1420,7 @@ def test_autorepair_records_real_status_below_cap(
     harness_repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.chdir(harness_repo)
-    monkeypatch.setattr(agent_runner, "_run_llm", lambda *a, **k: None)
+    monkeypatch.setattr(runner_recovery, "_run_llm", lambda *a, **k: None)
 
     ctx = _ctx_for(harness_repo, "agent-a")
     ctx.journal_entry = journal.start_session(ctx.task.task_id, "agent/t/1", ctx.base_commit)

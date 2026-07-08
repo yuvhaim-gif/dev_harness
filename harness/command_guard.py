@@ -14,7 +14,7 @@ is not a security boundary. A determined agent can still skip the hooks with
 (``commit-tree``/``update-ref``). Those patterns cannot be safely rewritten out
 of an arbitrary shell string, so instead of stripping them this module *flags*
 them: the orchestrator logs the policy event, penalises the repair counter, and
-the post-hoc containment gate (see ``agent_runner._containment_breach``) plus the
+the post-hoc containment gate (see ``runner_containment._containment_breach``) plus the
 server-side CI re-check (see ``harness/ci_enforce.py``) are the authoritative
 defences.
 

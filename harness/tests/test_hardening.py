@@ -32,6 +32,12 @@ import lock_policy  # noqa: E402
 import log_condenser  # noqa: E402
 import okf  # noqa: E402
 import prompt_builder  # noqa: E402
+import runner_containment  # noqa: E402
+import runner_core  # noqa: E402
+import runner_llm  # noqa: E402
+import runner_reconcile  # noqa: E402
+import runner_recovery  # noqa: E402
+import runner_states  # noqa: E402
 import telemetry  # noqa: E402
 import validate_agents_ledger  # noqa: E402
 
@@ -442,7 +448,7 @@ def test_h5b_emit_refreshes_rollback_ok_built_before_rollback(tmp_path: Path) ->
     )
 
     ctx.rollback_ok = True  # _rollback succeeded after the report was built
-    agent_runner._emit_forensic_report(ctx, report)
+    runner_recovery._emit_forensic_report(ctx, report)
 
     assert ctx.forensic_written is True
     body = (tmp_path / ".harness" / "logs" / "FAILED_AGENT_RUN.md").read_text(encoding="utf-8")
@@ -450,7 +456,7 @@ def test_h5b_emit_refreshes_rollback_ok_built_before_rollback(tmp_path: Path) ->
     assert "NOT CONFIRMED" not in body
 
     # Idempotent: a second emit must not double-write once forensic_written is set.
-    agent_runner._emit_forensic_report(ctx, report)
+    runner_recovery._emit_forensic_report(ctx, report)
 
 
 def test_h5c_attempts_show_distinct_per_attempt_cost() -> None:
@@ -804,7 +810,7 @@ def test_h8d_committed_symlink_is_containment_breach(
     # stays quiet -- isolating the symlink (mode) detection as the sole trigger.
     ctx.runner_commits.add(ctx.repo.head.commit.hexsha)
 
-    violations = agent_runner._containment_breach(ctx)
+    violations = runner_containment._containment_breach(ctx)
     assert any("symlink" in v for v in violations), violations
     assert any("harness/example/src/db/queries.py" in v for v in violations), violations
 
@@ -825,7 +831,7 @@ def test_h8e_containment_check_git_error_fails_closed(
     # the probe must surface as a breach rather than swallow as "clean".
     ctx.base_commit = "0" * 40
 
-    violations = agent_runner._containment_breach(ctx)
+    violations = runner_containment._containment_breach(ctx)
     assert violations, "un-runnable containment check must be treated as a breach"
     assert any("could not run" in v for v in violations), violations
 
@@ -837,11 +843,11 @@ def test_h8f_containment_abort_on_git_error_exits_four(
     ctx = _enforce_ctx(seeded_repo)
 
     def raise_check(_ctx: object) -> list[str]:
-        raise agent_runner.ContainmentCheckError("cannot diff base..HEAD")
+        raise runner_core.ContainmentCheckError("cannot diff base..HEAD")
 
-    monkeypatch.setattr(agent_runner, "_committed_paths", raise_check)
+    monkeypatch.setattr(runner_containment, "_committed_paths", raise_check)
 
-    assert agent_runner._containment_abort(ctx) is True
+    assert runner_containment._containment_abort(ctx) is True
     report = seeded_repo / ".harness" / "logs" / "FAILED_AGENT_RUN.md"
     assert report.exists()
 
@@ -917,15 +923,15 @@ def test_h9b_harness_managed_classification(
     (harness / "stray.py").write_text("x = 1\n", encoding="utf-8")
 
     # Kept (managed): logs, telemetry, manifest, and a well-formed journal blob.
-    assert agent_runner._is_harness_managed(repo_dir, ".harness/logs/FAILED_AGENT_RUN.md")
-    assert agent_runner._is_harness_managed(repo_dir, ".harness/telemetry/usage.json")
-    assert agent_runner._is_harness_managed(repo_dir, ".harness/contracts.lock")
-    assert agent_runner._is_harness_managed(repo_dir, ".harness/journal/t.json")
+    assert runner_recovery._is_harness_managed(repo_dir, ".harness/logs/FAILED_AGENT_RUN.md")
+    assert runner_recovery._is_harness_managed(repo_dir, ".harness/telemetry/usage.json")
+    assert runner_recovery._is_harness_managed(repo_dir, ".harness/contracts.lock")
+    assert runner_recovery._is_harness_managed(repo_dir, ".harness/journal/t.json")
     # Removed (not managed): a smuggled .py, malformed json, or a stray file
     # outside the managed subtrees -- all junk rollback must clean up.
-    assert not agent_runner._is_harness_managed(repo_dir, ".harness/journal/payload.py")
-    assert not agent_runner._is_harness_managed(repo_dir, ".harness/journal/bad.json")
-    assert not agent_runner._is_harness_managed(repo_dir, ".harness/stray.py")
+    assert not runner_recovery._is_harness_managed(repo_dir, ".harness/journal/payload.py")
+    assert not runner_recovery._is_harness_managed(repo_dir, ".harness/journal/bad.json")
+    assert not runner_recovery._is_harness_managed(repo_dir, ".harness/stray.py")
 
 
 def test_h9c_rollback_checkout_failure_is_fail_loud(
@@ -954,11 +960,11 @@ def test_h9c_rollback_checkout_failure_is_fail_loud(
             self.git_warnings: list[str] = []
             self.rollback_ok = True
 
-    monkeypatch.setattr(agent_runner, "_release_lease", lambda ctx, commit: None)
-    monkeypatch.setattr(agent_runner, "_repo_dir", lambda ctx: str(tmp_path))
+    monkeypatch.setattr(runner_recovery, "_release_lease", lambda ctx, commit: None)
+    monkeypatch.setattr(runner_recovery, "_repo_dir", lambda ctx: str(tmp_path))
 
     ctx = _Ctx()
-    agent_runner._rollback(ctx)
+    runner_recovery._rollback(ctx)
 
     assert ctx.rollback_ok is False
     assert any("stranded" in w for w in ctx.git_warnings)
@@ -1011,8 +1017,8 @@ def test_h10a_dirty_worktree_after_block_is_mechanical(
     (seeded_repo / "harness" / "example" / "src" / "db" / "queries.py").write_text(
         "# q\nx = 1\n", encoding="utf-8"
     )
-    monkeypatch.setattr(agent_runner.subprocess, "run", lambda *a, **k: _FakeCommit())
-    status, _ = agent_runner.enforce(ctx)
+    monkeypatch.setattr(runner_states.subprocess, "run", lambda *a, **k: _FakeCommit())
+    status, _ = runner_states.enforce(ctx)
     assert status == "mechanical"
 
 
@@ -1023,8 +1029,8 @@ def test_h10b_clean_worktree_after_block_is_semantic(
     ctx = _enforce_ctx(seeded_repo)
     # Nothing changed on disk: a blocked commit that left the tree as staged is
     # a genuine semantic/lock rejection.
-    monkeypatch.setattr(agent_runner.subprocess, "run", lambda *a, **k: _FakeCommit())
-    status, _ = agent_runner.enforce(ctx)
+    monkeypatch.setattr(runner_states.subprocess, "run", lambda *a, **k: _FakeCommit())
+    status, _ = runner_states.enforce(ctx)
     assert status == "semantic"
 
 
@@ -1041,7 +1047,7 @@ def test_h11a_allowlist_scopes_seam_env(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setenv("AGENT_AWS_SECRET_KEY", "leak")
     monkeypatch.setenv("GIT_ASKPASS", "leak")
 
-    env = agent_runner._seam_base_env()
+    env = runner_llm._seam_base_env()
     assert env.get("FOO") == "1"
     assert env.get("BAR") == "2"
     assert "SECRET" not in env
@@ -1055,7 +1061,7 @@ def test_h11a2_allowlist_admits_named_git_var(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setenv("GIT_ASKPASS", "/usr/bin/askpass")
     monkeypatch.setenv("AGENT_AWS_SECRET_KEY", "leak")
 
-    env = agent_runner._seam_base_env()
+    env = runner_llm._seam_base_env()
     assert env.get("GIT_ASKPASS") == "/usr/bin/askpass"
     assert "AGENT_AWS_SECRET_KEY" not in env
 
@@ -1063,7 +1069,7 @@ def test_h11a2_allowlist_admits_named_git_var(monkeypatch: pytest.MonkeyPatch) -
 def test_h11b_no_allowlist_is_full_copy(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("AGENT_ENV_ALLOWLIST", raising=False)
     monkeypatch.setenv("SECRET", "inherited")
-    env = agent_runner._seam_base_env()
+    env = runner_llm._seam_base_env()
     assert env.get("SECRET") == "inherited"  # default behaviour unchanged
 
 
@@ -1073,10 +1079,10 @@ def test_h11e_skip_override_never_inherited_by_seam(monkeypatch: pytest.MonkeyPa
     monkeypatch.setenv("SKIP_AGENT_HARNESS", "1")
 
     monkeypatch.delenv("AGENT_ENV_ALLOWLIST", raising=False)
-    assert "SKIP_AGENT_HARNESS" not in agent_runner._seam_base_env()  # full-copy mode
+    assert "SKIP_AGENT_HARNESS" not in runner_llm._seam_base_env()  # full-copy mode
 
     monkeypatch.setenv("AGENT_ENV_ALLOWLIST", "SKIP_AGENT_HARNESS")  # even if allowlisted
-    assert "SKIP_AGENT_HARNESS" not in agent_runner._seam_base_env()
+    assert "SKIP_AGENT_HARNESS" not in runner_llm._seam_base_env()
 
 
 def test_h11c_missing_allowlist_warns_once_and_reports_full_copy(seeded_repo: Path) -> None:
@@ -1180,7 +1186,7 @@ def test_h13a_guard_penalty_does_not_charge_autorepair(
     # legitimate autorepair budget. The flag is stripped, so the sanitized
     # `git commit -m noop` is a harmless no-op on the clean fixture tree.
     monkeypatch.setenv("AGENT_LLM_CMD", "git commit --no-verify -m noop")
-    agent_runner._run_llm(ctx, "mutate")
+    runner_llm._run_llm(ctx, "mutate")
     assert ctx.guard_penalties == 1
     assert ctx.autorepair_attempts == 0
 
@@ -1243,9 +1249,9 @@ def test_h14_stripped_frontmatter_is_okf_violation(seeded_repo: Path) -> None:
     _git(seeded_repo, "add", "-A")
     _git(seeded_repo, "commit", "-m", "strip okf frontmatter")
 
-    problems = agent_runner._okf_violations(ctx)
+    problems = runner_containment._okf_violations(ctx)
     assert any("API_SCHEMA.md" in p for p in problems), problems
-    breaches = agent_runner._containment_breach(ctx)
+    breaches = runner_containment._containment_breach(ctx)
     assert any("OKF info-layer violation" in b for b in breaches), breaches
 
 
@@ -1254,7 +1260,7 @@ def test_h14b_conformant_spec_doc_is_not_a_violation(seeded_repo: Path) -> None:
     _git(seeded_repo, "add", "-A")
     _git(seeded_repo, "commit", "-m", "add conformant spec doc")
 
-    assert agent_runner._okf_violations(ctx) == []
+    assert runner_containment._okf_violations(ctx) == []
 
 
 # --------------------------------------------------------------------------- #
@@ -1340,7 +1346,7 @@ def test_h16_harden_git_env_drops_config_env_family() -> None:
         "GIT_CONFIG_VALUE_0": "/tmp/evil",
         "PATH": "/usr/bin",
     }
-    agent_runner._harden_git_env(env)
+    runner_llm._harden_git_env(env)
     assert env["GIT_CONFIG_NOSYSTEM"] == "1"
     assert env["PATH"] == "/usr/bin"
     for gone in (
@@ -1364,7 +1370,7 @@ def test_h17a_load_ledger_rejects_off_version(
     monkeypatch.chdir(tmp_path)
     (tmp_path / "AGENTS.md").write_text(f"schema_version: {bad}\ntasks: {{}}\n", encoding="utf-8")
     with pytest.raises(SystemExit):
-        agent_runner._load_ledger()
+        runner_core._load_ledger()
 
 
 def test_h17b_load_ledger_accepts_supported_version(
@@ -1372,7 +1378,7 @@ def test_h17b_load_ledger_accepts_supported_version(
 ) -> None:
     monkeypatch.chdir(tmp_path)
     (tmp_path / "AGENTS.md").write_text("schema_version: 1\ntasks: {}\n", encoding="utf-8")
-    assert agent_runner._load_ledger()["tasks"] == {}
+    assert runner_core._load_ledger()["tasks"] == {}
 
 
 # --------------------------------------------------------------------------- #
@@ -1402,7 +1408,7 @@ def test_h18b_record_attempt_cleans_log_excerpt() -> None:
 def test_h19_open_pr_manual_hint_strips_newlines(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    monkeypatch.setattr(agent_runner.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(runner_reconcile.shutil, "which", lambda _name: None)
     task = agent_runner.TaskSpec(
         task_id="t",
         description="",
@@ -1421,6 +1427,6 @@ def test_h19_open_pr_manual_hint_strips_newlines(
     ctx = agent_runner.RunContext(
         repo=None, task=task, dry_run=False, agent_id="a", base_commit="b"
     )
-    agent_runner._open_pr(ctx)
+    runner_reconcile._open_pr(ctx)
     out = capsys.readouterr().out
     assert "\n[agent_runner] spoofed" not in out
