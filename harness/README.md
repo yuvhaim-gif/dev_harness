@@ -71,40 +71,43 @@ This README documents what is actually implemented in the repository:
 
 ```mermaid
 flowchart TD
-    A["<b>1 · Initialize</b><br/>parse ledger<br/>recover handover"]
-    B["<b>2 · Isolate</b><br/>claim lease<br/>create branch"]
+    %% happy-path spine (top -> bottom)
+    A["<b>1 · Initialize</b><br/>parse ledger · recover handover"]
+    B["<b>2 · Isolate</b><br/>claim lease · create branch"]
     C["<b>3 · Mutate</b><br/>invoke AGENT_LLM_CMD"]
-    D["<b>4 · Enforce</b><br/>scoped stage<br/>gated commit"]
-    E["<b>Autorepair</b><br/>condense log<br/>cache-ordered prompt to LLM"]
-    F["<b>5 · Reconcile</b><br/>push · PR · release lease<br/>journal 'pushed'"]
-
     G{"Post-step<br/>safety checks"}
+    D["<b>4 · Enforce</b><br/>scoped stage · gated commit"]
     P{"Containment gate<br/>base..HEAD"}
     S{"Staleness check<br/>vs shared ref"}
-    C2["Re-stage and<br/>retry once"]
+    F["<b>5 · Reconcile</b><br/>push · PR · release lease"]
 
+    %% enforce repair loop
+    C2["Re-stage,<br/>retry once"]
+    E["<b>Autorepair</b><br/>condense log<br/>cache-ordered prompt"]
+
+    %% terminals
     R0(["<b>Abort</b><br/>refuse to collide"])
-    X3(["<b>exit 3</b><br/>forensic + rollback"])
-    X4(["<b>exit 4</b><br/>containment breach<br/>forensic + rollback"])
-    R1(["<b>exit 1</b><br/>journal 'escalated'<br/>forensic + rollback"])
-    R2(["<b>exit 1</b><br/>journal 'stale'<br/>refuse push"])
+    X3(["<b>exit 3</b><br/>token/cost or timeout<br/>forensic + rollback"])
+    X4a(["<b>exit 4</b><br/>bypass / out-of-scope<br/>forensic + rollback"])
+    X4b(["<b>exit 4</b><br/>containment breach<br/>forensic + rollback"])
+    R1(["<b>exit 1</b><br/>escalated<br/>forensic + rollback"])
+    R2(["<b>exit 1</b><br/>stale · refuse push"])
 
-    A --> B
-    B -->|lease held by another agent| R0
-    B --> C
-    C --> G
-    G -->|token/cost or time ceiling breached| X3
-    G -->|hook-bypass or out-of-scope commit| X4
+    A --> B --> C --> G
     G -->|clear| D
+    D -->|passed| P
+    P -->|clean| S
+    S -->|fresh| F
+
+    B -->|lease held by<br/>another agent| R0
+    G -->|token/cost or<br/>time ceiling| X3
+    G -->|hook-bypass or<br/>out-of-scope commit| X4a
     D -->|mechanical fix| C2 --> D
     D -->|semantic failure| E
     E -->|attempts left| C
     E -->|cap exceeded| R1
-    D -->|passed| P
-    P -->|breach| X4
-    P -->|clean| S
+    P -->|breach| X4b
     S -->|stale| R2
-    S -->|fresh| F
 
     classDef state fill:#1f6feb,stroke:#0d419d,color:#ffffff;
     classDef decision fill:#9e6a03,stroke:#7d5300,color:#ffffff;
@@ -114,7 +117,7 @@ flowchart TD
     class A,B,C,D,E state;
     class G,P,S decision;
     class F success;
-    class R0,X3,X4,R1,R2 abort;
+    class R0,X3,X4a,X4b,R1,R2 abort;
 ```
 
 | State | What it does |
