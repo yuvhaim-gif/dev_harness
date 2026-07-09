@@ -538,6 +538,43 @@ def test_h5g_append_log_is_dated_newest_first(tmp_path: Path) -> None:
     assert okf.validate_concept_text(body, path=str(log_path), is_contract=False) == []
 
 
+def test_h5h_forensic_breach_list_matches_committed_state_gate(
+    seeded_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Regression: the forensic "containment breach attempts" list must be sourced
+    # from committed history (base..HEAD) -- the same authoritative footing as
+    # runner_containment._containment_breach -- so a benign untracked scratch file
+    # is NEVER mislabeled a breach on an escalation that had nothing to do with
+    # scope (e.g. a timeout abort). Committed out-of-allowlist changes still are.
+    monkeypatch.chdir(seeded_repo)
+    ctx = _enforce_ctx(seeded_repo)
+
+    # A mundane untracked scratch file left in the working tree.
+    (seeded_repo / "scratch_notes.txt").write_text("just a note\n", encoding="utf-8")
+
+    report = runner_recovery._build_forensic_report(
+        ctx, "escalated", "timeout abort -- step timeout", exit_code=3
+    )
+    assert report is not None
+    # Transparency: it may still surface in the "actually modified" list ...
+    assert "scratch_notes.txt" in report.modified
+    # ... but must NOT be flagged as a containment breach attempt.
+    assert "scratch_notes.txt" not in report.out_of_scope
+    assert report.out_of_scope == []
+
+    # A genuinely committed out-of-allowlist change IS a breach and is reported.
+    (seeded_repo / "secret.py").write_text("x = 1\n", encoding="utf-8")
+    _git(seeded_repo, "add", "secret.py")
+    _git(seeded_repo, "commit", "-m", "out-of-scope commit")
+
+    report2 = runner_recovery._build_forensic_report(
+        ctx, "escalated", "timeout abort -- step timeout", exit_code=3
+    )
+    assert report2 is not None
+    assert "secret.py" in report2.out_of_scope
+    assert "scratch_notes.txt" not in report2.out_of_scope
+
+
 # --------------------------------------------------------------------------- #
 # H5d. Coordination-payload validator (allowlist exemption is content-aware)
 # --------------------------------------------------------------------------- #

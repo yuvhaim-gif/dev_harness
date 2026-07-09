@@ -182,6 +182,26 @@ def _modified_paths(ctx: RunContext) -> list[str]:
     return sorted(seen)
 
 
+def _committed_out_of_scope(ctx: RunContext, allow: list[str]) -> list[str]:
+    """Out-of-allowlist paths in *committed* history (``base..HEAD``).
+
+    Mirrors the authoritative containment gate
+    (``runner_containment._containment_breach``), which inspects committed state
+    only and deliberately ignores uncommitted scratch files. Keeping the forensic
+    breach list on the same footing stops a benign untracked file from being
+    mislabeled a "containment breach attempt" on an escalation unrelated to scope.
+    """
+    if ctx.dry_run or not ctx.base_commit:
+        return []
+    try:
+        out = ctx.repo.git.diff("--name-only", f"{ctx.base_commit}..HEAD")
+    except git.exc.GitCommandError as exc:
+        log(f"WARNING: could not enumerate committed paths: {exc}")
+        return []
+    committed = [p for p in out.splitlines() if p]
+    return sorted(p for p in committed if p not in allow and not is_coordination_path(p))
+
+
 def _build_forensic_report(
     ctx: RunContext, outcome: str, reason: str, exit_code: int | None
 ) -> forensic.ForensicReport | None:
@@ -200,7 +220,7 @@ def _build_forensic_report(
         return None
     allow = sorted(compute_allowlist(ctx.task.raw))
     modified = _modified_paths(ctx)
-    out_of_scope = sorted(p for p in modified if p not in allow and not is_coordination_path(p))
+    out_of_scope = _committed_out_of_scope(ctx, allow)
     excerpt = log_condenser.condense(ctx.last_hook_log, repo_dir=_repo_dir(ctx))
     return forensic.ForensicReport(
         task_id=ctx.task.task_id,
