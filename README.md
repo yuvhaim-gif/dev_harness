@@ -129,6 +129,20 @@ flowchart TD
     class R0,X3,X4a,X4b,R1,R2 abort;
 ```
 
+**Exit codes.** The diagram shows the terminal states of the loop itself. The
+full set the orchestrator can return:
+
+- **`0`** — success (`pushed`, `local`, or a `--dry-run` plan).
+- **`1`** — soft stop: autorepair cap `escalated`, staleness-`refused push`, a
+  recoverable `error` (push failed / unhandled exception), or an operator-aborted
+  `--release`.
+- **`2`** — **CLI usage error**, raised in `main()` *before* the loop starts (no
+  `--task` / `AGENT_TASK_ID`, or an unsafe id passed to `--release`). This is why
+  `2` never appears among the loop terminals above.
+- **`3`** — budget or time-ceiling abort (`BUDGET_ABORT_EXIT`; a timeout stamps a
+  distinct reason but shares the code).
+- **`4`** — containment breach (`CONTAINMENT_ABORT_EXIT`).
+
 | State | What it does |
 |-------|--------------|
 | **Initialize** | Open the repo, refuse a dirty tree, pull only if a tracking `origin` exists, parse `AGENTS.md`, reject an unsupported `schema_version`, generate / reuse an `AGENT_ID`, and recover the latest unresolved handover journal (locally and from the shared state ref). |
