@@ -6,6 +6,94 @@ commit time. An agent may only touch the files a task explicitly declares;
 everything else is locked, and the orchestrator never leaves the repository in
 a half-broken state.
 
+## The problem it solves
+
+**The problem.** An autonomous / LLM coding agent turned loose on your
+repository can edit files it was never meant to touch, silently change a stable
+API, or leave the working tree half-broken when it fails mid-task.
+
+**The solution.** You declare, *per task*, exactly which files an agent may
+change. Everything else is locked. The rules are enforced three times — when the
+agent commits, again on the committed history right after, and a third time in
+CI — so nothing out of scope can reach a merged branch.
+
+> **The guarantee:** *nothing outside a task's declared allowlist reaches a
+> reviewed, pushed branch.*
+
+**Who this is for**
+
+- **Use it** if you run automated / LLM agents against a real repository and
+  need hard, verifiable limits on what they may change.
+- **You may not need it** if you only run a single trusted agent on a throwaway
+  branch — [minimal mode](#minimal-mode) collapses most of the machinery.
+- **It is not a sandbox.** It constrains what reaches a branch, not what the
+  agent process can do to your machine — run untrusted backends in a
+  container / VM.
+
+## Quick start
+
+```bash
+git init -b main                 # the project assumes a `main` branch
+python -m venv .venv             # create a virtualenv
+.venv\Scripts\activate           # POSIX: source .venv/bin/activate
+pip install .[dev]               # runtime + ruff / mypy / pytest
+pre-commit install               # register the local commit gates
+python -m harness --init         # stamp your README + an empty AGENTS.md
+python -m harness --doctor       # one-pass health check
+```
+
+<details>
+<summary>What each step does</summary>
+
+- **`git init -b main`** — the harness expects the `main` branch; don't rely on a
+  bare `git init`.
+- **virtualenv + `pip install .[dev]`** — installs the runtime deps plus the
+  lint/type/test tools the gates use.
+- **`pre-commit install`** — wires the file-lock, contract, and OKF hooks into
+  local git.
+- **`python -m harness --init`** — replaces the template README with a project
+  stub and seeds an empty `AGENTS.md` (`--example` reproduces the demo ledger).
+- **`python -m harness --doctor`** — reports the health of every coordination
+  subsystem; safe to run any time.
+
+</details>
+
+See [Setup](#setup) and [Running the orchestrator](#running-the-orchestrator)
+for the full walkthrough.
+
+## How it works in 5 steps
+
+1. **Declare** a task's file scope in `AGENTS.md` — its `targets`, `tests`, and
+   `spec_docs`.
+2. **Isolate** — the harness claims a TTL'd lease and cuts a dedicated work
+   branch.
+3. **Mutate** — it invokes your agent (`AGENT_LLM_CMD`) to edit *only* the
+   allowed files.
+4. **Enforce** — it stages just the allowlist and commits behind the lock /
+   contract hooks, auto-repairing test failures within a budget.
+5. **Reconcile** — it re-inspects the committed history, guards against a moved
+   base branch, then pushes and opens a PR.
+
+The full state machine — including the abort, budget, and repair paths — is the
+[five-state loop](#the-five-state-loop) below.
+
+## Key concepts
+
+| Term | In one line |
+|------|-------------|
+| **Ledger (`AGENTS.md`)** | YAML file where each task declares the files an agent may touch. |
+| **Allowlist** | The exact set of paths a task may change; everything else is locked. |
+| **`evolve` / `isolated`** | Task modes: `evolve` may edit specs + tests + targets; `isolated` only targets. |
+| **Lease** | A short-lived claim on a task so two agents never work it at once. |
+| **Handover journal** | An append-only record of each run, recovered by the next agent. |
+| **Contract** | A stable spec doc, hash-pinned; changing it must co-change a bound test. |
+| **OKF** | [Open Knowledge Format](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md) — the frontmatter standard the `spec_docs` follow. |
+| **Containment gate** | Post-commit check of committed history; aborts (**exit 4**) on any breach. |
+| **Staleness guard** | Refuses to push if the shared branch moved under the agent's feet. |
+| **`--doctor`** | Read-only health report across every coordination subsystem. |
+
+---
+
 This README documents what is actually implemented in the repository:
 
 - the **orchestrator** and its five-state loop;
@@ -34,6 +122,10 @@ This README documents what is actually implemented in the repository:
 
 ## Contents
 
+- [The problem it solves](#the-problem-it-solves)
+- [Quick start](#quick-start)
+- [How it works in 5 steps](#how-it-works-in-5-steps)
+- [Key concepts](#key-concepts)
 - [The five-state loop](#the-five-state-loop)
 - [Repository layout](#repository-layout)
 - [The operational ledger (`AGENTS.md`)](#the-operational-ledger-agentsmd)
@@ -893,6 +985,9 @@ a breach — **exit 4** — rather than a clean pass, mirroring the fail-safe us
 
 ### Known failure modes & how they are handled
 
+<details>
+<summary>Full failure-mode / mitigation matrix (click to expand)</summary>
+
 | Failure mode | Symptom | Mitigation |
 |--------------|---------|------------|
 | Stale / orphaned lease | a crashed agent leaves a lease behind | TTL (3600s) makes it reclaimable; `--doctor` shows `expired`; rollback releases it |
@@ -916,6 +1011,8 @@ a breach — **exit 4** — rather than a clean pass, mirroring the fail-safe us
 | OKF info-layer corruption | an evolve-mode edit strips a spec_doc's `type` or adds a volatile `timestamp` to a contract, degrading the durable knowledge layer | `okf.verify()` runs at four layers: `validate-okf` pre-commit (exit 1), post-hoc containment gate (exit 4, re-validated from the committed blob), CI re-check, and `--doctor` |
 | Budget breach | token/USD ceiling exceeded mid-run | immediate financial abort, rollback, forensic report, exit 3. **Caveat:** the token/cost figures are **self-reported** by `AGENT_LLM_CMD` via `usage.json`; a backend that reports zero (malicious or broken) never trips `MAX_TOTAL_TOKENS` / `MAX_RUN_COST_USD`. Budgeting is an accounting aid over a *trusted input*, not a metered control — meter spend at your provider/proxy if the backend is untrusted |
 | Coordination layer is overkill | single-agent run, shared-ref machinery unwanted | `AGENT_MINIMAL=1` keeps local locking, drops the shared ref |
+
+</details>
 
 ### Honest limitations
 
