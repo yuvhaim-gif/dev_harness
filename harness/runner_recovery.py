@@ -239,6 +239,31 @@ def _committed_out_of_scope(ctx: RunContext, allow: list[str]) -> list[str]:
     return sorted(p for p in committed if p not in allow and not is_coordination_path(p))
 
 
+def _capture_work_diff(ctx: RunContext) -> tuple[str, str, str]:
+    """Snapshot the work-branch delta vs. base *before* rollback deletes it.
+
+    Returns ``(tip_short_sha, diffstat, full_patch)``. The forensic report is
+    built while the work branch is still ``HEAD``, so this preserves exactly what
+    the agent tried -- committed and uncommitted tracked changes alike -- as
+    durable text under ``.harness/logs/``. That is why the later ``git branch -D``
+    never costs an operator the diff: the record does not depend on the dangling
+    commit surviving the host's next ``git gc``. A git failure is non-fatal: it
+    degrades to an empty capture plus a warning, never blocking the abort.
+    """
+    if ctx.dry_run or not ctx.base_commit:
+        return ("", "", "")
+    try:
+        sha = ctx.repo.git.rev_parse("--short", "HEAD")
+        diffstat = ctx.repo.git.diff("--stat", ctx.base_commit)
+        patch = ctx.repo.git.diff(ctx.base_commit)
+    except git.exc.GitCommandError as exc:
+        warning = f"could not capture work-branch diff for forensics: {exc}"
+        log(f"WARNING: {warning}")
+        ctx.git_warnings.append(warning)
+        return ("", "", "")
+    return (sha.strip(), diffstat.strip(), patch)
+
+
 def _build_forensic_report(
     ctx: RunContext, outcome: str, reason: str, exit_code: int | None
 ) -> forensic.ForensicReport | None:
@@ -259,6 +284,8 @@ def _build_forensic_report(
     modified = _modified_paths(ctx)
     out_of_scope = _committed_out_of_scope(ctx, allow)
     excerpt = log_condenser.condense(ctx.last_hook_log, repo_dir=_repo_dir(ctx))
+    work_commit, work_diffstat, work_patch = _capture_work_diff(ctx)
+    ctx.work_patch = work_patch
     return forensic.ForensicReport(
         task_id=ctx.task.task_id,
         mutation_mode=ctx.task.mutation_mode,
@@ -266,6 +293,8 @@ def _build_forensic_report(
         reason=reason,
         base_commit=ctx.base_commit,
         work_branch=ctx.work_branch,
+        work_commit=work_commit,
+        work_diffstat=work_diffstat,
         error_code=exit_code,
         allowed=allow,
         modified=modified,
@@ -299,6 +328,12 @@ def _emit_forensic_report(ctx: RunContext, report: forensic.ForensicReport | Non
     try:
         forensic.write_okf_postmortem(report, repo_dir=repo_dir)
         forensic.append_log(report, repo_dir=repo_dir)
+        # Preserve the agent's attempted diff before the work branch is deleted,
+        # so escalated runs stay inspectable without racing the host's git gc.
+        if ctx.work_patch:
+            patch_path = forensic.write_work_patch(report, ctx.work_patch, repo_dir=repo_dir)
+            if patch_path:
+                log(f"captured work-branch diff for forensics: {patch_path}")
     except OSError as exc:
         log(f"WARNING: could not write OKF memory artifacts: {exc}")
     forensic.print_badge(report.outcome, path)

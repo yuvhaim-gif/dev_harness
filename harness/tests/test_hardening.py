@@ -434,6 +434,7 @@ class _EmitCtx:
         self.dry_run = False
         self.forensic_written = False
         self.rollback_ok = rollback_ok
+        self.work_patch = ""
         self.git_warnings: list[str] = []
 
 
@@ -941,6 +942,13 @@ def test_h9_rollback_removes_agent_untracked_files(seeded_repo: Path) -> None:
         b for b in _git(seeded_repo, "branch", "--list", "agent/*").stdout.splitlines() if b
     ]
     assert len(work_branches) == 1, work_branches
+    # The agent's attempted diff is snapshotted durably before any branch
+    # cleanup, so an escalated run stays inspectable as plain text (immune to
+    # git gc) even once the branch would be deleted. The out-of-band commit
+    # added escaped.py, so the captured patch must contain it.
+    patches = list((seeded_repo / ".harness" / "logs").glob("*.patch"))
+    assert len(patches) == 1, patches
+    assert "escaped.py" in patches[0].read_text(encoding="utf-8")
 
 
 def test_h9b_harness_managed_classification(
@@ -1099,6 +1107,93 @@ def test_h9g_rollback_branch_delete_failure_is_nonfatal(
     assert ctx.rollback_ok is True
     assert fake_git.branch_calls == [("-D", ctx.work_branch)]
     assert any("work-branch cleanup failed" in w for w in ctx.git_warnings)
+
+
+class _DiffGit:
+    """Fake git exposing rev-parse/diff for the forensic diff-capture path."""
+
+    def __init__(
+        self,
+        sha: str = "abc1234",
+        diffstat: str = " f.py | 2 +-\n 1 file changed\n",
+        patch: str = "diff --git a/f.py b/f.py\n+x = 1\n",
+        raises: bool = False,
+    ) -> None:
+        self._sha = sha
+        self._diffstat = diffstat
+        self._patch = patch
+        self._raises = raises
+
+    def rev_parse(self, *a: str) -> str:
+        if self._raises:
+            raise git.exc.GitCommandError(["git", "rev-parse", *a], 1)
+        return f"{self._sha}\n"
+
+    def diff(self, *a: str) -> str:
+        if self._raises:
+            raise git.exc.GitCommandError(["git", "diff", *a], 1)
+        return self._diffstat if "--stat" in a else self._patch
+
+
+class _DiffCtx:
+    def __init__(
+        self, git_obj: _DiffGit, base_commit: str = "basesha", dry_run: bool = False
+    ) -> None:
+        self.dry_run = dry_run
+        self.base_commit = base_commit
+        self.repo = type("R", (), {"git": git_obj})()
+        self.git_warnings: list[str] = []
+
+
+def test_h9h_capture_work_diff_snapshots_sha_stat_and_patch() -> None:
+    # Before rollback deletes the work branch, the agent's delta vs. base is
+    # snapshotted (tip SHA + diffstat + full patch) so the forensic record does
+    # not depend on the dangling commit surviving the host's next git gc.
+    ctx = _DiffCtx(_DiffGit())
+    sha, diffstat, patch = runner_recovery._capture_work_diff(ctx)  # type: ignore[arg-type]
+    assert sha == "abc1234"
+    assert "f.py" in diffstat
+    assert patch.startswith("diff --git")
+    assert ctx.git_warnings == []
+
+    # No base commit (or a dry run) means nothing to capture -- empty, no error.
+    assert runner_recovery._capture_work_diff(_DiffCtx(_DiffGit(), base_commit="")) == ("", "", "")  # type: ignore[arg-type]
+    assert runner_recovery._capture_work_diff(_DiffCtx(_DiffGit(), dry_run=True)) == ("", "", "")  # type: ignore[arg-type]
+
+
+def test_h9i_capture_work_diff_git_failure_is_nonfatal() -> None:
+    # A git error while snapshotting must never break the abort: it degrades to
+    # an empty capture and a recorded warning, so rollback still proceeds.
+    ctx = _DiffCtx(_DiffGit(raises=True))
+    assert runner_recovery._capture_work_diff(ctx) == ("", "", "")  # type: ignore[arg-type]
+    assert any("could not capture work-branch diff" in w for w in ctx.git_warnings)
+
+
+def test_h9j_report_renders_snapshot_and_write_work_patch(tmp_path: Path) -> None:
+    # The snapshot surfaces in the report (tip SHA + diffstat + patch pointer)
+    # and the full patch is written durably under .harness/logs/; an empty patch
+    # writes no file.
+    report = forensic.ForensicReport(
+        task_id="t",
+        mutation_mode="isolated",
+        outcome="escalated",
+        work_branch="agent/optimise_query_layer/20260101T000000Z-abc123",
+        work_commit="abc1234",
+        work_diffstat=" f.py | 2 +-",
+    )
+    text = forensic.render(report)
+    assert "Work-branch snapshot" in text
+    assert "abc1234" in text
+    assert ".patch" in text
+
+    patch_text = "diff --git a/f.py b/f.py\n+x = 1\n"
+    written = forensic.write_work_patch(report, patch_text, repo_dir=str(tmp_path))
+    assert written is not None
+    assert Path(written).read_text(encoding="utf-8") == patch_text
+    assert Path(written).name.endswith(".patch")
+
+    # Nothing to capture -> no file created.
+    assert forensic.write_work_patch(report, "   ", repo_dir=str(tmp_path)) is None
 
 
 def test_h9d_coordination_payload_free_text_is_structural_only() -> None:

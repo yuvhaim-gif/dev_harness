@@ -33,6 +33,8 @@ class ForensicReport:
     reason: str = ""
     base_commit: str = ""
     work_branch: str = ""
+    work_commit: str = ""
+    work_diffstat: str = ""
     error_code: int | None = None
     allowed: list[str] = field(default_factory=list)
     modified: list[str] = field(default_factory=list)
@@ -47,6 +49,10 @@ class ForensicReport:
 
 def report_path(repo_dir: str = ".", report_dir: str = REPORT_DIR) -> str:
     return os.path.join(repo_dir, report_dir, REPORT_NAME)
+
+
+def work_patch_path(work_branch: str, repo_dir: str = ".", report_dir: str = REPORT_DIR) -> str:
+    return os.path.join(repo_dir, report_dir, f"{_slug(work_branch or 'work')}.patch")
 
 
 def _fmt_list(items: list[str]) -> str:
@@ -114,6 +120,20 @@ def render(report: ForensicReport) -> str:
     lines.append(_fmt_list(sorted(report.out_of_scope)).rstrip("\n"))
     lines.append("")
 
+    if report.work_commit or report.work_diffstat:
+        lines.append("**Work-branch snapshot (captured before the branch was deleted):**")
+        lines.append("")
+        if report.work_commit:
+            lines.append(f"- dropped tip commit: `{report.work_commit}`")
+        if report.work_diffstat:
+            rel_patch = f"{REPORT_DIR}/{_slug(report.work_branch or 'work')}.patch"
+            lines.append(f"- full patch: `{rel_patch}` (inspect: `git apply --stat {rel_patch}`)")
+            lines.append("")
+            lines.append("```")
+            lines.append(report.work_diffstat.strip())
+            lines.append("```")
+        lines.append("")
+
     lines.append("## 2. Errors, Assertions & Policy Warnings")
     lines.append("")
     if report.git_warnings:
@@ -154,6 +174,25 @@ def write_report(report: ForensicReport, repo_dir: str = ".") -> str:
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "w", encoding="utf-8", newline="\n") as fh:
         fh.write(render(report))
+    return path
+
+
+def write_work_patch(report: ForensicReport, patch_text: str, repo_dir: str = ".") -> str | None:
+    """Persist the full work-branch diff next to the report before deletion.
+
+    Returns the path written, or ``None`` when there is nothing to capture. The
+    patch lives under the rollback-surviving ``.harness/logs/`` tree, so the
+    agent's attempted changes remain inspectable as plain text even after the
+    work branch ref is force-deleted -- unlike a dangling commit, this is immune
+    to ``git gc``.
+    """
+    if not patch_text.strip():
+        return None
+    path = work_patch_path(report.work_branch, repo_dir)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    body = patch_text if patch_text.endswith("\n") else patch_text + "\n"
+    with open(path, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(body)
     return path
 
 

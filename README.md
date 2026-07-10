@@ -852,7 +852,13 @@ repository size.
 that branch. With the **shared state ref active** (an `origin` is configured and
 minimal mode is off) the journal is published to the ref, so rollback
 **force-deletes the work branch** — failed runs no longer accumulate orphan
-`agent/*` refs. In **minimal mode or without an `origin`** the journal lives
+`agent/*` refs. Before the branch is deleted the harness **snapshots the agent's
+attempted diff**: the full patch is written to `.harness/logs/<branch>.patch` and
+the dropped tip SHA plus a diffstat are recorded in `FAILED_AGENT_RUN.md`. Because
+that record is plain text under the rollback-surviving forensic tree, it is
+**immune to `git gc`** — you can inspect exactly what the agent tried
+(`git apply --stat .harness/logs/<branch>.patch`) long after the ref is gone,
+without racing your host's next prune. In **minimal mode or without an `origin`** the journal lives
 *only* on the work branch, so the branch is deliberately **retained** (its name
 is logged) as the sole local record; prune it manually once you have inspected
 it:
