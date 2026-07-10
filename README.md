@@ -856,9 +856,15 @@ minimal mode is off) the journal is published to the ref, so rollback
 attempted diff**: the full patch is written to `.harness/logs/<branch>.patch` and
 the dropped tip SHA plus a diffstat are recorded in `FAILED_AGENT_RUN.md`. Because
 that record is plain text under the rollback-surviving forensic tree, it is
-**immune to `git gc`** — you can inspect exactly what the agent tried
-(`git apply --stat .harness/logs/<branch>.patch`) long after the ref is gone,
-without racing your host's next prune. In **minimal mode or without an `origin`** the journal lives
+**immune to `git gc` on that machine** — you can inspect exactly what the agent
+tried (`git apply --stat .harness/logs/<branch>.patch`) long after the ref is
+gone, without racing your host's next prune. Note the durability boundary: like
+**every** `.harness/logs/` artifact (the report, OKF postmortems, `log.md`, and
+this patch), it is a **local-disk** record — `.harness/logs/` is gitignored, so
+it is **not committed, not pushed, and not mirrored to the shared state ref**.
+Cross-clone / fresh-checkout recovery is provided by the **handover journal**,
+which *is* published to the shared ref; the patch is a local forensic convenience
+layered on top, not a replacement for it. In **minimal mode or without an `origin`** the journal lives
 *only* on the work branch, so the branch is deliberately **retained** (its name
 is logged) as the sole local record; prune it manually once you have inspected
 it:
