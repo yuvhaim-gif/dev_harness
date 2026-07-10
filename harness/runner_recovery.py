@@ -68,6 +68,11 @@ def _persist_journal(ctx: RunContext, outcome: str, notes: str = "") -> None:
             {posix_path: posix_path},
             message=f"harness: journal {outcome} {ctx.task.task_id} [{ctx.agent_id}]",
         )
+        # Record durability: only once the journal is mirrored off the work
+        # branch (onto the shared ref) is it safe for rollback to delete that
+        # branch. A local-only journal lives *only* on the work branch, so a
+        # failed publish (or minimal / no-origin mode) must keep the branch.
+        ctx.journal_published = ok_pub
         if not ok_pub:
             warning = (
                 f"could not publish '{outcome}' handover journal to the shared ref; "
@@ -109,6 +114,37 @@ def _is_harness_managed(repo_dir: str, path: str) -> bool:
     return False
 
 
+def _cleanup_work_branch(ctx: RunContext) -> None:
+    """Delete the rolled-back work branch once its journal is safely off-branch.
+
+    Called only after the checkout back to the original branch succeeded (so the
+    branch is no longer checked out and can be force-deleted). Force (`-D`) is
+    correct: the branch holds the runner's own commits that the rollback is
+    discarding by design.
+
+    Gated on ``journal_published``: the handover journal is committed *on the
+    work branch*, so deleting the branch is only safe once that journal has been
+    mirrored to the shared state ref. In minimal / no-origin mode, or after a
+    failed publish, the branch is the sole local record -- keep it and log its
+    name for manual pruning. A delete failure is non-fatal (rollback already
+    succeeded); it is recorded as a warning, not an abort.
+    """
+    if not ctx.work_branch:
+        return
+    if not ctx.journal_published:
+        log(
+            f"retained work branch '{ctx.work_branch}' (handover journal not "
+            "mirrored to the shared ref); prune manually after inspection."
+        )
+        return
+    try:
+        ctx.repo.git.branch("-D", ctx.work_branch)
+        log(f"deleted rolled-back work branch '{ctx.work_branch}'.")
+    except git.exc.GitCommandError as exc:
+        log(f"WARNING: could not delete work branch '{ctx.work_branch}': {exc}")
+        ctx.git_warnings.append(f"work-branch cleanup failed: {exc}")
+
+
 def _rollback(ctx: RunContext) -> None:
     if ctx.dry_run or not ctx.branch_created or not ctx.original_branch:
         return
@@ -142,6 +178,7 @@ def _rollback(ctx: RunContext) -> None:
         try:
             ctx.repo.git.checkout(ctx.original_branch)
             log(f"rolled back to original branch '{ctx.original_branch}'.")
+            _cleanup_work_branch(ctx)
             ctx.rollback_ok = reset_ok
             return
         except git.exc.GitCommandError as exc:

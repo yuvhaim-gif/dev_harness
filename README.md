@@ -847,6 +847,20 @@ Un-pruned resolved journals are harmless to correctness — recovery filters by
 task and unresolved outcome, so stale files are ignored; the only cost is
 repository size.
 
+**Work branches.** A rolled-back or escalated run only leaves its
+`agent/<task>/…` branch behind when it cannot mirror the handover journal off
+that branch. With the **shared state ref active** (an `origin` is configured and
+minimal mode is off) the journal is published to the ref, so rollback
+**force-deletes the work branch** — failed runs no longer accumulate orphan
+`agent/*` refs. In **minimal mode or without an `origin`** the journal lives
+*only* on the work branch, so the branch is deliberately **retained** (its name
+is logged) as the sole local record; prune it manually once you have inspected
+it:
+
+```bash
+git branch -D agent/<task>/<stamp>
+```
+
 ---
 
 ## Threat model & failure modes

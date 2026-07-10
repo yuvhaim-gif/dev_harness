@@ -129,6 +129,7 @@ class RunContext:
     ledger: telemetry.TokenLedger = field(default_factory=telemetry.TokenLedger)
     git_warnings: list[str] = field(default_factory=list)
     rollback_ok: bool = False
+    journal_published: bool = False
     forensic_written: bool = False
     runner_commits: set[str] = field(default_factory=set)
     baseline_untracked: frozenset[str] = frozenset()

@@ -935,6 +935,12 @@ def test_h9_rollback_removes_agent_untracked_files(seeded_repo: Path) -> None:
     entries = _git(seeded_repo, "status", "--porcelain").stdout.splitlines()
     leftover = [line for line in entries if ".harness/" not in line]
     assert leftover == [], f"tree not clean after rollback: {leftover}"
+    # No origin here (minimal mode): the handover journal is not mirrored off the
+    # work branch, so rollback RETAINS it as the sole local record (manual prune).
+    work_branches = [
+        b for b in _git(seeded_repo, "branch", "--list", "agent/*").stdout.splitlines() if b
+    ]
+    assert len(work_branches) == 1, work_branches
 
 
 def test_h9b_harness_managed_classification(
@@ -1005,6 +1011,94 @@ def test_h9c_rollback_checkout_failure_is_fail_loud(
 
     assert ctx.rollback_ok is False
     assert any("stranded" in w for w in ctx.git_warnings)
+
+
+class _CleanupGit:
+    """Fake git that records branch operations and lets checkout succeed."""
+
+    def __init__(self, branch_raises: bool = False) -> None:
+        self.branch_calls: list[tuple[str, ...]] = []
+        self._branch_raises = branch_raises
+
+    def reset(self, *a: str) -> str:
+        return ""
+
+    def ls_files(self, *a: str) -> str:
+        return ""
+
+    def checkout(self, *a: str) -> str:
+        return ""
+
+    def branch(self, *a: str) -> str:
+        self.branch_calls.append(a)
+        if self._branch_raises:
+            raise git.exc.GitCommandError(["git", "branch", *a], 1)
+        return ""
+
+
+class _CleanupCtx:
+    def __init__(self, git_obj: _CleanupGit, journal_published: bool) -> None:
+        self.dry_run = False
+        self.branch_created = True
+        self.original_branch = "main"
+        self.work_branch = "agent/optimise_query_layer/20260101T000000Z-abc123"
+        self.journal_published = journal_published
+        self.repo = type("R", (), {"git": git_obj})()
+        self.baseline_untracked: frozenset[str] = frozenset()
+        self.git_warnings: list[str] = []
+        self.rollback_ok = False
+
+
+def test_h9e_rollback_deletes_work_branch_when_journal_published(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # After a clean rollback, once the handover journal is mirrored to the
+    # shared ref (journal_published) the local work branch is force-deleted so
+    # escalated/rolled-back runs do not accumulate orphan agent/<task>/... refs.
+    monkeypatch.setattr(runner_recovery, "_release_lease", lambda ctx, commit: None)
+    monkeypatch.setattr(runner_recovery, "_repo_dir", lambda ctx: str(tmp_path))
+
+    fake_git = _CleanupGit()
+    ctx = _CleanupCtx(fake_git, journal_published=True)
+    runner_recovery._rollback(ctx)  # type: ignore[arg-type]
+
+    assert ctx.rollback_ok is True
+    assert fake_git.branch_calls == [("-D", ctx.work_branch)]
+    assert ctx.git_warnings == []
+
+
+def test_h9f_rollback_retains_work_branch_when_journal_not_published(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Minimal / no-origin mode (or a failed publish) leaves the journal only on
+    # the work branch, so rollback must NOT delete it -- the branch is the sole
+    # local record and is kept for manual pruning.
+    monkeypatch.setattr(runner_recovery, "_release_lease", lambda ctx, commit: None)
+    monkeypatch.setattr(runner_recovery, "_repo_dir", lambda ctx: str(tmp_path))
+
+    fake_git = _CleanupGit()
+    ctx = _CleanupCtx(fake_git, journal_published=False)
+    runner_recovery._rollback(ctx)  # type: ignore[arg-type]
+
+    assert ctx.rollback_ok is True
+    assert fake_git.branch_calls == []
+
+
+def test_h9g_rollback_branch_delete_failure_is_nonfatal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A failed branch delete must never break the rollback: the checkout already
+    # succeeded, so rollback_ok stays True and the failure is a recorded warning.
+    monkeypatch.setattr(runner_recovery, "_release_lease", lambda ctx, commit: None)
+    monkeypatch.setattr(runner_recovery, "_repo_dir", lambda ctx: str(tmp_path))
+
+    fake_git = _CleanupGit(branch_raises=True)
+    ctx = _CleanupCtx(fake_git, journal_published=True)
+    runner_recovery._rollback(ctx)  # type: ignore[arg-type]
+
+    assert ctx.rollback_ok is True
+    assert fake_git.branch_calls == [("-D", ctx.work_branch)]
+    assert any("work-branch cleanup failed" in w for w in ctx.git_warnings)
 
 
 def test_h9d_coordination_payload_free_text_is_structural_only() -> None:
@@ -1467,3 +1561,44 @@ def test_h19_open_pr_manual_hint_strips_newlines(
     runner_reconcile._open_pr(ctx)
     out = capsys.readouterr().out
     assert "\n[agent_runner] spoofed" not in out
+
+
+# --------------------------------------------------------------------------- #
+# H20. CI and pre-commit run mypy with identical strictness (no drift)
+# --------------------------------------------------------------------------- #
+def _precommit_mypy_argv() -> list[str]:
+    import yaml
+
+    config = yaml.safe_load((REPO_ROOT / ".pre-commit-config.yaml").read_text(encoding="utf-8"))
+    for repo in config["repos"]:
+        for hook in repo.get("hooks", []):
+            if hook.get("id") == "mypy":
+                return ["mypy", *hook.get("args", [])]
+    raise AssertionError("no mypy hook found in .pre-commit-config.yaml")
+
+
+def _ci_mypy_argv() -> list[str]:
+    import yaml
+
+    workflow = yaml.safe_load(
+        (REPO_ROOT / ".github" / "workflows" / "harness-ci.yml").read_text(encoding="utf-8")
+    )
+    for job in workflow["jobs"].values():
+        for step in job.get("steps", []):
+            run = step.get("run", "")
+            if "mypy" in run:
+                return run.split()
+    raise AssertionError("no mypy step found in harness-ci.yml")
+
+
+def test_h20_ci_and_precommit_mypy_strictness_match() -> None:
+    # The trusted-runner CI re-check is the authoritative type gate; if it were
+    # more lenient than the local hook (e.g. an extra --ignore-missing-imports),
+    # a missing-stub error could pass CI while blocking developers. Pin them
+    # to the exact same invocation so the strictness can never silently drift.
+    precommit = _precommit_mypy_argv()
+    ci = _ci_mypy_argv()
+    assert precommit == ["mypy", "--strict", "harness"], precommit
+    assert ci == ["mypy", "--strict", "harness"], ci
+    assert "--ignore-missing-imports" not in precommit
+    assert "--ignore-missing-imports" not in ci

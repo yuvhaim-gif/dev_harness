@@ -35,7 +35,7 @@ jobs:
         run: ruff format --check .
 
       - name: Type check
-        run: mypy --strict --ignore-missing-imports harness
+        run: mypy --strict harness
 
       - name: Tests
         run: pytest -q
