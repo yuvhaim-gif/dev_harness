@@ -67,16 +67,6 @@ python -m harness --task <task_id>
 """
 
 
-def _env_float(name: str) -> float | None:
-    raw = (os.getenv(name) or "").strip()
-    if not raw:
-        return None
-    try:
-        return float(raw)
-    except ValueError:
-        return None
-
-
 def _minimal_mode() -> bool:
     """Tier the optional coordination layer off for simple single-agent runs.
 
@@ -167,18 +157,16 @@ def _parse_task(task_id: str) -> TaskSpec:
     if raw is None:
         raise SystemExit(f"ERROR: task '{task_id}' not found in AGENTS.md.")
     attempts_raw = raw.get("max_autorepair_attempts", 3)
+    attempts_err = (
+        f"ERROR: task '{task_id}' max_autorepair_attempts must be an integer, "
+        f"got {attempts_raw!r}."
+    )
     if isinstance(attempts_raw, bool):
-        raise SystemExit(
-            f"ERROR: task '{task_id}' max_autorepair_attempts must be an integer, "
-            f"got {attempts_raw!r}."
-        )
+        raise SystemExit(attempts_err)
     try:
         max_autorepair_attempts = int(attempts_raw)
     except (TypeError, ValueError):
-        raise SystemExit(
-            f"ERROR: task '{task_id}' max_autorepair_attempts must be an integer, "
-            f"got {attempts_raw!r}."
-        ) from None
+        raise SystemExit(attempts_err) from None
     return TaskSpec(
         task_id=task_id,
         description=str(raw.get("description", "")).strip(),

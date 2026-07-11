@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import yaml
+from ledger import LedgerError, load_ledger
 
 RESERVED_INDEX = "index.md"
 RESERVED_LOG = "log.md"
@@ -141,9 +142,13 @@ def verify_paths(spec_map: Mapping[str, bool]) -> list[str]:
 
 
 def _load_ledger(ledger_path: str) -> dict[str, Any]:
-    with open(ledger_path, encoding="utf-8") as fh:
-        data: Any = yaml.safe_load(fh)
-    return data if isinstance(data, dict) else {}
+    # Route through the canonical loader; an unusable ledger (missing, invalid
+    # YAML, non-mapping) yields no spec_docs to validate here -- the dedicated
+    # validate-agents-ledger hook is what fails loudly on a broken AGENTS.md.
+    try:
+        return load_ledger(ledger_path)
+    except LedgerError:
+        return {}
 
 
 def verify(ledger_path: str = "AGENTS.md") -> list[str]:

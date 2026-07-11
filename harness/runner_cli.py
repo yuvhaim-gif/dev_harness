@@ -182,15 +182,24 @@ def doctor() -> int:
         if os.path.isdir(journal_dir)
         else []
     )
+    # One pass over the journal dir feeds both the count and the per-task
+    # latest-unresolved lookup, instead of re-scanning once per declared task.
     unresolved_total = 0
+    latest_by_task: dict[str, dict[str, Any]] = {}
     for name in journal_names:
         try:
             with open(os.path.join(journal_dir, name), encoding="utf-8") as fh:
                 data = json.load(fh)
         except (OSError, json.JSONDecodeError):
             continue
-        if isinstance(data, dict) and data.get("outcome") in journal.UNRESOLVED_OUTCOMES:
-            unresolved_total += 1
+        if not (isinstance(data, dict) and data.get("outcome") in journal.UNRESOLVED_OUTCOMES):
+            continue
+        unresolved_total += 1
+        tid = str(data.get("task_id", ""))
+        current = latest_by_task.get(tid)
+        finished_at = str(data.get("finished_at", ""))
+        if current is None or finished_at >= str(current.get("finished_at", "")):
+            latest_by_task[tid] = data
     print(
         f"  journal files: {len(journal_names)} committed "
         f"({unresolved_total} unresolved); these accumulate by design -- see the "
@@ -203,7 +212,7 @@ def doctor() -> int:
         task_ids = []
     any_unresolved = False
     for task_id in task_ids:
-        entry = journal.latest_unresolved(task_id)
+        entry = latest_by_task.get(str(task_id))
         if entry is not None:
             any_unresolved = True
             print(

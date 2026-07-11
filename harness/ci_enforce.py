@@ -37,6 +37,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import contract_manifest  # noqa: E402
 import okf  # noqa: E402
+from git_blob import read_blob  # noqa: E402
 from ledger import LedgerError, get_task, load_ledger  # noqa: E402
 from lock_policy import (  # noqa: E402
     UnknownMutationModeError,
@@ -105,13 +106,6 @@ def _changed_files(base: str, head: str) -> list[str]:
         print(f"ERROR: could not diff {base}...{head}: {res.stderr.strip()}")
         sys.exit(1)
     return [line for line in res.stdout.splitlines() if line]
-
-
-def _blob_at(ref: str, path: str) -> str | None:
-    # Content of ``path`` at ``ref``; None when absent there (e.g. a deletion),
-    # which carries no payload to validate.
-    res = _git("show", f"{ref}:{path}")
-    return res.stdout if res.returncode == 0 else None
 
 
 def _changed_symlinks(base: str, head: str) -> list[str]:
@@ -216,7 +210,7 @@ def main(argv: list[str] | None = None) -> int:
         if f in allowed:
             continue
         if is_coordination_path(f):
-            blob = _blob_at(args.head, f)
+            blob = read_blob(None, args.head, f)
             # Present coordination files are exempt only when well-formed; this
             # is the layer that has no SHA-based out-of-band backstop, so a
             # directly-pushed branch smuggling content here is caught right here.

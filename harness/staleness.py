@@ -30,27 +30,27 @@ def critical_paths(task: Mapping[str, Any]) -> set[str]:
     return paths
 
 
-def _blob_at(repo_dir: str, ref: str, path: str) -> str | None:
+def changed_between(repo_dir: str, base_ref: str, head_ref: str, paths: set[str]) -> list[str]:
+    """Critical ``paths`` that differ between two refs.
+
+    One ``git diff --name-only`` scoped to ``paths`` replaces the previous
+    per-path ``git show`` pair (2N subprocesses -> 1). The caller has already
+    verified both refs resolve, so a non-zero diff is an abnormal git failure;
+    it fails closed by treating every critical path as moved rather than
+    silently reporting "safe to push".
+    """
+    if not paths:
+        return []
     res = subprocess.run(
-        ["git", "show", f"{ref}:{path}"],
+        ["git", "diff", "--name-only", base_ref, head_ref, "--", *sorted(paths)],
         cwd=repo_dir,
         capture_output=True,
         text=True,
     )
     if res.returncode != 0:
-        return None
-    return res.stdout
-
-
-def changed_between(repo_dir: str, base_ref: str, head_ref: str, paths: set[str]) -> list[str]:
-    """Critical ``paths`` whose content differs between two refs."""
-    changed: list[str] = []
-    for path in sorted(paths):
-        before = _blob_at(repo_dir, base_ref, path)
-        after = _blob_at(repo_dir, head_ref, path)
-        if before != after:
-            changed.append(path)
-    return changed
+        return sorted(paths)
+    reported = {line for line in res.stdout.splitlines() if line}
+    return sorted(reported & paths)
 
 
 def check(

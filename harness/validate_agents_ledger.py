@@ -15,8 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # noqa: E402
 import leases  # noqa: E402
 import okf  # noqa: E402
 from ledger import LedgerError, load_ledger  # noqa: E402
-
-VALID_MODES = {"evolve", "isolated"}
+from lock_policy import VALID_MUTATION_MODES  # noqa: E402
 
 
 def validate(path: str = "AGENTS.md") -> int:
@@ -50,10 +49,10 @@ def validate(path: str = "AGENTS.md") -> int:
             ok = False
             continue
         mode = task.get("mutation_mode")
-        if mode not in VALID_MODES:
+        if mode not in VALID_MUTATION_MODES:
             print(
                 f"ERROR: task '{task_id}' has invalid mutation_mode "
-                f"'{mode}' (expected one of {sorted(VALID_MODES)})."
+                f"'{mode}' (expected one of {sorted(VALID_MUTATION_MODES)})."
             )
             ok = False
 

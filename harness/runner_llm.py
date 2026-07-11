@@ -12,7 +12,8 @@ from typing import Any
 import command_guard
 import telemetry
 from lock_policy import compute_allowlist
-from runner_core import RunContext, _env_float, log
+from runner_core import RunContext, log
+from telemetry import _env_float
 
 
 def _harden_git_env(env: dict[str, str]) -> None:

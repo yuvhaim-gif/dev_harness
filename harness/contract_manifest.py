@@ -13,11 +13,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sys
 from collections.abc import Iterable
 from typing import Any
 
-import yaml
+from ledger import LedgerError, load_ledger
 from lock_policy import CONTRACT_LOCK_PATH
 
 LOCK_VERSION = 1
@@ -59,8 +60,6 @@ def load_lock(path: str = CONTRACT_LOCK_PATH) -> dict[str, str]:
 
 
 def write_lock(hashes: dict[str, str], path: str = CONTRACT_LOCK_PATH) -> None:
-    import os
-
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     payload = {"version": LOCK_VERSION, "contracts": hashes}
     with open(path, "w", encoding="utf-8", newline="\n") as fh:
@@ -69,9 +68,14 @@ def write_lock(hashes: dict[str, str], path: str = CONTRACT_LOCK_PATH) -> None:
 
 
 def _load_ledger(ledger_path: str) -> dict[str, Any]:
-    with open(ledger_path, encoding="utf-8") as fh:
-        data: Any = yaml.safe_load(fh)
-    return data if isinstance(data, dict) else {}
+    # Route through the canonical loader; treat an unusable ledger (missing,
+    # invalid YAML, non-mapping) as "no declared contracts" so the manifest
+    # gate degrades gracefully -- the dedicated validate-agents-ledger hook is
+    # what fails loudly on a broken AGENTS.md.
+    try:
+        return load_ledger(ledger_path)
+    except LedgerError:
+        return {}
 
 
 def verify(ledger_path: str = "AGENTS.md", lock_path: str = CONTRACT_LOCK_PATH) -> list[str]:

@@ -341,6 +341,18 @@ def test_h4y_strips_combined_short_no_verify() -> None:
     assert res.sanitized == "git commit -m msg"
 
 
+def test_h4z_interpreter_recursion_is_depth_capped() -> None:
+    # The interpreter-in-interpreter scan is bounded so a pathologically nested
+    # command cannot exhaust the stack. Below the cap a buried bypass is still
+    # surfaced; at/over the cap the recursive scan is skipped (fail-open only for
+    # absurd nesting no real invocation uses).
+    nested = 'sh -c "git commit --no-verify -m x"'
+    below = command_guard.sanitize_command(nested, _depth=command_guard._MAX_SCAN_DEPTH - 1)
+    assert below.suspicious
+    at_cap = command_guard.sanitize_command(nested, _depth=command_guard._MAX_SCAN_DEPTH)
+    assert not at_cap.suspicious
+
+
 def test_h4z_preserves_short_m_value_that_looks_like_n() -> None:
     # `-mn` == `-m n` (message "n"), NOT no-verify; must be left untouched.
     res = command_guard.sanitize_command("git commit -mn")

@@ -170,7 +170,13 @@ def _obfuscated_bypass(tokens: list[str]) -> list[str]:
     return sorted(found)
 
 
-def _shell_c_evasion(tokens: list[str]) -> list[str]:
+# Cap how deep the interpreter-in-interpreter recursion may go so a crafted
+# ``sh -c "sh -c \"sh -c ...\""`` nest cannot exhaust the stack. Well past any
+# legitimate nesting; beyond it the non-recursive linear strip still runs.
+_MAX_SCAN_DEPTH = 8
+
+
+def _shell_c_evasion(tokens: list[str], depth: int) -> list[str]:
     """Flag a git bypass buried inside a shell interpreter's ``-c`` script.
 
     For each ``<interpreter> [flags] -c <script>`` run, recursively sanitise the
@@ -187,7 +193,7 @@ def _shell_c_evasion(tokens: list[str]) -> list[str]:
             nxt = tokens[j]
             if _RUN_STRING_FLAG.match(nxt):
                 if j + 1 < len(tokens):
-                    inner = sanitize_command(tokens[j + 1])
+                    inner = sanitize_command(tokens[j + 1], _depth=depth + 1)
                     found += [f"shell -c git-bypass: {f}" for f in inner.stripped]
                     found += [f"shell -c {f}" for f in inner.flagged]
                 break
@@ -225,7 +231,7 @@ def _strip_short_no_verify(tok: str) -> tuple[str | None, bool]:
     return (f"-{rest}" if rest else None), True
 
 
-def _scan_inline_script(script: str) -> list[str]:
+def _scan_inline_script(script: str, depth: int) -> list[str]:
     """Surface a git bypass hidden in a code interpreter's inline script.
 
     The script is opaque to the outer parse and is often *not* shell (e.g.
@@ -234,7 +240,7 @@ def _scan_inline_script(script: str) -> list[str]:
     (``subprocess.run(["git", "commit", "--no-verify"])``).
     """
     found: list[str] = []
-    inner = sanitize_command(script)
+    inner = sanitize_command(script, _depth=depth + 1)
     found += [f"interpreter git-bypass: {f}" for f in inner.stripped]
     found += [f"interpreter {f}" for f in inner.flagged]
     pieces = set(re.split(r"[\s'\"(),\[\]]+", script))
@@ -245,7 +251,7 @@ def _scan_inline_script(script: str) -> list[str]:
     return found
 
 
-def _code_interpreter_evasion(tokens: list[str]) -> list[str]:
+def _code_interpreter_evasion(tokens: list[str], depth: int) -> list[str]:
     """Flag a git bypass buried in ``python -c`` / ``perl -e`` / ``node -e`` ...
 
     Mirrors ``_shell_c_evasion`` for non-shell interpreters, whose inline-eval
@@ -260,7 +266,7 @@ def _code_interpreter_evasion(tokens: list[str]) -> list[str]:
             nxt = tokens[j]
             if _EVAL_FLAG.match(nxt):
                 if j + 1 < len(tokens):
-                    found += _scan_inline_script(tokens[j + 1])
+                    found += _scan_inline_script(tokens[j + 1], depth)
                 break
             if nxt.startswith(("-", "/")):
                 j += 1
@@ -269,8 +275,13 @@ def _code_interpreter_evasion(tokens: list[str]) -> list[str]:
     return sorted(set(found))
 
 
-def sanitize_command(cmd: str | None) -> GuardResult:
-    """Strip git bypass flags from ``cmd`` and flag unstrippable evasion."""
+def sanitize_command(cmd: str | None, *, _depth: int = 0) -> GuardResult:
+    """Strip git bypass flags from ``cmd`` and flag unstrippable evasion.
+
+    ``_depth`` is internal: it tracks interpreter-in-interpreter recursion so a
+    pathologically nested command cannot exhaust the stack (see
+    ``_MAX_SCAN_DEPTH``).
+    """
     if not cmd:
         return GuardResult(original=cmd or "", sanitized=cmd or "")
 
@@ -361,8 +372,9 @@ def sanitize_command(cmd: str | None) -> GuardResult:
         out.append(tok)
 
     flagged.extend(f"obfuscated git-bypass: {f}" for f in _obfuscated_bypass(tokens))
-    flagged.extend(_shell_c_evasion(tokens))
-    flagged.extend(_code_interpreter_evasion(tokens))
+    if _depth < _MAX_SCAN_DEPTH:
+        flagged.extend(_shell_c_evasion(tokens, _depth))
+        flagged.extend(_code_interpreter_evasion(tokens, _depth))
     flagged = sorted(set(flagged))
     if not stripped:
         return GuardResult(original=cmd, sanitized=cmd, flagged=flagged)

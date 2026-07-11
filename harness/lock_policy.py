@@ -74,6 +74,12 @@ class UnknownMutationModeError(ValueError):
     """Raised when a task declares an unsupported mutation_mode."""
 
 
+# The complete set of supported mutation modes, defined once here so the hook,
+# the CI re-check, the ledger validator, and the runner all agree on what a
+# valid mode is instead of re-listing them independently.
+VALID_MUTATION_MODES: frozenset[str] = frozenset({"evolve", "isolated"})
+
+
 def is_coordination_path(path: str) -> bool:
     """True for harness-managed coordination state (leases, journal).
 
@@ -162,16 +168,16 @@ def compute_allowlist(task: Mapping[str, Any]) -> set[str]:
     removed from the result, even if they appear elsewhere in the task.
     """
     mode = task.get("mutation_mode")
+    if mode not in VALID_MUTATION_MODES:
+        raise UnknownMutationModeError(str(mode))
     targets = set(task.get("targets") or [])
     tests = set(task.get("tests") or [])
     spec_docs = set(task.get("spec_docs") or [])
 
     if mode == "evolve":
         allowed = targets | tests | spec_docs | {CONTRACT_LOCK_PATH}
-    elif mode == "isolated":
+    else:  # isolated -- targets only; the manifest stays locked
         allowed = set(targets)
-    else:
-        raise UnknownMutationModeError(str(mode))
 
     explicit_locked = set(task.get("locked_files") or []) | set(ALWAYS_LOCKED)
     return allowed - explicit_locked

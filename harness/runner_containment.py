@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import git
 import okf
+from git_blob import read_blob
 from lock_policy import (
     compute_allowlist,
     is_coordination_path,
@@ -49,10 +50,7 @@ def _committed_paths(ctx: RunContext) -> list[str]:
 
 def _committed_blob(ctx: RunContext, path: str) -> str | None:
     """Content of ``path`` committed at HEAD; None when absent (e.g. deleted)."""
-    try:
-        return str(ctx.repo.git.show(f"HEAD:{path}"))
-    except git.exc.GitCommandError:
-        return None
+    return read_blob(ctx.repo.working_tree_dir, "HEAD", path)
 
 
 def _committed_symlinks(ctx: RunContext) -> list[str]:
