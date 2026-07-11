@@ -283,6 +283,7 @@ dev_process/
     ├── README.md                      # This document (the framework's own docs)
     ├── lock_policy.py                 # Shared compute_allowlist() + symlink_paths() mode check + coordination bypass + human override
     ├── ledger.py                      # Shared AGENTS.md loader (load_ledger/get_task/LedgerError) for hooks, runner & CI
+    ├── git_blob.py                    # Shared read_blob(): a path's content at a git ref (staleness/CI/containment)
     ├── hook_context.py                # Shared gated-hook preamble (override/skip/resolve task) + staged-files reader
     ├── enforce_file_locks.py          # Pre-commit gate: aborts out-of-allowlist (and symlink) commits
     ├── validate_agents_ledger.py      # Validates AGENTS.md (incl. contracts ⊆ spec_docs, spec_docs are .md concepts)
@@ -321,7 +322,9 @@ dev_process/
         ├── test_contracts.py          # Asserts contracts.lock matches every contract (+ whole-file hash covers frontmatter)
         ├── test_okf.py                # OKF conformance: type gate, reserved-file rules, contract no-timestamp
         ├── test_harness.py            # F2–F18: framework self-tests (incl. --init/doctor, drive machine, packaging)
-        └── test_hardening.py          # Telemetry, condenser, prompt, guard, forensic, override, symlink + OKF locks
+        ├── test_hardening.py          # Telemetry, condenser, prompt, guard, forensic, override, symlink + OKF locks
+        ├── test_git_blob.py           # read_blob() at a ref: present / absent / git-error paths
+        └── test_telemetry_env.py      # _env_float parsing: defaults, overrides, malformed values
 ```
 
 > Everything under `harness/example/` is a **sample workload** used to exercise
