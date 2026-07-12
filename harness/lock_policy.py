@@ -42,22 +42,32 @@ COORDINATION_PREFIXES: tuple[str, ...] = (".harness/leases/", ".harness/journal/
 # Git records a symlink with this tree mode. An allowlisted *path* can be
 # turned into a symlink (mode 100644 -> 120000) without ever leaving the
 # allowlist, which lets an agent alias an allowed path onto a locked file and
-# defeat the path-only lock gates. We therefore reject any agent-introduced
-# symlink outright, regardless of where it points.
+# defeat the path-only lock gates. The same escape works with a gitlink
+# (mode 160000): an allowed path becomes a submodule pointer whose content lives
+# out-of-band and is never present as a reviewable blob. We therefore reject any
+# agent-introduced non-regular tree entry outright, regardless of where it points.
 SYMLINK_MODE = "120000"
+
+# The only legal blob modes for a tracked file. A deletion is recorded with an
+# all-zero new mode. Anything else in ``new_mode`` (``120000`` symlink,
+# ``160000`` gitlink, and any future special mode) is a non-regular entry.
+REGULAR_MODES = frozenset({"100644", "100755"})
+DELETED_MODE = "000000"
 
 
 def symlink_paths(raw_diff: str) -> list[str]:
-    """Paths whose resulting git mode is a symlink, from ``git diff --raw`` output.
+    """Paths whose resulting git mode is non-regular, from ``git diff --raw`` output.
 
     ``--raw`` lines look like::
 
         :<old_mode> <new_mode> <old_sha> <new_sha> <status>\\t<path>
 
-    The result is a symlink iff ``new_mode`` is ``120000``. Mode is read from
-    git's recorded tree entry (not ``os.path.islink``) so the check is portable
-    and works against committed history on a CI runner where the link may not be
-    materialised on disk.
+    A path is flagged iff its ``new_mode`` is neither a regular blob mode
+    (``100644``/``100755``) nor a deletion (``000000``) -- i.e. a symlink
+    (``120000``), a gitlink (``160000``), or any other special mode. Mode is read
+    from git's recorded tree entry (not ``os.path.islink``) so the check is
+    portable and works against committed history on a CI runner where the entry
+    may not be materialised on disk.
     """
     out: list[str] = []
     for line in raw_diff.splitlines():
@@ -65,8 +75,10 @@ def symlink_paths(raw_diff: str) -> list[str]:
             continue
         meta, _, path = line.partition("\t")
         fields = meta.split()  # [:old_mode, new_mode, old_sha, new_sha, status]
-        if len(fields) >= 2 and fields[1] == SYMLINK_MODE and path:
-            out.append(path)
+        if len(fields) >= 2 and path:
+            new_mode = fields[1]
+            if new_mode != DELETED_MODE and new_mode not in REGULAR_MODES:
+                out.append(path)
     return out
 
 

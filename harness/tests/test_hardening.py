@@ -821,13 +821,35 @@ def _stage_symlink(repo: Path, link_path: str, target: str) -> None:
     _git(repo, "update-index", "--add", "--cacheinfo", f"120000,{blob},{link_path}")
 
 
+# A gitlink (mode 160000) is the same class of mode-based escape: an allowlisted
+# path becomes a submodule pointer whose content lives out-of-band and is never a
+# reviewable blob. The path never leaves the allowlist, so the path-only gates
+# pass it; the mode-aware check must reject it just like a symlink.
+_FAKE_GITLINK_SHA = "1234567890123456789012345678901234567890"
+
+
+def _stage_gitlink(repo: Path, link_path: str, sha: str = _FAKE_GITLINK_SHA) -> None:
+    """Stage ``link_path`` as a git submodule pointer (mode 160000) via plumbing.
+
+    ``--cacheinfo`` does not require the referenced commit to exist locally, so an
+    arbitrary 40-hex ``sha`` produces the exact tree entry a real gitlink would --
+    portable and without initialising a second repository on disk.
+    """
+    _git(repo, "update-index", "--add", "--cacheinfo", f"160000,{sha},{link_path}")
+
+
 def test_h8b_symlink_paths_parser() -> None:
     raw = (
         ":100644 120000 1111111 2222222 T\tsrc/app.py\n"
         ":100644 100644 3333333 4444444 M\tsrc/keep.py\n"
         ":000000 120000 0000000 5555555 A\tsrc/new_link\n"
+        ":100644 160000 6666666 7777777 T\tsrc/gitlink\n"
+        ":100644 100755 8888888 9999999 M\tsrc/exec.sh\n"
+        ":100644 000000 aaaaaaa 0000000 D\tsrc/gone.py\n"
     )
-    assert lock_policy.symlink_paths(raw) == ["src/app.py", "src/new_link"]
+    # Symlink (120000) and gitlink (160000) are non-regular and flagged; a mode
+    # change to an executable (100755), a plain edit, and a deletion are not.
+    assert lock_policy.symlink_paths(raw) == ["src/app.py", "src/new_link", "src/gitlink"]
 
 
 def test_h8c_staged_symlink_blocked_by_hook(seeded_repo: Path) -> None:
@@ -862,6 +884,40 @@ def test_h8d_committed_symlink_is_containment_breach(
 
     violations = runner_containment._containment_breach(ctx)
     assert any("symlink" in v for v in violations), violations
+    assert any("harness/example/src/db/queries.py" in v for v in violations), violations
+
+
+def test_h8c_staged_gitlink_blocked_by_hook(seeded_repo: Path) -> None:
+    # queries.py is in the task allowlist; flip it to a submodule pointer (mode
+    # 160000). The path stays allowlisted, so only the mode-aware check can stop it.
+    _stage_gitlink(seeded_repo, "harness/example/src/db/queries.py")
+
+    env = os.environ.copy()
+    env.pop("SKIP_AGENT_HARNESS", None)
+    env["AGENT_TASK_ID"] = "optimise_query_layer"
+
+    res = subprocess.run(
+        [sys.executable, str(HOOK)], cwd=str(seeded_repo), capture_output=True, text=True, env=env
+    )
+    combined = res.stdout + res.stderr
+    assert res.returncode == 1, combined
+    assert "harness/example/src/db/queries.py" in combined
+
+
+def test_h8d_committed_gitlink_is_containment_breach(
+    seeded_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(seeded_repo)
+    ctx = _enforce_ctx(seeded_repo)
+
+    _stage_gitlink(seeded_repo, "harness/example/src/db/queries.py")
+    _git(seeded_repo, "-c", "core.hooksPath=.", "commit", "-m", "gitlink bypass")
+
+    # Attribute the commit to the orchestrator so the out-of-band-commit layer
+    # stays quiet -- isolating the mode (gitlink) detection as the sole trigger.
+    ctx.runner_commits.add(ctx.repo.head.commit.hexsha)
+
+    violations = runner_containment._containment_breach(ctx)
     assert any("harness/example/src/db/queries.py" in v for v in violations), violations
 
 

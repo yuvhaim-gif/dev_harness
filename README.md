@@ -294,7 +294,7 @@ dev_process/
     ├── ledger.py                      # Shared AGENTS.md loader (load_ledger/get_task/LedgerError) for hooks, runner & CI
     ├── git_blob.py                    # Shared read_blob(): a path's content at a git ref (staleness/CI/containment)
     ├── hook_context.py                # Shared gated-hook preamble (override/skip/resolve task) + staged-files reader
-    ├── enforce_file_locks.py          # Pre-commit gate: aborts out-of-allowlist (and symlink) commits
+    ├── enforce_file_locks.py          # Pre-commit gate: aborts out-of-allowlist (and symlink/gitlink) commits
     ├── validate_agents_ledger.py      # Validates AGENTS.md (incl. contracts ⊆ spec_docs, spec_docs are .md concepts)
     ├── okf.py                         # OKF conformance for the spec_docs info layer (type gate + reserved-file rules)
     ├── validate_okf.py                # Pre-commit gate: every declared spec_doc is an OKF concept
@@ -331,7 +331,7 @@ dev_process/
         ├── test_contracts.py          # Asserts contracts.lock matches every contract (+ whole-file hash covers frontmatter)
         ├── test_okf.py                # OKF conformance: type gate, reserved-file rules, contract no-timestamp
         ├── test_harness.py            # F2–F18: framework self-tests (incl. --init/doctor, drive machine, packaging)
-        ├── test_hardening.py          # Telemetry, condenser, prompt, guard, forensic, override, symlink + OKF locks
+        ├── test_hardening.py          # Telemetry, condenser, prompt, guard, forensic, override, symlink/gitlink + OKF locks
         ├── test_git_blob.py           # read_blob() at a ref: present / absent / git-error paths
         └── test_telemetry_env.py      # _env_float parsing: defaults, overrides, malformed values
 ```
@@ -429,16 +429,21 @@ alike — so the exemption cannot be abused to land payload outside the allowlis
 All ledger paths must be **POSIX** (forward-slash), repo-root-relative, because
 that is exactly what `git diff --cached --name-only` emits on every OS.
 
-**Symlinks are rejected by file *mode*, not just path.** The allowlist reasons
-about path strings, but an allowlisted path can be flipped from a regular file
+**Non-regular modes (symlinks, gitlinks) are rejected by file *mode*, not just
+path.** The allowlist reasons about path strings, but an allowlisted path can be
+flipped from a regular file
 (git mode `100644`) into a **symlink** (mode `120000`) aimed at a locked file —
-keeping its permitted name while aliasing locked content. A path-only check
-would wave that through. Every lock layer therefore also inspects the *resulting
-git mode* via a shared `lock_policy.symlink_paths()` helper (a `--raw` diff
-parse) and rejects any agent-introduced symlink outright, regardless of where it
-points. Reading the mode from git's recorded tree entry — rather than
-`os.path.islink` — makes the check portable and effective even against committed
-history on a CI runner where the link is never materialised on disk.
+keeping its permitted name while aliasing locked content. A **gitlink** (mode
+`160000`) is the same escape: the allowlisted path becomes a submodule pointer
+whose content lives out-of-band and never appears as a reviewable blob. A
+path-only check would wave both through. Every lock layer therefore also inspects
+the *resulting git mode* via a shared `lock_policy.symlink_paths()` helper (a
+`--raw` diff parse) and rejects any agent-introduced non-regular tree entry —
+anything whose new mode is neither a regular blob (`100644`/`100755`) nor a
+deletion — outright, regardless of where it points. Reading the mode from git's
+recorded tree entry — rather than `os.path.islink` — makes the check portable and
+effective even against committed history on a CI runner where the entry is never
+materialised on disk.
 
 ---
 
@@ -542,10 +547,12 @@ drifted contract fails CI even when commits are bypassed.
 2. Load `AGENTS.md`; a missing file or invalid YAML aborts cleanly with a clear
    message (no traceback).
 3. Look up the task and compute its allowlist.
-4. Reject any **staged symlink** outright — a `git diff --cached --raw` pass
-   flags every entry whose resulting git mode is `120000`. An allowlisted path
-   flipped into a symlink keeps its permitted name, so a path-only check would
-   miss it; this closes the alias-to-a-locked-file bypass and **exits 1**.
+4. Reject any **staged symlink or gitlink** outright — a `git diff --cached
+   --raw` pass flags every entry whose resulting git mode is non-regular (not
+   `100644`/`100755` and not a deletion), i.e. a symlink (`120000`) or a gitlink
+   (`160000`). An allowlisted path flipped into one keeps its permitted name, so a
+   path-only check would miss it; this closes the alias-to-a-locked-file and
+   out-of-band-submodule bypasses and **exits 1**.
 5. Compare the remaining staged files (`git diff --cached --name-only`) against
    the allowlist. Any staged file outside it → print the violations and
    **exit 1**, aborting the commit.
@@ -779,9 +786,10 @@ ignored) and flags four things —
   excepted **only when the committed content is a well-formed lease/journal
   payload** — a smuggled `.py` or unknown-shaped JSON under the exempt prefix is
   flagged as an *invalid coordination payload*),
-- a committed **symlink** (any tree entry with mode `120000` on `base..HEAD`),
-  even when its path is itself allowlisted — catching an allowed path aliased
-  onto a locked file, and
+- a committed **symlink or gitlink** (any non-regular tree entry — mode `120000`
+  or `160000` on `base..HEAD`), even when its path is itself allowlisted —
+  catching an allowed path aliased onto a locked file or turned into an
+  out-of-band submodule pointer, and
 - an **out-of-band commit** the orchestrator did not author itself (i.e. a SHA
   not in its `runner_commits` set — the signature of a hook-bypassed commit), and
 - an **OKF info-layer violation** — a committed `spec_doc` whose OKF frontmatter
@@ -809,9 +817,10 @@ agent cannot influence (wired up in `.github/workflows/harness-ci.yml`):
    the runner that smuggles an arbitrary file under `.harness/journal/` or
    `.harness/leases/` is rejected right here as an *invalid coordination
    payload*), and
-4. no change on that branch may introduce a **symlink** — a `--raw` diff over
-   the same range rejects any entry whose resulting mode is `120000`, so the
-   alias-to-a-locked-file bypass is blocked remotely too, and
+4. no change on that branch may introduce a **symlink or gitlink** — a `--raw`
+   diff over the same range rejects any entry whose resulting mode is non-regular
+   (`120000` symlink or `160000` gitlink), so the alias-to-a-locked-file and
+   out-of-band-submodule bypasses are blocked remotely too, and
 5. a contract changed on an agent branch must carry a change to at least one of
    that task's bound `contract_tests` — the same binding the local
    `enforce_contract_binding` hook applies, re-checked here so it survives a
@@ -1019,7 +1028,7 @@ a breach — **exit 4** — rather than a clean pass, mirroring the fail-safe us
 | Branch-name allowlist dodge | agent pushes its work on a branch that does not match `agent/<task>/…` so the CI file-scope re-check finds no task | `ci_enforce.py` **fails closed** — the task id is trusted from `AGENT_TASK_ID`/`--task` first (the branch name only *locates* a task, never decides whether the check applies); an unresolved task rejects the branch unless the trusted, workflow-set `HARNESS_NON_AGENT_OK=1` opts a genuine human PR out |
 | Empty CI diff range | a bare `GITHUB_BASE_REF` (e.g. `main`) does not resolve in a shallow/detached checkout, silently emptying the diff and passing a rogue branch | `_resolve_base()` falls back bare → `origin/<name>` → shallow fetch before diffing, so the range is never silently empty |
 | Stranded rollback | a lingering file handle (Windows) pins the work tree and the final `git checkout` back to the original branch fails | retried once after `gc.collect()`; on final failure `rollback_ok` flips **False**, section 4 reports **NOT CONFIRMED**, and an `ERROR` names the stranded branch + manual-recovery command (not a swallowed warning) — containment (exit 4) is unaffected, being derived from *committed* state |
-| Symlink lock bypass | an allowlisted path is flipped to a symlink (mode `120000`) aliasing a locked file | every lock layer rejects symlinks by git mode (`symlink_paths()`): pre-commit exit 1, containment gate exit 4, CI re-check fail |
+| Symlink / gitlink lock bypass | an allowlisted path is flipped to a symlink (mode `120000`) aliasing a locked file, or to a gitlink (mode `160000`) smuggling out-of-band submodule content | every lock layer rejects any non-regular mode (`symlink_paths()` flags anything that is not `100644`/`100755`/deletion): pre-commit exit 1, containment gate exit 4, CI re-check fail |
 | OKF info-layer corruption | an evolve-mode edit strips a spec_doc's `type` or adds a volatile `timestamp` to a contract, degrading the durable knowledge layer | `okf.verify()` runs at four layers: `validate-okf` pre-commit (exit 1), post-hoc containment gate (exit 4, re-validated from the committed blob), CI re-check, and `--doctor` |
 | Budget breach | token/USD ceiling exceeded mid-run | immediate financial abort, rollback, forensic report, exit 3. **Caveat:** the token/cost figures are **self-reported** by `AGENT_LLM_CMD` via `usage.json`; a backend that reports zero (malicious or broken) never trips `MAX_TOTAL_TOKENS` / `MAX_RUN_COST_USD`. Budgeting is an accounting aid over a *trusted input*, not a metered control — meter spend at your provider/proxy if the backend is untrusted |
 | Coordination layer is overkill | single-agent run, shared-ref machinery unwanted | `AGENT_MINIMAL=1` keeps local locking, drops the shared ref |
@@ -1172,7 +1181,7 @@ Exit codes:
 | `1` | Failure (e.g. autorepair cap exceeded, or a stale push refused); the tree is rolled back. |
 | `2` | No task specified. |
 | `3` | **Financial or time abort** — a token/cost budget was breached, or a step (`AGENT_STEP_TIMEOUT_SECONDS`) / wall-clock (`MAX_RUN_SECONDS`) timeout fired; the tree is rolled back and a forensic report (carrying the distinguishing reason) is written. |
-| `4` | **Containment breach** — the agent committed outside its allowlist, committed a symlink (aliasing an allowlisted path onto a locked file), committed a spec_doc that breaks OKF conformance (stripped `type` / added contract `timestamp`), made an out-of-band (hook-bypassed) commit, or exhausted the `guard_penalties` ceiling with repeated git-bypass attempts; the tree is rolled back and a forensic report is written. |
+| `4` | **Containment breach** — the agent committed outside its allowlist, committed a symlink or gitlink (aliasing an allowlisted path onto a locked file, or smuggling out-of-band submodule content), committed a spec_doc that breaks OKF conformance (stripped `type` / added contract `timestamp`), made an out-of-band (hook-bypassed) commit, or exhausted the `guard_penalties` ceiling with repeated git-bypass attempts; the tree is rolled back and a forensic report is written. |
 
 Example dry-run output (remote-less repo):
 
@@ -1282,10 +1291,12 @@ H5d) and the immutable rule tagging handover/journal text as **untrusted data**
 and writes `FAILED_AGENT_RUN.md`, and an end-to-end **containment-breach** run
 (H8) where an LLM that commits an out-of-band file via a hook bypass is caught by
 the post-hoc gate and aborts with **exit 4** plus a clean rollback. A dedicated
-**symlink bypass** group (H8b) covers the mode-aware lock: the `symlink_paths()`
-`--raw` parser, the pre-commit hook blocking an allowlisted path staged as a
-symlink to a locked file (exit 1), and the post-hoc gate reporting a committed
-symlink as a breach even when its path is itself allowlisted. The **rollback**
+**symlink / gitlink bypass** group (H8b–H8d) covers the mode-aware lock: the
+`symlink_paths()` `--raw` parser (flagging symlinks *and* gitlinks while leaving
+regular-file mode changes and deletions alone), the pre-commit hook blocking an
+allowlisted path staged as a symlink to a locked file or as a gitlink (exit 1),
+and the post-hoc gate reporting either as a breach even when its path is itself
+allowlisted. The **rollback**
 group (H9/H9b) asserts agent-created untracked files are removed — *including*
 LLM junk under `.harness/` (a stray `.py`, malformed JSON) — while the harness's
 own logs, telemetry, manifest, and well-formed coordination payloads are kept.
@@ -1323,7 +1334,7 @@ workload's contracts.
    - `validate-agents-ledger` (because `check-yaml` skips the `.md`-extensioned
      `AGENTS.md`),
    - `enforce-file-locks` (no staged file may fall outside the task's allowlist,
-     and no staged entry may be a symlink),
+     and no staged entry may be a symlink or gitlink),
    - `verify-contract-manifest` (every declared contract still matches
      `.harness/contracts.lock`),
    - `enforce-contract-binding` (a staged contract change must co-stage the
@@ -1354,12 +1365,14 @@ workload's contracts.
   and the runner to prevent policy drift.
 - **Always-locked** — `AGENTS.md` and `.pre-commit-config.yaml` can never be
   modified by an agent task.
-- **Symlink-aware locks** — the path allowlist is backed by a file-*mode* check
+- **Mode-aware locks** — the path allowlist is backed by a file-*mode* check
   (`lock_policy.symlink_paths()`): every lock layer (pre-commit, post-hoc
-  containment gate, CI re-check) rejects any agent-introduced symlink (git mode
-  `120000`) so an allowlisted path cannot be aliased onto a locked file. Mode is
-  read from git's recorded tree entry, not `os.path.islink`, so it holds against
-  committed history on a CI runner.
+  containment gate, CI re-check) rejects any agent-introduced non-regular tree
+  entry — a symlink (git mode `120000`) or a gitlink (`160000`), i.e. anything
+  that is not a regular blob (`100644`/`100755`) or a deletion — so an allowlisted
+  path cannot be aliased onto a locked file or turned into an out-of-band
+  submodule pointer. Mode is read from git's recorded tree entry, not
+  `os.path.islink`, so it holds against committed history on a CI runner.
 - **OKF information layer** — every task's `spec_docs` is an Open Knowledge
   Format concept bundle; `okf.verify()` enforces a non-empty `type` (and no
   volatile `timestamp` on contracts) at four layers (pre-commit, post-hoc
@@ -1387,7 +1400,7 @@ workload's contracts.
   surfaced in forensics and `--doctor`. `SKIP_AGENT_HARNESS` is always dropped
   from the seam so the human override cannot be inherited.
 - **Post-hoc containment gate** — after mutation the orchestrator inspects
-  committed history (`base..HEAD`); any out-of-allowlist, symlink, or
+  committed history (`base..HEAD`); any out-of-allowlist, symlink, gitlink, or
   out-of-band (hook-bypassed) commit triggers a forensic rollback and **exit
   4**, so a skipped local hook cannot smuggle work onto the branch.
 - **Server-side re-enforcement** — `harness/ci_enforce.py` re-applies the
