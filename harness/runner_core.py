@@ -158,8 +158,7 @@ def _parse_task(task_id: str) -> TaskSpec:
         raise SystemExit(f"ERROR: task '{task_id}' not found in AGENTS.md.")
     attempts_raw = raw.get("max_autorepair_attempts", 3)
     attempts_err = (
-        f"ERROR: task '{task_id}' max_autorepair_attempts must be an integer, "
-        f"got {attempts_raw!r}."
+        f"ERROR: task '{task_id}' max_autorepair_attempts must be an integer, got {attempts_raw!r}."
     )
     if isinstance(attempts_raw, bool):
         raise SystemExit(attempts_err)
