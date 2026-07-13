@@ -1836,3 +1836,77 @@ def test_guard_strict_aborts_on_first_flag(monkeypatch: pytest.MonkeyPatch) -> N
     )
     assert runner_recovery._guard_abort(_guard_ctx(0, 1)) is True
     assert "guard abort" in calls["reason"]
+
+
+# --------------------------------------------------------------------------- #
+# H23. F-003 opt-in shell=False argv execution
+# --------------------------------------------------------------------------- #
+def _mk_llm_ctx(tmp_path: Path) -> Any:
+    task = runner_core.TaskSpec(
+        task_id="t",
+        description="",
+        mutation_mode="isolated",
+        spec_docs=[],
+        tests=[],
+        targets=[],
+        locked_files=[],
+        commit_prefix="chore",
+        max_autorepair_attempts=3,
+        pr_labels=[],
+        contracts=[],
+        contract_tests=[],
+        raw={"mutation_mode": "isolated"},
+    )
+    ctx = runner_core.RunContext(repo=None, task=task, dry_run=False)  # type: ignore[arg-type]
+    ctx.handover_path = str(tmp_path / "h.json")
+    return ctx
+
+
+def test_llm_argv_uses_no_shell(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_popen(target: Any, **kw: Any) -> Any:
+        captured["target"] = target
+        captured["shell"] = kw["shell"]
+
+        class _P:
+            pid = 4242
+            returncode = 0
+
+            def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+                return ("", "")
+
+        return _P()
+
+    monkeypatch.setattr(runner_llm.subprocess, "Popen", fake_popen)
+    monkeypatch.setenv("AGENT_TOKEN_USAGE_FILE", str(tmp_path / "u.json"))
+    monkeypatch.setenv("AGENT_LLM_CMD", "ignored")
+    monkeypatch.setenv("AGENT_LLM_ARGV", '["echo","hi"]')
+    runner_llm._run_llm(_mk_llm_ctx(tmp_path), "mutate")
+    assert captured["shell"] is False
+    assert captured["target"] == ["echo", "hi"]
+
+
+def test_llm_default_uses_shell(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_popen(target: Any, **kw: Any) -> Any:
+        captured["target"] = target
+        captured["shell"] = kw["shell"]
+
+        class _P:
+            pid = 4242
+            returncode = 0
+
+            def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+                return ("", "")
+
+        return _P()
+
+    monkeypatch.setattr(runner_llm.subprocess, "Popen", fake_popen)
+    monkeypatch.setenv("AGENT_TOKEN_USAGE_FILE", str(tmp_path / "u.json"))
+    monkeypatch.setenv("AGENT_LLM_CMD", "echo hi")
+    monkeypatch.delenv("AGENT_LLM_ARGV", raising=False)
+    runner_llm._run_llm(_mk_llm_ctx(tmp_path), "mutate")
+    assert captured["shell"] is True
+    assert captured["target"] == "echo hi"

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import signal
 import subprocess
@@ -152,15 +153,23 @@ def _run_llm(ctx: RunContext, phase: str, repair_log: str = "", prompt_file: str
     # (sh -> bash -> sleep ...) would be orphaned and keep mutating the tree
     # after we have already rolled back. The tree is killed via killpg (POSIX)
     # / taskkill /T (Windows), which closes that hole on both platforms.
+    argv_json = os.getenv("AGENT_LLM_ARGV")
+    if argv_json:
+        run_target: Any = json.loads(argv_json)
+        shell = False
+    else:
+        run_target = run_cmd
+        shell = True
+
     popen_kwargs: dict[str, Any] = {
-        "shell": True,
+        "shell": shell,
         "env": _llm_env(ctx, phase, repair_log, prompt_file),
     }
     if sys.platform == "win32":
         popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
     else:
         popen_kwargs["start_new_session"] = True
-    proc = subprocess.Popen(run_cmd, **popen_kwargs)
+    proc = subprocess.Popen(run_target, **popen_kwargs)
     try:
         proc.communicate(timeout=step_timeout)
     except subprocess.TimeoutExpired:
