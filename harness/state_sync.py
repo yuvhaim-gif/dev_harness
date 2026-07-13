@@ -20,7 +20,7 @@ import tempfile
 import time
 from typing import Any
 
-from lock_policy import is_coordination_path
+from lock_policy import is_coordination_path, is_valid_coordination_payload
 
 STATE_REF = os.getenv("AGENT_STATE_REF", "harness-state")
 
@@ -97,6 +97,25 @@ def read_json(
 ) -> dict[str, Any] | None:
     raw = read_file(repo_dir, path, ref, remote)
     if raw is None:
+        return None
+    try:
+        data: Any = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def read_coordination_json(
+    repo_dir: str, path: str, ref: str = STATE_REF, remote: str = "origin"
+) -> dict[str, Any] | None:
+    """Read a shared-ref JSON payload, returning None unless it is a
+    structurally valid coordination artifact for ``path``.
+
+    Poisoned or wrong-shaped shared-ref data is treated as absent so a
+    malicious push cannot inject content the runner would otherwise trust.
+    """
+    raw = read_file(repo_dir, path, ref, remote)
+    if raw is None or not is_valid_coordination_payload(path, raw):
         return None
     try:
         data: Any = json.loads(raw)

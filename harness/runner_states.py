@@ -39,7 +39,7 @@ def _shared_latest_unresolved(ctx: RunContext) -> dict[str, Any] | None:
     for path in state_sync.list_files(repo_dir, journal.JOURNAL_DIR):
         if not path.endswith(".json"):
             continue
-        entry = state_sync.read_json(repo_dir, path)
+        entry = state_sync.read_coordination_json(repo_dir, path)
         if entry is None or entry.get("task_id") != ctx.task.task_id:
             continue
         if entry.get("outcome") not in journal.UNRESOLVED_OUTCOMES:

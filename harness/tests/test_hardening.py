@@ -1994,3 +1994,21 @@ def test_reclaim_window_default(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_reclaim_window_override(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("AGENT_RECLAIM_STALE_SECONDS", "5")
     assert leases._reclaim_stale_seconds() == 5
+
+
+# --------------------------------------------------------------------------- #
+# H29. F-008 validate coordination payloads on read
+# --------------------------------------------------------------------------- #
+def test_read_coordination_rejects_bad_shape(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(state_sync, "read_file", lambda *a, **k: '{"evil":"x"}')
+    assert state_sync.read_coordination_json(".", ".harness/leases/a.json") is None
+
+
+def test_read_coordination_accepts_valid(monkeypatch: pytest.MonkeyPatch) -> None:
+    good = (
+        '{"task_id":"t","branch":"b","agent_id":"a","base_commit":"c",'
+        '"targets":[],"created_at":"2026-01-01T00:00:00Z","ttl_seconds":10}'
+    )
+    monkeypatch.setattr(state_sync, "read_file", lambda *a, **k: good)
+    out = state_sync.read_coordination_json(".", ".harness/leases/a.json")
+    assert out is not None and out["task_id"] == "t"
