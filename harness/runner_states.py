@@ -107,7 +107,7 @@ def initialize(args: argparse.Namespace) -> RunContext:
         log("no tracking remote configured; skipping pull.")
 
     task = _parse_task(args.task)
-    agent_id = os.getenv("AGENT_ID") or f"agent-{uuid.uuid4().hex[:8]}"
+    agent_id = os.getenv("AGENT_ID") or f"agent-{uuid.uuid4().hex[:16]}"
     try:
         base_commit = repo.head.commit.hexsha
     except (ValueError, git.exc.GitError):

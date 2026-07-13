@@ -2027,3 +2027,15 @@ def test_clean_redacts_injection() -> None:
 
 def test_clean_caps_length() -> None:
     assert len(journal._clean("a" * 5000)) <= 2000
+
+
+# --------------------------------------------------------------------------- #
+# H31. F-015 agent-id fallback entropy
+# --------------------------------------------------------------------------- #
+def test_agent_id_entropy(monkeypatch: pytest.MonkeyPatch) -> None:
+    import re
+    import uuid
+
+    monkeypatch.delenv("AGENT_ID", raising=False)
+    generated = os.getenv("AGENT_ID") or f"agent-{uuid.uuid4().hex[:16]}"
+    assert re.fullmatch(r"agent-[0-9a-f]{16}", generated)
