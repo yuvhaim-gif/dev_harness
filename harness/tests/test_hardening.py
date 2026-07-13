@@ -1981,3 +1981,16 @@ def test_publish_index_is_repo_local(tmp_path: Path, monkeypatch: pytest.MonkeyP
         backoff_base=0,
     )
     assert seen["dir"] == os.path.join(str(tmp_path), ".harness", "tmp")
+
+
+# --------------------------------------------------------------------------- #
+# H28. F-004 configurable reclaim-mutex staleness window
+# --------------------------------------------------------------------------- #
+def test_reclaim_window_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("AGENT_RECLAIM_STALE_SECONDS", raising=False)
+    assert leases._reclaim_stale_seconds() == 30
+
+
+def test_reclaim_window_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AGENT_RECLAIM_STALE_SECONDS", "5")
+    assert leases._reclaim_stale_seconds() == 5

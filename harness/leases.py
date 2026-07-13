@@ -50,6 +50,13 @@ DEFAULT_TTL_SECONDS = 3600
 # stale mutex; it is stolen once older than this many seconds.
 _RECLAIM_LOCK_STALE_SECONDS = 30
 
+
+def _reclaim_stale_seconds() -> int:
+    """Reclaim-mutex staleness window, overridable to shrink skew exposure."""
+    raw = os.getenv("AGENT_RECLAIM_STALE_SECONDS")
+    return int(raw) if raw and raw.isdigit() else _RECLAIM_LOCK_STALE_SECONDS
+
+
 # On Windows, os.replace onto an existing file fails with a sharing violation
 # (PermissionError) when another agent has the lease open for reading at that
 # instant. The replace itself is still atomic; a few short retries ride out the
@@ -135,7 +142,7 @@ def _acquire_reclaim_mutex(lock_dir: str) -> bool:
             age = time.time() - os.path.getmtime(lock_dir)
         except OSError:
             return False
-        if age <= _RECLAIM_LOCK_STALE_SECONDS:
+        if age <= _reclaim_stale_seconds():
             return False
         stealing = f"{lock_dir}.stealing-{os.getpid()}-{uuid.uuid4().hex[:8]}"
         try:
@@ -144,7 +151,7 @@ def _acquire_reclaim_mutex(lock_dir: str) -> bool:
             # Another racer already stole/cleared it; do not double-claim.
             return False
         try:
-            fresh = time.time() - os.path.getmtime(stealing) <= _RECLAIM_LOCK_STALE_SECONDS
+            fresh = time.time() - os.path.getmtime(stealing) <= _reclaim_stale_seconds()
         except OSError:
             fresh = False
         if fresh:
