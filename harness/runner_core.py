@@ -128,6 +128,7 @@ class RunContext:
     env_warned: bool = False
     start_time: float = 0.0
     timed_out: str = ""
+    budget_warned: set[float] = field(default_factory=set)
 
 
 def _load_ledger(path: str = "AGENTS.md") -> dict[str, Any]:

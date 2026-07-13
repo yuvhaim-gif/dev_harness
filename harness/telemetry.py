@@ -197,6 +197,17 @@ class TokenLedger:
             )
         return None
 
+    def budget_utilisation(self) -> float | None:
+        """Max fraction (0..1) of any configured budget currently consumed."""
+        fracs: list[float] = []
+        max_tokens = _env_int("MAX_TOTAL_TOKENS")
+        if max_tokens:
+            fracs.append(self.total_tokens / max_tokens)
+        max_cost = _env_float("MAX_RUN_COST_USD")
+        if max_cost:
+            fracs.append(self.cost_usd / max_cost)
+        return max(fracs) if fracs else None
+
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
 

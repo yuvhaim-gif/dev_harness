@@ -45,3 +45,18 @@ def test_env_int_valid_and_invalid(monkeypatch: pytest.MonkeyPatch) -> None:
     assert telemetry._env_int("HARNESS_TEST_INT") is None
     monkeypatch.setenv("HARNESS_TEST_INT", "nope")
     assert telemetry._env_int("HARNESS_TEST_INT") is None
+
+
+def test_budget_utilisation(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MAX_TOTAL_TOKENS", "100")
+    monkeypatch.delenv("MAX_RUN_COST_USD", raising=False)
+    ledger = telemetry.TokenLedger()
+    ledger.record(telemetry.StepUsage(total_tokens=75))
+    util = ledger.budget_utilisation()
+    assert util is not None and abs(util - 0.75) < 1e-9
+
+
+def test_budget_utilisation_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("MAX_TOTAL_TOKENS", raising=False)
+    monkeypatch.delenv("MAX_RUN_COST_USD", raising=False)
+    assert telemetry.TokenLedger().budget_utilisation() is None

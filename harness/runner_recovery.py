@@ -435,6 +435,12 @@ def _work_diff(ctx: RunContext, max_chars: int = 6000) -> str:
 
 def _budget_abort(ctx: RunContext) -> bool:
     """Financial circuit-breaker: hard rollback + escalate if any budget breached."""
+    util = ctx.ledger.budget_utilisation()
+    if util is not None:
+        for th in (0.50, 0.75, 0.90):
+            if util >= th and th not in ctx.budget_warned:
+                log(f"[budget] {int(th * 100)}% of budget consumed ({ctx.ledger.summary()}).")
+                ctx.budget_warned.add(th)
     reason = ctx.ledger.exceeded()
     if reason is None:
         return False
