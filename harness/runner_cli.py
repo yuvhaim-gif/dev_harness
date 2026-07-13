@@ -172,7 +172,8 @@ def doctor() -> int:
     else:
         print(
             "  WARNING: AGENT_ENV_ALLOWLIST not set; the LLM subprocess inherits the "
-            "FULL parent environment (env_scope=full_copy). Set it to scope the seam."
+            "FULL parent environment (env_scope=full_copy). Set it to scope the seam. "
+            "Set AGENT_ENV_STRICT=1 to refuse a full-copy run."
         )
 
     print("-- handover journals (unresolved) --")

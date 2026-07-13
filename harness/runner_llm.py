@@ -11,7 +11,7 @@ from typing import Any
 
 import command_guard
 import telemetry
-from lock_policy import compute_allowlist
+from lock_policy import compute_allowlist, env_flag
 from runner_core import RunContext, log
 from telemetry import _env_float
 
@@ -54,6 +54,11 @@ def _seam_base_env() -> dict[str, str]:
     """
     raw = os.getenv("AGENT_ENV_ALLOWLIST")
     if not raw:
+        if env_flag("AGENT_ENV_STRICT"):
+            raise SystemExit(
+                "AGENT_ENV_STRICT=1 but AGENT_ENV_ALLOWLIST is unset: refusing "
+                "to copy the full parent environment into the LLM subprocess."
+            )
         env = os.environ.copy()
     else:
         names = {n.strip() for n in raw.replace(",", "\n").splitlines() if n.strip()}

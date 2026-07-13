@@ -1765,3 +1765,28 @@ def test_h20_ci_and_precommit_mypy_strictness_match() -> None:
     assert ci == ["mypy", "--strict", "harness"], ci
     assert "--ignore-missing-imports" not in precommit
     assert "--ignore-missing-imports" not in ci
+
+
+# --------------------------------------------------------------------------- #
+# H21. F-001 opt-in strict environment scoping
+# --------------------------------------------------------------------------- #
+def test_seam_full_copy_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("AGENT_ENV_ALLOWLIST", raising=False)
+    monkeypatch.delenv("AGENT_ENV_STRICT", raising=False)
+    monkeypatch.setenv("SOME_SECRET", "x")
+    assert runner_llm._seam_base_env()["SOME_SECRET"] == "x"
+
+
+def test_seam_strict_refuses(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("AGENT_ENV_ALLOWLIST", raising=False)
+    monkeypatch.setenv("AGENT_ENV_STRICT", "1")
+    with pytest.raises(SystemExit):
+        runner_llm._seam_base_env()
+
+
+def test_seam_allowlist_scopes(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AGENT_ENV_ALLOWLIST", "KEEP")
+    monkeypatch.setenv("KEEP", "1")
+    monkeypatch.setenv("DROP", "2")
+    env = runner_llm._seam_base_env()
+    assert env.get("KEEP") == "1" and "DROP" not in env
