@@ -133,9 +133,16 @@ def _extract_signals(lines: list[str]) -> _Signals:
 
 
 def _source_context(repo_dir: str, file: str, line: int) -> str | None:
-    path = file if os.path.isabs(file) else os.path.join(repo_dir, file)
+    root = os.path.realpath(repo_dir)
+    candidate = os.path.realpath(os.path.join(root, file))
     try:
-        with open(path, encoding="utf-8") as fh:
+        inside = os.path.commonpath([root, candidate]) == root
+    except ValueError:
+        inside = False
+    if os.path.isabs(file) or not inside:
+        return None
+    try:
+        with open(candidate, encoding="utf-8") as fh:
             src = fh.read().splitlines()
     except (FileNotFoundError, OSError, UnicodeDecodeError):
         return None

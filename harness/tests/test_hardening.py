@@ -1923,3 +1923,20 @@ def test_workflow_files_never_allowlisted() -> None:
         "spec_docs": [],
     }
     assert ".github/workflows/harness-ci.yml" not in lock_policy.compute_allowlist(task)
+
+
+# --------------------------------------------------------------------------- #
+# H25. F-007 confine log-condenser source reads to the repo
+# --------------------------------------------------------------------------- #
+def test_source_context_reads_repo_file(tmp_path: Path) -> None:
+    (tmp_path / "a.py").write_text("x=1\ny=2\nz=3\n", encoding="utf-8")
+    ctx = log_condenser._source_context(str(tmp_path), "a.py", 2)
+    assert ctx is not None and "a.py:2" in ctx
+
+
+def test_source_context_rejects_absolute(tmp_path: Path) -> None:
+    assert log_condenser._source_context(str(tmp_path), os.path.abspath(__file__), 1) is None
+
+
+def test_source_context_rejects_traversal(tmp_path: Path) -> None:
+    assert log_condenser._source_context(str(tmp_path), "../../etc/x.py", 1) is None
