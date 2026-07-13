@@ -18,6 +18,12 @@ from ledger import LedgerError, load_ledger  # noqa: E402
 from lock_policy import VALID_MUTATION_MODES  # noqa: E402
 
 
+def _safe_ledger_path(p: str) -> bool:
+    q = str(p).replace("\\", "/")
+    parts = q.split("/")
+    return not (q.startswith("/") or ".." in parts or ":" in q)
+
+
 def validate(path: str = "AGENTS.md") -> int:
     try:
         ledger = load_ledger(path)
@@ -73,6 +79,23 @@ def validate(path: str = "AGENTS.md") -> int:
             if value is not None and not isinstance(value, list):
                 print(f"ERROR: task '{task_id}' field '{field_name}' must be a list.")
                 ok = False
+
+        for field_name in (
+            "spec_docs",
+            "tests",
+            "targets",
+            "locked_files",
+            "contracts",
+            "contract_tests",
+        ):
+            value = task.get(field_name)
+            if isinstance(value, list):
+                for p in value:
+                    if isinstance(p, str) and not _safe_ledger_path(p):
+                        print(
+                            f"ERROR: task '{task_id}' field '{field_name}' has unsafe path: {p!r}"
+                        )
+                        ok = False
 
         contracts = set(task.get("contracts") or [])
         spec_docs = set(task.get("spec_docs") or [])

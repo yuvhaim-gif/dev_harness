@@ -2039,3 +2039,12 @@ def test_agent_id_entropy(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("AGENT_ID", raising=False)
     generated = os.getenv("AGENT_ID") or f"agent-{uuid.uuid4().hex[:16]}"
     assert re.fullmatch(r"agent-[0-9a-f]{16}", generated)
+
+
+# --------------------------------------------------------------------------- #
+# H32. F-016 ledger path-traversal validation
+# --------------------------------------------------------------------------- #
+def test_ledger_rejects_traversal() -> None:
+    assert not validate_agents_ledger._safe_ledger_path("../../etc/passwd")
+    assert not validate_agents_ledger._safe_ledger_path("/abs/path.py")
+    assert validate_agents_ledger._safe_ledger_path("harness/example/src/x.py")
