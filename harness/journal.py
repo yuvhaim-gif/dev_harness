@@ -26,6 +26,15 @@ _LOG_EXCERPT_CHARS = 2000
 
 _NOTES_CHARS = 2000
 
+_INJECTION_MARKERS = (
+    "ignore previous",
+    "ignore all previous",
+    "system:",
+    "assistant:",
+    "<|",
+    "|>",
+)
+
 
 def _clean(text: str, limit: int = _NOTES_CHARS) -> str:
     """Cap and strip control chars from free-text that re-enters an LLM prompt.
@@ -34,9 +43,13 @@ def _clean(text: str, limit: int = _NOTES_CHARS) -> str:
     output) yet a recovered journal feeds the next agent's context via
     ``AGENT_HANDOVER_FILE``. Removing control characters (newline excepted) and
     bounding length blunts terminal/prompt-spoofing without touching the immutable
-    prompt rules that already tag this text as data, not instructions.
+    prompt rules that already tag this text as data, not instructions. As
+    defence-in-depth, a clear prompt-injection marker redacts the whole field.
     """
-    return "".join(ch for ch in (text or "") if ch == "\n" or ch >= " ")[:limit]
+    cleaned = "".join(ch for ch in (text or "") if ch == "\n" or ch >= " ")[:limit]
+    if any(marker in cleaned.lower() for marker in _INJECTION_MARKERS):
+        return "[handover redacted: injection markers detected]"
+    return cleaned
 
 
 def _now() -> str:
