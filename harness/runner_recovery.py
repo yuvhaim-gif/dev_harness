@@ -12,7 +12,12 @@ import leases
 import log_condenser
 import prompt_builder
 import state_sync
-from lock_policy import compute_allowlist, is_coordination_path, is_valid_coordination_payload
+from lock_policy import (
+    compute_allowlist,
+    env_flag,
+    is_coordination_path,
+    is_valid_coordination_payload,
+)
 from runner_core import (
     BUDGET_ABORT_EXIT,
     CONTAINMENT_ABORT_EXIT,
@@ -464,19 +469,29 @@ def _timeout_abort(ctx: RunContext) -> bool:
     return True
 
 
+def _guard_ceiling(ctx: RunContext) -> int:
+    """Guard-penalty ceiling: env override (>=1) else the autorepair budget."""
+    raw = os.getenv("AGENT_GUARD_MAX_PENALTIES")
+    if raw and raw.isdigit():
+        return max(1, int(raw))
+    return ctx.task.max_autorepair_attempts
+
+
 def _guard_abort(ctx: RunContext) -> bool:
     """Containment circuit-breaker for repeated git-bypass attempts.
 
     Guard penalties have their own ceiling so a tamper-once agent keeps its full
     autorepair budget, but a persistent escape attempt is contained. Exits 4
     (the escape family), not 3, because this is a breach attempt, not a budget
-    event.
+    event. AGENT_GUARD_STRICT converts a single unstrippable (suspicious)
+    pattern into an immediate abort.
     """
-    if ctx.guard_penalties < ctx.task.max_autorepair_attempts:
+    hard = env_flag("AGENT_GUARD_STRICT") and ctx.guard_flagged >= 1
+    if ctx.guard_penalties < _guard_ceiling(ctx) and not hard:
         return False
     reason = (
-        f"repeated git-bypass attempts ({ctx.guard_penalties} >= "
-        f"{ctx.task.max_autorepair_attempts})"
+        f"repeated git-bypass attempts (penalties={ctx.guard_penalties}, "
+        f"flagged={ctx.guard_flagged}, ceiling={_guard_ceiling(ctx)})"
     )
     log(f"GUARD ABORT: {reason}. Rolling back.")
     _abort_with_forensics(

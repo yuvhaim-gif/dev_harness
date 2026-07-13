@@ -137,6 +137,7 @@ def _run_llm(ctx: RunContext, phase: str, repair_log: str = "", prompt_file: str
         log(f"[{phase}] PENALTY: {warning}")
         ctx.git_warnings.append(warning)
         ctx.guard_penalties += 1
+        ctx.guard_flagged += 1
     run_cmd = guard.sanitized
 
     usage_path = telemetry.usage_file_path()

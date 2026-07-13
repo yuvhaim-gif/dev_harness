@@ -12,6 +12,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -1790,3 +1791,48 @@ def test_seam_allowlist_scopes(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("DROP", "2")
     env = runner_llm._seam_base_env()
     assert env.get("KEEP") == "1" and "DROP" not in env
+
+
+# --------------------------------------------------------------------------- #
+# H22. F-002 configurable + separable guard ceiling
+# --------------------------------------------------------------------------- #
+def _guard_ctx(pen: int, flagged: int, attempts: int = 3) -> Any:
+    class _Task:
+        max_autorepair_attempts = attempts
+
+    class _Ctx:
+        pass
+
+    ctx = _Ctx()
+    ctx.guard_penalties = pen
+    ctx.guard_flagged = flagged
+    ctx.task = _Task()
+    return ctx
+
+
+def test_guard_default_threshold(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("AGENT_GUARD_MAX_PENALTIES", raising=False)
+    assert runner_recovery._guard_ceiling(_guard_ctx(0, 0)) == 3
+
+
+def test_guard_lower_ceiling(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AGENT_GUARD_MAX_PENALTIES", "1")
+    assert runner_recovery._guard_ceiling(_guard_ctx(0, 0)) == 1
+
+
+def test_guard_no_abort_below_ceiling(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("AGENT_GUARD_MAX_PENALTIES", raising=False)
+    monkeypatch.delenv("AGENT_GUARD_STRICT", raising=False)
+    assert runner_recovery._guard_abort(_guard_ctx(1, 0)) is False
+
+
+def test_guard_strict_aborts_on_first_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AGENT_GUARD_STRICT", "1")
+    calls: dict[str, Any] = {}
+    monkeypatch.setattr(
+        runner_recovery,
+        "_abort_with_forensics",
+        lambda ctx, **kw: calls.update(kw),
+    )
+    assert runner_recovery._guard_abort(_guard_ctx(0, 1)) is True
+    assert "guard abort" in calls["reason"]

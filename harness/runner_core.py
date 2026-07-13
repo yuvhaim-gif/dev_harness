@@ -110,6 +110,7 @@ class RunContext:
     work_branch: str = ""
     autorepair_attempts: int = 0
     guard_penalties: int = 0
+    guard_flagged: int = 0
     last_hook_log: str = ""
     last_status: str = ""
     branch_created: bool = field(default=False)
