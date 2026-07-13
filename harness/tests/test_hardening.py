@@ -1958,3 +1958,26 @@ def test_publish_rejects_newline_path(tmp_path: Path) -> None:
 def test_publish_rejects_non_coordination_path(tmp_path: Path) -> None:
     with pytest.raises(ValueError):
         state_sync.publish_files(str(tmp_path), {"evil.py": "src"}, "msg")
+
+
+# --------------------------------------------------------------------------- #
+# H27. F-011 the shared-index temp file lives inside the repo
+# --------------------------------------------------------------------------- #
+def test_publish_index_is_repo_local(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: dict[str, Any] = {}
+    real = state_sync.tempfile.mkstemp
+
+    def spy(*a: Any, **k: Any) -> Any:
+        seen["dir"] = k.get("dir")
+        return real(*a, **k)
+
+    monkeypatch.setattr(state_sync.tempfile, "mkstemp", spy)
+    (tmp_path / ".harness").mkdir()
+    state_sync.publish_files(
+        str(tmp_path),
+        {".harness/leases/x.json": None},
+        "msg",
+        attempts=1,
+        backoff_base=0,
+    )
+    assert seen["dir"] == os.path.join(str(tmp_path), ".harness", "tmp")

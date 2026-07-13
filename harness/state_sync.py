@@ -138,7 +138,9 @@ def publish_files(
         if "\n" in path or "\r" in path or not is_coordination_path(path):
             raise ValueError(f"refusing unsafe shared-ref path: {path!r}")
 
-    fd, index_path = tempfile.mkstemp(prefix="harness-index-")
+    tmp_dir = os.path.join(repo_dir, ".harness", "tmp")
+    os.makedirs(tmp_dir, exist_ok=True)
+    fd, index_path = tempfile.mkstemp(prefix="harness-index-", dir=tmp_dir)
     os.close(fd)
     os.remove(index_path)
     env = {**os.environ, "GIT_INDEX_FILE": index_path}
