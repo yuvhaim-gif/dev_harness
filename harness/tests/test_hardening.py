@@ -1910,3 +1910,16 @@ def test_llm_default_uses_shell(monkeypatch: pytest.MonkeyPatch, tmp_path: Path)
     runner_llm._run_llm(_mk_llm_ctx(tmp_path), "mutate")
     assert captured["shell"] is True
     assert captured["target"] == "echo hi"
+
+
+# --------------------------------------------------------------------------- #
+# H24. F-005 CI workflow files are never allowlisted
+# --------------------------------------------------------------------------- #
+def test_workflow_files_never_allowlisted() -> None:
+    task = {
+        "mutation_mode": "evolve",
+        "targets": [".github/workflows/harness-ci.yml"],
+        "tests": [],
+        "spec_docs": [],
+    }
+    assert ".github/workflows/harness-ci.yml" not in lock_policy.compute_allowlist(task)

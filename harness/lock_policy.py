@@ -13,6 +13,14 @@ from typing import Any
 
 ALWAYS_LOCKED: frozenset[str] = frozenset({"AGENTS.md", ".pre-commit-config.yaml"})
 
+ALWAYS_LOCKED_PREFIXES: tuple[str, ...] = (".github/workflows/",)
+
+
+def _is_always_locked(path: str) -> bool:
+    p = path.replace("\\", "/")
+    return p in ALWAYS_LOCKED or any(p.startswith(x) for x in ALWAYS_LOCKED_PREFIXES)
+
+
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 
 
@@ -192,4 +200,5 @@ def compute_allowlist(task: Mapping[str, Any]) -> set[str]:
         allowed = set(targets)
 
     explicit_locked = set(task.get("locked_files") or []) | set(ALWAYS_LOCKED)
-    return allowed - explicit_locked
+    result = allowed - explicit_locked
+    return {p for p in result if not _is_always_locked(p)}
