@@ -745,14 +745,14 @@ def test_f12_publish_files_returns_false_on_unreachable_remote(tmp_path: Path) -
     _git(tmp_path, "init", "-b", "main")
     _git(tmp_path, "config", "user.email", "x@example.com")
     _git(tmp_path, "config", "user.name", "X")
-    _write(tmp_path, "f.txt", "hi\n")
+    _write(tmp_path, ".harness/leases/f.json", "hi\n")
 
     # No 'origin' remote exists, so every push attempt must fail. With
     # backoff_base=0 the retries are instantaneous. The contract is that callers
     # learn about the failure via a False return rather than a silent swallow.
     ok = state_sync.publish_files(
         str(tmp_path),
-        {"f.txt": "f.txt"},
+        {".harness/leases/f.json": ".harness/leases/f.json"},
         message="m",
         remote="origin",
         attempts=2,

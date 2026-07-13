@@ -39,6 +39,7 @@ import runner_llm  # noqa: E402
 import runner_reconcile  # noqa: E402
 import runner_recovery  # noqa: E402
 import runner_states  # noqa: E402
+import state_sync  # noqa: E402
 import telemetry  # noqa: E402
 import validate_agents_ledger  # noqa: E402
 
@@ -1940,3 +1941,20 @@ def test_source_context_rejects_absolute(tmp_path: Path) -> None:
 
 def test_source_context_rejects_traversal(tmp_path: Path) -> None:
     assert log_condenser._source_context(str(tmp_path), "../../etc/x.py", 1) is None
+
+
+# --------------------------------------------------------------------------- #
+# H26. F-006 validate publish-file keys before they reach git
+# --------------------------------------------------------------------------- #
+def test_publish_rejects_newline_path(tmp_path: Path) -> None:
+    with pytest.raises(ValueError):
+        state_sync.publish_files(
+            str(tmp_path),
+            {".harness/leases/a.json\nx": "src"},
+            "msg",
+        )
+
+
+def test_publish_rejects_non_coordination_path(tmp_path: Path) -> None:
+    with pytest.raises(ValueError):
+        state_sync.publish_files(str(tmp_path), {"evil.py": "src"}, "msg")

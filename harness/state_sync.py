@@ -20,6 +20,8 @@ import tempfile
 import time
 from typing import Any
 
+from lock_policy import is_coordination_path
+
 STATE_REF = os.getenv("AGENT_STATE_REF", "harness-state")
 
 _REMOTE_PREFIX = "refs/remotes"
@@ -132,6 +134,10 @@ def publish_files(
     attempt is exhausted; callers MUST treat that as a coordination failure
     (e.g. a lease release that did not propagate) rather than ignore it.
     """
+    for path in updates:
+        if "\n" in path or "\r" in path or not is_coordination_path(path):
+            raise ValueError(f"refusing unsafe shared-ref path: {path!r}")
+
     fd, index_path = tempfile.mkstemp(prefix="harness-index-")
     os.close(fd)
     os.remove(index_path)
