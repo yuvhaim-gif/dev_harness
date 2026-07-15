@@ -38,6 +38,7 @@ repos:
       - id: validate-agents-ledger
         name: "Validate AGENTS.md is loadable YAML with required keys"
         language: python
+        language_version: python3
         entry: python harness/validate_agents_ledger.py
         additional_dependencies: ["pyyaml>=6.0"]
         files: ^AGENTS\.md$
@@ -46,6 +47,7 @@ repos:
       - id: enforce-file-locks
         name: "Enforce agent file locks"
         language: python
+        language_version: python3
         entry: python harness/enforce_file_locks.py
         additional_dependencies: ["pyyaml>=6.0"]
         pass_filenames: false
@@ -54,6 +56,7 @@ repos:
       - id: verify-contract-manifest
         name: "Verify hashed contract manifest matches contracts"
         language: python
+        language_version: python3
         entry: python harness/contract_manifest.py
         additional_dependencies: ["pyyaml>=6.0"]
         pass_filenames: false
@@ -62,6 +65,7 @@ repos:
       - id: enforce-contract-binding
         name: "Require contract changes to carry manifest + bound tests"
         language: python
+        language_version: python3
         entry: python harness/enforce_contract_binding.py
         additional_dependencies: ["pyyaml>=6.0"]
         pass_filenames: false
@@ -70,6 +74,7 @@ repos:
       - id: validate-okf
         name: "Enforce OKF conformance of the spec_docs info layer"
         language: python
+        language_version: python3
         entry: python harness/validate_okf.py
         additional_dependencies: ["pyyaml>=6.0"]
         pass_filenames: false
