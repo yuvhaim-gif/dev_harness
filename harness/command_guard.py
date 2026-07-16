@@ -34,7 +34,15 @@ routing it through a shell variable
 while the bypass never appears as the bare ``--no-verify`` argument the strip
 removes. Neither can be safely rewritten in place, so they are *flagged*
 (``obfuscated git-bypass`` for the wrapped-argument form, ``indirected
-git-bypass`` for the variable form) and charged a guard penalty.
+git-bypass`` for the variable form) and charged a guard penalty. The variable
+form is followed one remove further: a flag produced by a command substitution
+assigned to the variable (``x=$(printf -- --no-verify); ... $x`` or the backtick
+spelling) is split across tokens by the parser, so the bypass never lands in the
+assignment's own value; the continuation tokens of an unclosed substitution are
+gathered and stripped of shell-meta so that flag still taints the variable. This
+raises the cost by one level only — a flag spliced from concatenated fragments
+(``a=--no; b=-verify; ... $a$b``) is still missed, which is why this whole layer
+is a cost-raiser and the containment gate remains the security boundary.
 
 A git bypass can also be buried inside a shell interpreter's script argument
 (``sh -c "git commit --no-verify"``, ``bash -lc ...``, ``cmd /c ...``): the
@@ -203,17 +211,40 @@ def _bypass_vars(tokens: list[str]) -> dict[str, list[str]]:
 
     ``FLAG=--no-verify`` (optionally with a tokenizer-glued trailing separator,
     ``FLAG=--no-verify;``) records ``FLAG -> ['--no-verify']``.
+
+    A command substitution / backtick on the right-hand side
+    (``x=$(printf -- --no-verify)``, ``x=`printf -- --no-verify```) is split by
+    the tokenizer across whitespace (``x=$(printf``, ``--``, ``--no-verify)``),
+    so the flag never lands in the assignment token's own value. Continuation
+    tokens are gathered until the substitution closes and their shell-meta
+    wrapping is stripped so the buried flag is still seen. This only closes the
+    demonstrated one-level case: a flag spliced from concatenated fragments
+    (``a=--no; b=-verify; ... $a$b``) is still missed, which is why this layer
+    raises the cost of bypass rather than being the security boundary.
     """
     found: dict[str, list[str]] = {}
-    for tok in tokens:
-        match = _ASSIGN_RE.match(tok)
+    n = len(tokens)
+    i = 0
+    while i < n:
+        match = _ASSIGN_RE.match(tokens[i])
         if not match:
+            i += 1
             continue
         name, value = match.group(1), match.group(2)
-        pieces = set(re.split(r"[\s;&|]+", value))
+        span = [value]
+        j = i + 1
+        if ("$(" in value or "`" in value) and ")" not in value and value.count("`") < 2:
+            while j < n and tokens[j] not in _SEPARATORS:
+                span.append(tokens[j])
+                closed = ")" in tokens[j] or "`" in tokens[j]
+                j += 1
+                if closed:
+                    break
+        pieces = {piece.strip(_SHELL_META) for piece in re.split(r"[\s;&|]+", " ".join(span))}
         hit = sorted(flag for flag in _BYPASS_FLAGS if flag in pieces)
         if hit:
             found[name] = hit
+        i = max(j, i + 1)
     return found
 
 

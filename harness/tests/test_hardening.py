@@ -453,6 +453,35 @@ def test_h4al_variable_bypass_without_git_is_not_flagged() -> None:
     assert not res.suspicious
 
 
+def test_h4am_flags_bypass_from_command_substitution_assignment() -> None:
+    # One remove past the plain-variable case: the flag is produced by a command
+    # substitution assigned to the variable (`x=$(printf -- --no-verify)`), which
+    # the tokenizer splits across tokens so the assignment value never contains
+    # the bare flag. The continuation-token scan must still taint `x` and flag it
+    # when `$x` reaches the commit (was undetected before).
+    res = command_guard.sanitize_command("x=$(printf -- --no-verify); git commit -m t $x")
+    assert res.suspicious
+    assert not res.tampered
+    assert any("indirected git-bypass" in f and "--no-verify" in f for f in res.flagged)
+
+
+def test_h4an_flags_bypass_from_backtick_substitution_assignment() -> None:
+    # The backtick spelling of the same substitution-assignment evasion must be
+    # caught identically to the `$(...)` form.
+    res = command_guard.sanitize_command("x=`printf -- --no-verify`; git commit -m t $x")
+    assert res.suspicious
+    assert any("indirected git-bypass" in f and "--no-verify" in f for f in res.flagged)
+
+
+def test_h4ao_benign_substitution_message_variable_is_not_flagged() -> None:
+    # A variable whose substitution produces a normal value (not a bypass flag)
+    # and feeds a templated commit message must not be mistaken for a routed
+    # bypass, even though the RHS is a command substitution.
+    res = command_guard.sanitize_command('MSG=$(cat msg.txt); git commit -m "$MSG"')
+    assert not res.suspicious
+    assert not res.tampered
+
+
 # --------------------------------------------------------------------------- #
 # H5. Forensic post-mortem
 # --------------------------------------------------------------------------- #

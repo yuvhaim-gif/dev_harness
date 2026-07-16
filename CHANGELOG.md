@@ -23,6 +23,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Remediate red-team findings across security, leases, honesty, and rollback paths.
 - Harden reconcile, leases, commit-env, win32 process kill, and ledger validation.
 - Flag obfuscated git-bypass flags in the command guard.
+- Flag a git-bypass flag routed through a command-substitution/backtick variable
+  assignment (`x=$(printf -- --no-verify); ... $x`) in the command guard.
 - Close the command-guard global-flag gap and make contract binding server-authoritative.
 
 ## [0.1.0] - 2026
