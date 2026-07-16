@@ -9,14 +9,6 @@ present. The full framework docs always live under `harness/README.md`.
 
 # Agent Workflow Harness
 
-> **Security hardening (2026-07).** A security-remediation pass was applied on
-> branch `harden/security-remediation` (15 findings, F-001–F-017). It is fully
-> backward-compatible: default runtime behavior is unchanged, and every new
-> control is either **opt-in via an env flag** or **pure additive input
-> validation**. New opt-in flags: `AGENT_ENV_STRICT`, `AGENT_ENV_ALLOWLIST`,
-> `AGENT_GUARD_STRICT`, `AGENT_GUARD_MAX_PENALTIES`, `AGENT_LLM_ARGV`,
-> `AGENT_RECLAIM_STALE_SECONDS`. See `harness/README.md` for details.
-
 A hardened framework that keeps automated / LLM coding agents **on the rails**
 using a strict five-state loop and programmatic **file-locking** enforced at
 commit time. An agent may only touch the files a task explicitly declares;

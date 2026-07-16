@@ -41,7 +41,7 @@ throwaway git repos in a temp dir):
 | **F6**             | `test_f6d_non_contract_change_is_not_gated`            | Non-contract edits are not gated by the binding hook. |
 | **F7** manifest    | `test_f7_manifest_detects_drift`                       | `contract_manifest.verify()` reports a drifted hash. |
 | **F8** leases      | `test_f8_lease_blocks_second_agent_then_releases`      | A live lease blocks a second agent; release re-opens it. |
-| **F8**             | `test_acquire_single_winner_under_concurrent_reclaim`  | 30 threads racing one expired lease → **exactly one** wins (the reclaim-mutex fix; no TOCTOU). |
+| **F8**             | `test_acquire_single_winner_under_concurrent_reclaim`  | 30 threads racing one expired lease → **exactly one** wins (reclaim-mutex serialisation; no TOCTOU race). |
 | **F8**             | `test_is_active_nonnumeric_ttl_is_inactive`            | A non-numeric `ttl_seconds` is treated as inactive, not an uncaught `ValueError`. |
 | **F9** journal     | `test_f9_journal_records_unresolved_for_next_agent`    | Escalated sessions are recoverable via `latest_unresolved()`. |
 | **F10** staleness  | `test_f10_staleness_detects_moved_contract`            | A contract moved on the shared ref is reported as stale. |
@@ -62,10 +62,10 @@ throwaway git repos in a temp dir):
 `harness/tests/test_hardening.py` covers the LLM-execution hardening layer: token-usage
 normalisation and budget aborts (telemetry), log condensation, cache-ordered
 prompt assembly, bypass-flag stripping **and hook-evasion flagging** (command
-guard — including the `sh -c` / `bash -lc` / `cmd /c` script-wrapped bypass that
-previously passed undetected, H4t–H4x), the `SKIP_AGENT_HARNESS` override,
+guard — including the `sh -c` / `bash -lc` / `cmd /c` script-wrapped bypass,
+H4t–H4x), the `SKIP_AGENT_HARNESS` override,
 forensic-report generation (including H5c, which asserts the step log shows
-**genuinely per-attempt** costs rather than repeating the first repair step), the
+**genuinely per-attempt** costs), the
 content-aware **coordination-payload validator** (`is_valid_coordination_payload`,
 H5d) and the immutable rule tagging handover/journal text as **untrusted data**
 (H5e), an end-to-end financial-abort run that asserts the exit-3 path rolls back

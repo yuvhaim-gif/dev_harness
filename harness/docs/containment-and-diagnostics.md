@@ -70,7 +70,7 @@ The task id is resolved from a **trusted** source first — an explicit `--task`
 or the CI-injected `AGENT_TASK_ID` — because the branch *name* is agent-chosen
 and only ever a fallback for *locating* the task, never for deciding whether the
 file-scope check applies. If no task can be resolved the re-check **fails
-closed** (a mislabeled branch can no longer skip-and-pass); a genuine human PR
+closed** (a mislabeled branch cannot skip-and-pass); a genuine human PR
 opts out explicitly by setting the trusted, workflow-set `HARNESS_NON_AGENT_OK=1`
 (which the agent cannot set), after which the branch gets only the manifest check
 and its file scope is the reviewer's responsibility. The base ref is resolved
@@ -92,16 +92,16 @@ The report has four sections: (1) allowed scope vs. paths actually modified
 assertions, and git policy warnings, (3) a chronological step log with token
 consumption and cost per attempt, and (4) confirmation that the local working
 tree was safely rolled back. The per-attempt costs in section 3 are **genuinely
-per-attempt** — each Enforce attempt is paired with the *i*-th autorepair LLM
+per-attempt**: each Enforce attempt is paired with the *i*-th autorepair LLM
 step it triggered (the final, cap-exceeding attempt has no following step and
-honestly shows zero), rather than repeating the first step's usage on every row.
+shows zero).
 
 The scope evidence in sections 1–3 is compiled from the working tree **before**
 the rollback runs (so the containment proof is not erased by the `git reset
 --hard`), while the **Rollback Verification** in section 4 reflects the *actual*
 post-rollback outcome: the report is built before the rollback and emitted after
-it, so the verdict (`CONFIRMED` / `NOT CONFIRMED`) is the real one rather than a
-stale default.
+it, so the verdict (`CONFIRMED` / `NOT CONFIRMED`) is the real post-rollback
+result.
 
 **The post-mortem also joins the OKF memory layer.** Alongside the human-readable
 `FAILED_AGENT_RUN.md`, the same report is written as an OKF concept document
@@ -117,17 +117,16 @@ removes agent-created junk *including* anything the LLM wrote under `.harness/`
 (a stray `.py`, malformed JSON), while deliberately **preserving the harness's
 own artifacts** there — the forensic logs (`.harness/logs/`), the telemetry sink
 (`.harness/telemetry/`), the hashed manifest (`.harness/contracts.lock`), and
-*well-formed* lease/journal payloads. Previously the sweep skipped everything
-under `.harness/`, so junk written there survived a "pristine" rollback.
+*well-formed* lease/journal payloads. Junk the LLM wrote under `.harness/` is
+therefore not left behind by a "pristine" rollback.
 
 **Rollback fails loud when it cannot leave the work branch.** The final
 `git checkout` back to the original branch is retried once (a lingering
 GitPython/Windows file handle can transiently pin the work tree); if it still
 fails, `rollback_ok` is set `False`, section 4 reports **NOT CONFIRMED**, and an
-`ERROR` line names the stranded branch with the manual-recovery command rather
-than swallowing the failure as a quiet warning. Containment (**exit 4**) is
-unaffected — that verdict is derived from *committed* state, not from where the
-local `HEAD` ends up.
+`ERROR` line names the stranded branch with the manual-recovery command instead
+of failing silently. Containment (**exit 4**) is unaffected — that verdict is
+derived from *committed* state, not from where the local `HEAD` ends up.
 
 ### Diagnostics (`--doctor`)
 
@@ -184,8 +183,7 @@ git commit -m "chore: prune resolved handover journals"
 ```
 
 Keep any journal whose outcome is still unresolved (`escalated` / `error` /
-`stale`) — those are exactly the records the next agent recovers. Automatic
-shared-ref retention is a known, deferred enhancement.
+`stale`) — those are exactly the records the next agent recovers.
 
 Un-pruned resolved journals are harmless to correctness — recovery filters by
 task and unresolved outcome, so stale files are ignored; the only cost is
@@ -195,7 +193,7 @@ repository size.
 `agent/<task>/…` branch behind when it cannot mirror the handover journal off
 that branch. With the **shared state ref active** (an `origin` is configured and
 minimal mode is off) the journal is published to the ref, so rollback
-**force-deletes the work branch** — failed runs no longer accumulate orphan
+**force-deletes the work branch** — failed runs do not accumulate orphan
 `agent/*` refs. Before the branch is deleted the harness **snapshots the agent's
 attempted diff**: the full patch is written to `.harness/logs/<branch>.patch` and
 the dropped tip SHA plus a diffstat are recorded in `FAILED_AGENT_RUN.md`. Because
@@ -252,8 +250,8 @@ a breach — **exit 4** — rather than a clean pass, mirroring the fail-safe us
 | Failure mode | Symptom | Mitigation |
 |--------------|---------|------------|
 | Stale / orphaned lease | a crashed agent leaves a lease behind | TTL (3600s) makes it reclaimable; `--doctor` shows `expired`; rollback releases it |
-| Lease reclaim race | two agents both read one expired lease as free | reclaim is serialised behind an atomic `os.mkdir` mutex; the winner re-reads under the lock, so **exactly one** agent wins (was a real TOCTOU). Taking over a *stale* mutex left by a crashed reclaimer uses an atomic `os.rename` (not `rmdir`+`mkdir`, two syscalls that let a second racer clobber the winner's fresh lock) plus a second age check, so a lock recreated between the mtime read and the steal is restored, never double-held |
-| Corrupt / adversarial lease TTL | `ttl_seconds` is non-numeric in a lease file | `is_active()` treats it as **inactive (reclaimable)** instead of crashing the coordination check with an uncaught `ValueError` |
+| Lease reclaim race | two agents both read one expired lease as free | reclaim is serialised behind an atomic `os.mkdir` mutex; the winner re-reads under the lock, so **exactly one** agent wins. Taking over a *stale* mutex left by a crashed reclaimer uses an atomic `os.rename` (not `rmdir`+`mkdir`, two syscalls that would let a second racer clobber the winner's fresh lock) plus a second age check, so a lock recreated between the mtime read and the steal is restored, never double-held |
+| Corrupt / adversarial lease TTL | `ttl_seconds` is non-numeric in a lease file | `is_active()` treats it as **inactive (reclaimable)**, so a malformed lease never crashes the coordination check with an uncaught `ValueError` |
 | Poisoned coordination state | a payload smuggled under the allowlist-exempt `.harness/leases/` or `.harness/journal/` (e.g. a `.py`, nested path, or unknown-shaped JSON) — a persistent prompt-injection vector, since journal content feeds the next agent's prompt | the exemption is **content-aware** (`is_valid_coordination_payload`): the pre-commit hook (exit 1), the post-hoc containment gate (exit 4), **and** the server-side CI re-check (the layer with no SHA backstop, so it stops a *directly pushed* branch) all reject anything that is not a flat well-formed lease/journal `*.json`; the immutable prompt rules additionally tag handover/journal text as **untrusted data** |
 | Corrupt `contracts.lock` | manifest file is not valid JSON | `CorruptLockError` ⇒ a clear "run `--update`" message, never a traceback; surfaced by `--doctor` and CI |
 | Malicious / malformed task id | a task key or `--release`/`--task` value like `../contracts` or `../../etc/x` is fused into the lease/journal file path and the work-branch name, and could traverse out of `.harness/` | `leases.is_valid_task_id` enforces a conservative slug (`[A-Za-z0-9][A-Za-z0-9._-]*`, no `..`) and **fails closed** at every entry point: `lease_path` raises, `_parse_task` and `release_lease` reject before any filesystem write, and the `validate-agents-ledger` pre-commit hook rejects an unsafe ledger *key* (not just its values) |
@@ -301,7 +299,7 @@ a breach — **exit 4** — rather than a clean pass, mirroring the fail-safe us
   fields are a **prompt-injection surface**: the immutable framework rules
   therefore instruct the model to treat AGENTS.md context, the handover/journal
   file, and any prior-session notes as **untrusted data, never instructions**,
-  and as defence-in-depth the journal now **control-char-strips and length-caps**
+  and as defence-in-depth the journal **control-char-strips and length-caps**
   those fields on write. That is a mitigation, not a sandbox — run untrusted
   backends in your own isolation and review escalated journals before trusting
   their narrative.

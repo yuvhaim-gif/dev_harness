@@ -16,15 +16,15 @@ context:
   `O_CREAT | O_EXCL` so two agents that both read "absent" cannot each believe
   they won. **Reclaiming an expired lease** is serialised behind a short-lived
   atomic mutex (`os.mkdir` on a sibling `.lock` directory, stolen if older than
-  30s): the winner re-reads under the lock before committing the claim, so two
-  agents that both saw the lease as expired can no longer both `os.replace` their
-  own copy and both return success — exactly one wins (the prior read→replace
-  reclaim had a real TOCTOU race here). The lease itself is still written
-  **atomically** (sibling temp file `os.replace`d into place, with a bounded
-  retry to ride out the Windows sharing window when another agent has it open for
-  reading). A corrupt or adversarial lease with a non-numeric `ttl_seconds` is
-  treated as **inactive (reclaimable)** rather than crashing the check the whole
-  coordination layer depends on. Reconcile (and rollback) releases the lease.
+  30s, tunable via `AGENT_RECLAIM_STALE_SECONDS`): the winner re-reads under the
+  lock before committing the claim, so two agents that both see the lease as
+  expired cannot both `os.replace` their own copy and return success — **exactly
+  one** wins. The lease itself is written **atomically** (sibling temp file
+  `os.replace`d into place, with a bounded retry to ride out the Windows sharing
+  window when another agent has it open for reading). A corrupt or adversarial
+  lease with a non-numeric `ttl_seconds` is treated as **inactive (reclaimable)**
+  so a malformed file never crashes the check the whole coordination layer
+  depends on. Reconcile (and rollback) releases the lease.
 - **Handover journal** (`harness/journal.py`) — every session writes an
   append-only JSON record to `.harness/journal/` containing each attempt's
   state, status, and hook-log excerpt, plus a terminal outcome

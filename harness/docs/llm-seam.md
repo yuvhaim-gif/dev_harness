@@ -67,13 +67,13 @@ is a single opaque token to the outer parse, so the structured strip never sees
 the inner `git`. The guard recursively sanitises that `-c` / `/c` script and
 *flags* any bypass flag, plumbing subcommand, or hooks-path override it finds
 inside (it cannot be rewritten in place from outside the quotes), charging the
-same `guard_penalties` hit — closing a hole where such a wrapped command
-previously passed through completely undetected. The same treatment extends to
+same `guard_penalties` hit, so a wrapped command cannot pass through
+undetected. The same treatment extends to
 **non-shell interpreters** (`python -c …`, `perl -e …`, `ruby`, `node`, `deno`):
 their inline-eval string is scanned for a git bypass even when it is quoted code
-rather than a shell command. Finally, an **alias indirection**
-(`git -c alias.x=commit x …`) that smuggles a commit/push past the structured
-strip is likewise flagged.
+rather than a shell command, so a wrapped command cannot slip a bypass past the
+outer parse. Finally, an **alias indirection** (`git -c alias.x=commit x …`)
+that smuggles a commit/push past the structured strip is likewise flagged.
 
 ## Token & cost budgeting
 
@@ -142,3 +142,17 @@ environment through `_commit_env()`, which sets `AGENT_TASK_ID` and **drops
 gates during an autonomous run. If the switch is set when a run starts,
 `initialize` logs a one-time warning that it is being ignored for the run's
 commits.
+
+## Optional hardening controls
+
+The default runtime is unchanged when none of these are set; each is **opt-in**
+via an environment variable and tightens one seam of the run:
+
+| Variable | Effect | Default |
+|----------|--------|---------|
+| `AGENT_ENV_ALLOWLIST` | Restrict the LLM subprocess environment to only the named vars (comma/newline-separated); no `AGENT_*` / `GIT_*` prefix carve-out. | unset → full copy of the parent env (with a one-time warning) |
+| `AGENT_ENV_STRICT` | Refuse to launch the seam at all while `AGENT_ENV_ALLOWLIST` is unset, rather than falling back to a full env copy. | off |
+| `AGENT_LLM_ARGV` | Run `AGENT_LLM_CMD` as an explicit JSON argv list with `shell=False`, so no shell parses the command string. | unset → the command runs through a shell |
+| `AGENT_GUARD_MAX_PENALTIES` | Override the `guard_penalties` ceiling that trips the exit-4 guard abort. | the task's `max_autorepair_attempts` |
+| `AGENT_GUARD_STRICT` | Turn a single unstrippable (flagged) bypass pattern into an immediate exit-4 abort. | off (penalties accumulate to the ceiling) |
+| `AGENT_RECLAIM_STALE_SECONDS` | Reclaim-mutex staleness window for expired-lease takeover (see [Cross-agent coordination](coordination.md)). | `30` |
