@@ -204,7 +204,8 @@ def doctor() -> int:
     print(
         f"  journal files: {len(journal_names)} committed "
         f"({unresolved_total} unresolved); these accumulate by design -- see the "
-        "README 'Operations' note for the manual cleanup recipe."
+        "'Journal growth & cleanup' note in "
+        "harness/docs/containment-and-diagnostics.md for the manual cleanup recipe."
     )
     try:
         ledger = _load_ledger()
