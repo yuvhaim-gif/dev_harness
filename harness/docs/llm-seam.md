@@ -75,6 +75,16 @@ rather than a shell command, so a wrapped command cannot slip a bypass past the
 outer parse. Finally, an **alias indirection** (`git -c alias.x=commit x …`)
 that smuggles a commit/push past the structured strip is likewise flagged.
 
+The mirror of the obfuscated-git case is an obfuscated bypass **flag** on an
+otherwise clean `git commit`: wrapping it in a command substitution
+(`git commit -m x $(echo --no-verify)`, whose argument the strip only sees as
+`--no-verify)`) or routing it through a shell variable
+(`FLAG=--no-verify; git commit … $FLAG`) both keep `git` a clean token while the
+bare `--no-verify` argument the strip removes never appears. Neither can be
+rewritten in place, so they are flagged (`obfuscated git-bypass` for the
+wrapped-argument form, `indirected git-bypass` for the variable form) and charged
+the same `guard_penalties` hit.
+
 ## Token & cost budgeting
 
 `harness/telemetry.py` keeps a running `TokenLedger`. After each LLM step

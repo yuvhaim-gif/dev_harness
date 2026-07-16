@@ -411,6 +411,48 @@ def test_h4ag_benign_config_is_not_mistaken_for_alias() -> None:
     assert not res.suspicious
 
 
+def test_h4ah_flags_obfuscated_bypass_arg_on_clean_git() -> None:
+    # A bypass flag wrapped in a command substitution rides on an otherwise
+    # clean `git commit`; the strip never sees the bare `--no-verify` token, so
+    # the guard must flag it rather than pass it through (was undetected before).
+    res = command_guard.sanitize_command("git commit -m x $(echo --no-verify)")
+    assert res.suspicious
+    assert not res.tampered
+    assert any("obfuscated git-bypass" in f and "--no-verify" in f for f in res.flagged)
+
+
+def test_h4ai_flags_bypass_routed_through_shell_variable() -> None:
+    # The flag is assigned to a variable and expanded beside the commit; the
+    # literal `--no-verify` never appears as a git argument (was undetected).
+    res = command_guard.sanitize_command("FLAG=--no-verify; git commit -m x $FLAG")
+    assert res.suspicious
+    assert not res.tampered
+    assert any("indirected git-bypass" in f and "--no-verify" in f for f in res.flagged)
+
+
+def test_h4aj_flags_variable_bypass_across_separators() -> None:
+    # Assignment and expansion split by `&&` into separate segments must still
+    # be connected: the variable map is built over the whole command.
+    res = command_guard.sanitize_command("FLAG=-n && git push $FLAG origin main")
+    assert res.suspicious
+    assert any("indirected git-bypass" in f and "-n" in f for f in res.flagged)
+
+
+def test_h4ak_benign_message_variable_is_not_flagged() -> None:
+    # `$MSG` was never assigned a bypass flag, so a normal templated message
+    # must not be mistaken for a routed bypass.
+    res = command_guard.sanitize_command('MSG=ok; git commit -m "$MSG"')
+    assert not res.suspicious
+    assert not res.tampered
+
+
+def test_h4al_variable_bypass_without_git_is_not_flagged() -> None:
+    # A bypass-valued variable that never reaches a commit/push segment is not a
+    # git escape attempt and must not be flagged.
+    res = command_guard.sanitize_command("FLAG=--no-verify; echo $FLAG")
+    assert not res.suspicious
+
+
 # --------------------------------------------------------------------------- #
 # H5. Forensic post-mortem
 # --------------------------------------------------------------------------- #

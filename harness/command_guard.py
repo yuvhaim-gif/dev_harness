@@ -26,6 +26,16 @@ slips a bypass flag past the stripper untouched. Those obfuscated tokens cannot
 be safely rewritten either, so like the plumbing patterns above they are
 *flagged* (and charged a guard penalty) rather than silently passed.
 
+The mirror of that hole is an obfuscated bypass *flag* on an otherwise clean
+git: wrapping the flag in a command substitution
+(``git commit -m x $(echo --no-verify)`` -> the argument ``--no-verify)``) or
+routing it through a shell variable
+(``FLAG=--no-verify; git commit -m x $FLAG``) both keep ``git`` a clean token
+while the bypass never appears as the bare ``--no-verify`` argument the strip
+removes. Neither can be safely rewritten in place, so they are *flagged*
+(``obfuscated git-bypass`` for the wrapped-argument form, ``indirected
+git-bypass`` for the variable form) and charged a guard penalty.
+
 A git bypass can also be buried inside a shell interpreter's script argument
 (``sh -c "git commit --no-verify"``, ``bash -lc ...``, ``cmd /c ...``): the
 quoted script is a single opaque token to the outer parse, so the structured
@@ -88,6 +98,11 @@ _STACKABLE_SHORT_BOOLS = frozenset("nasevqp")
 # git's dashed builtins: the git name and its subcommand fused into one token.
 _GIT_DASHED = frozenset({"git-commit", "git-commit.exe", "git-push", "git-push.exe"})
 
+# A shell variable assignment (``NAME=value``) and a ``$NAME`` / ``${NAME}``
+# expansion, used to trace a bypass flag routed through a shell variable.
+_ASSIGN_RE = re.compile(r"^([A-Za-z_]\w*)=(.*)$", re.DOTALL)
+_VAR_REF_RE = re.compile(r"\$\{?([A-Za-z_]\w*)\}?")
+
 
 @dataclass
 class GuardResult:
@@ -138,26 +153,39 @@ def _is_obfuscated_git(tok: str) -> bool:
 
 
 def _obfuscated_bypass(tokens: list[str]) -> list[str]:
-    """Flag bypass flags riding on an obfuscated git commit/push.
+    """Flag a bypass flag reaching a git commit/push through shell-meta wrapping.
 
-    Per shell segment, require all three signals together — an obfuscated git
-    token, a ``commit``/``push`` subcommand, and a bypass flag — so a benign
-    ``echo -n hi && git commit`` (clean git, flag in a different segment) is
-    never flagged.
+    Two mirror-image evasions are caught, both scoped per shell segment and both
+    requiring a ``commit``/``push`` subcommand so a benign
+    ``echo -n hi && git commit`` (bypass in a different segment) never fires:
+
+    * an **obfuscated git** token (``$(git``, ```git``, ``$GIT``) carrying any
+      bypass flag — the structured strip skips the wrapped git entirely; and
+    * an **obfuscated bypass flag** (``$(echo --no-verify)`` -> the argument
+      ``--no-verify)``) riding on an otherwise *clean* ``git commit`` — the flag
+      survives because it is not the bare ``--no-verify`` token the strip drops.
+
+    A clean flag on a clean git (``git commit --no-verify``) is left to the
+    structured strip and is deliberately *not* re-flagged here.
     """
     found: set[str] = set()
     obf_git = sub = False
-    bypass: set[str] = set()
+    clean_bypass: set[str] = set()
+    obf_bypass: set[str] = set()
 
     def _flush() -> None:
-        if obf_git and sub and bypass:
-            found.update(bypass)
+        if not sub:
+            return
+        found.update(obf_bypass)
+        if obf_git:
+            found.update(clean_bypass)
 
     for tok in tokens:
         if tok in _SEPARATORS:
             _flush()
             obf_git = sub = False
-            bypass = set()
+            clean_bypass = set()
+            obf_bypass = set()
             continue
         if _is_obfuscated_git(tok):
             obf_git = True
@@ -165,7 +193,63 @@ def _obfuscated_bypass(tokens: list[str]) -> list[str]:
             sub = True
         core = tok.strip(_SHELL_META)
         if core in _BYPASS_FLAGS:
-            bypass.add(core)
+            (clean_bypass if core == tok else obf_bypass).add(core)
+    _flush()
+    return sorted(found)
+
+
+def _bypass_vars(tokens: list[str]) -> dict[str, list[str]]:
+    """Map each shell variable assigned a bypass flag value to those flags.
+
+    ``FLAG=--no-verify`` (optionally with a tokenizer-glued trailing separator,
+    ``FLAG=--no-verify;``) records ``FLAG -> ['--no-verify']``.
+    """
+    found: dict[str, list[str]] = {}
+    for tok in tokens:
+        match = _ASSIGN_RE.match(tok)
+        if not match:
+            continue
+        name, value = match.group(1), match.group(2)
+        pieces = set(re.split(r"[\s;&|]+", value))
+        hit = sorted(flag for flag in _BYPASS_FLAGS if flag in pieces)
+        if hit:
+            found[name] = hit
+    return found
+
+
+def _indirect_bypass(tokens: list[str]) -> list[str]:
+    """Flag a bypass flag smuggled to git commit/push through a shell variable.
+
+    ``FLAG=--no-verify; git commit -m x $FLAG`` assigns the flag to a variable
+    and expands it beside the commit, so neither the structured strip nor the
+    obfuscated-token scan (the literal ``--no-verify`` never appears as a git
+    argument) sees it. Collect any variable assigned a bypass flag value, then
+    flag it when a ``$VAR`` / ``${VAR}`` expansion of that variable lands in a
+    ``commit``/``push`` segment. A benign ``git commit -m "$MSG"`` is untouched
+    because ``MSG`` was never assigned a bypass flag.
+    """
+    bypass_vars = _bypass_vars(tokens)
+    if not bypass_vars:
+        return []
+    found: set[str] = set()
+    sub = False
+    hits: set[str] = set()
+
+    def _flush() -> None:
+        if sub and hits:
+            found.update(hits)
+
+    for tok in tokens:
+        if tok in _SEPARATORS:
+            _flush()
+            sub = False
+            hits = set()
+            continue
+        if tok.lower() in _GIT_SUBCOMMANDS:
+            sub = True
+        for name in _VAR_REF_RE.findall(tok):
+            if name in bypass_vars:
+                hits.update(bypass_vars[name])
     _flush()
     return sorted(found)
 
@@ -372,6 +456,7 @@ def sanitize_command(cmd: str | None, *, _depth: int = 0) -> GuardResult:
         out.append(tok)
 
     flagged.extend(f"obfuscated git-bypass: {f}" for f in _obfuscated_bypass(tokens))
+    flagged.extend(f"indirected git-bypass: {f}" for f in _indirect_bypass(tokens))
     if _depth < _MAX_SCAN_DEPTH:
         flagged.extend(_shell_c_evasion(tokens, _depth))
         flagged.extend(_code_interpreter_evasion(tokens, _depth))
