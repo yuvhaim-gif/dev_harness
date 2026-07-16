@@ -10,3 +10,4 @@ __pycache__/
 .harness/tmp/
 build/
 *.egg-info/
+plan.md
