@@ -66,45 +66,54 @@ The full state machine — including the abort, budget, and repair paths — is 
 
 ```mermaid
 flowchart TD
-    %% happy-path spine (top -> bottom)
+    %% ── happy-path spine (straight, top -> bottom) ─────────────────
     A["<b>1 · Initialize</b><br/>parse ledger · recover handover"]
     B["<b>2 · Isolate</b><br/>claim lease · create branch"]
     C["<b>3 · Mutate</b><br/>invoke AGENT_LLM_CMD"]
     G{"Post-step<br/>safety checks"}
-    H{"Post-repair<br/>safety checks"}
     D["<b>4 · Enforce</b><br/>scoped stage · gated commit"]
     P{"Containment gate<br/>base..HEAD"}
     S{"Staleness check<br/>vs shared ref"}
     F["<b>5 · Reconcile</b><br/>push · PR · release lease"]
 
-    %% enforce repair loop
+    %% ── enforce repair loop (kept as one tight cluster) ────────────
     C2["Re-stage,<br/>retry once"]
     E["<b>Autorepair</b><br/>condense log<br/>cache-ordered prompt"]
+    H{"Post-repair<br/>safety checks"}
 
-    %% terminals
+    %% ── terminals (each gate gets its own adjacent exit) ───────────
     R0(["<b>Abort</b><br/>refuse to collide"])
-    X3(["<b>exit 3</b><br/>token/cost or timeout<br/>forensic + rollback"])
-    X4a(["<b>exit 4</b><br/>bypass / out-of-scope<br/>forensic + rollback"])
-    X4b(["<b>exit 4</b><br/>containment breach<br/>forensic + rollback"])
+    X3g(["<b>exit 3</b><br/>token/cost or timeout<br/>forensic + rollback"])
+    X4g(["<b>exit 4</b><br/>bypass / out-of-scope<br/>forensic + rollback"])
     R1(["<b>exit 1</b><br/>escalated<br/>forensic + rollback"])
+    X3h(["<b>exit 3</b><br/>token/cost or timeout<br/>forensic + rollback"])
+    X4h(["<b>exit 4</b><br/>repeated git-bypass<br/>forensic + rollback"])
+    X4b(["<b>exit 4</b><br/>containment breach<br/>forensic + rollback"])
     R2(["<b>exit 1</b><br/>stale · refuse push"])
 
-    A --> B --> C --> G
+    %% spine edges (continue-first so aborts fan to the side)
+    A --> B
+    B --> C
+    C --> G
     G -->|clear| D
     D -->|passed| P
     P -->|clean| S
     S -->|fresh| F
 
-    B -->|lease held by<br/>another agent| R0
-    G -->|token/cost or<br/>time ceiling| X3
-    G -->|hook-bypass or<br/>out-of-scope commit| X4a
-    D -->|mechanical fix| C2 --> D
+    %% repair loop edges
+    D -->|mechanical fix| C2
+    C2 --> D
     D -->|semantic failure| E
     E -->|attempts left| H
-    E -->|cap exceeded| R1
     H -->|clear| D
-    H -->|token/cost or<br/>time ceiling| X3
-    H -->|repeated<br/>git-bypass| X4a
+
+    %% abort edges (declared after each source's continue edge)
+    B -->|lease held by<br/>another agent| R0
+    G -->|token/cost or<br/>time ceiling| X3g
+    G -->|hook-bypass or<br/>out-of-scope commit| X4g
+    E -->|cap exceeded| R1
+    H -->|token/cost or<br/>time ceiling| X3h
+    H -->|repeated<br/>git-bypass| X4h
     P -->|breach| X4b
     S -->|stale| R2
 
@@ -116,7 +125,7 @@ flowchart TD
     class A,B,C,D,E state;
     class G,H,P,S decision;
     class F success;
-    class R0,X3,X4a,X4b,R1,R2 abort;
+    class R0,X3g,X4g,X3h,X4h,X4b,R1,R2 abort;
 ```
 
 **Exit codes.** The diagram shows the terminal states of the loop itself. The
