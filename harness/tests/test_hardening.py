@@ -482,6 +482,18 @@ def test_h4ao_benign_substitution_message_variable_is_not_flagged() -> None:
     assert not res.tampered
 
 
+def test_h4ap_guard_scope_ignores_runtime_only_bypass() -> None:
+    # The guard is a LAUNCH-STRING scanner, not a runtime monitor: a command with
+    # no bypass token in its own string is returned untouched, even though the
+    # script it launches could bypass the hooks at runtime. This codifies the
+    # known blind spot so nobody "fixes" it by faking runtime detection -- the
+    # containment gate and CI re-check are the boundary for that case.
+    res = command_guard.sanitize_command("python rogue_agent.py")
+    assert res.tampered is False
+    assert res.suspicious is False
+    assert res.sanitized == "python rogue_agent.py"
+
+
 # --------------------------------------------------------------------------- #
 # H5. Forensic post-mortem
 # --------------------------------------------------------------------------- #

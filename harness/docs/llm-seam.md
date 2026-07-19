@@ -61,6 +61,18 @@ containment gate and the server-side CI re-check (see
 which inspect committed history and therefore hold regardless of which git the
 agent ran.
 
+**Scope — what the guard actually sees.** The guard inspects **only** the
+configured `AGENT_LLM_CMD` string, once, before the seam launches it. It never
+observes — and cannot observe — the git commands the spawned agent decides to
+run *at runtime*. All the evasion-detection above (recursive `sh -c` scanning,
+variable-indirection tracing, combined short flags, …) therefore matters only
+when a bypass is baked into the launch command string itself (for example an
+operator's wrapper script). Against an agent that improvises a bypass
+*mid-session* — the framework's primary threat model — the guard contributes
+nothing, and the post-hoc containment gate + CI re-check are the sole defence.
+Do not read the guard's sophistication as runtime coverage; it is a
+launch-string cost-raiser, not a runtime monitor.
+
 A git bypass can also be buried inside a **shell interpreter's script argument**
 (`sh -c "git commit --no-verify"`, `bash -lc …`, `cmd /c …`): the quoted script
 is a single opaque token to the outer parse, so the structured strip never sees

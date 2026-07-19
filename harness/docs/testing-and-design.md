@@ -55,7 +55,7 @@ throwaway git repos in a temp dir):
 | **F15** bootstrap  | `test_f15a_init_writes_empty_skeleton_that_validates` | `--init` writes a project README + an empty `AGENTS.md` skeleton that validates. |
 | **F15**            | `test_f15b_init_example_recreates_shipped_ledger`     | `--init --example` reproduces the shipped example ledger byte-for-byte. |
 | **F15**            | `test_f15c_doctor_flags_template_readme_then_init_clears_it` | `--doctor` warns on the template README; `--init` clears the sentinel. |
-| **F16** drive loop | `test_f16a–h_*`                                        | The `run_drive` state machine, exercised with fakes: `passed`/`dry-run` reconcile, a single mechanical retry, post-mutate/post-repair aborts (exit 3/4), the autorepair cap (exit 1), and post-pass containment (exit 4). |
+| **F16** drive loop | `test_f16a–i_*`                                        | The `run_drive` state machine, exercised with fakes: `passed`/`dry-run` reconcile, a single mechanical retry, post-mutate/post-repair aborts (exit 3/4), the autorepair cap (exit 1), post-pass containment (exit 4), and (f16i) that a semantic failure re-enters **Enforce** after autorepair **without** re-running Mutate — one LLM call per repair cycle, not two. |
 | **F17** CLI        | `test_f17a–d_*`                                        | `--version`, `--list`, `--report-json` (valid JSON with the expected keys), and `--release` clearing a local lease. |
 | **F18** packaging  | `test_f18_editable_install_exposes_console_script`    | An editable install exposes the `agent-harness` console entry point. |
 
@@ -63,7 +63,10 @@ throwaway git repos in a temp dir):
 normalisation and budget aborts (telemetry), log condensation, cache-ordered
 prompt assembly, bypass-flag stripping **and hook-evasion flagging** (command
 guard — including the `sh -c` / `bash -lc` / `cmd /c` script-wrapped bypass,
-H4t–H4x), the `SKIP_AGENT_HARNESS` override,
+H4t–H4x, and H4ap which pins the guard's **launch-string scope**: a command with
+no bypass token in its own string is returned untouched even when the script it
+launches could bypass the hooks at runtime, so the known blind spot is not
+"fixed" by faking runtime detection), the `SKIP_AGENT_HARNESS` override,
 forensic-report generation (including H5c, which asserts the step log shows
 **genuinely per-attempt** costs), the
 content-aware **coordination-payload validator** (`is_valid_coordination_payload`,
@@ -167,9 +170,12 @@ workload's contracts.
 - **Escape-hatch interception** — `--no-verify` / `-n` on a spawned `git commit`
   / `git push` are stripped and charged to a dedicated `guard_penalties` budget
   (separate from the autorepair counter, with its own exit-4 ceiling), and
-  unstrippable hook-evasion (`core.hooksPath`, plumbing) is flagged. This raises
-  the cost of a bypass but is **not** a security boundary; the authoritative
-  defences are the post-hoc containment gate and the server-side CI re-check.
+  unstrippable hook-evasion (`core.hooksPath`, plumbing) is flagged. The guard
+  inspects **only** the configured `AGENT_LLM_CMD` launch string, once, before
+  launch — it never sees the git commands the agent decides to run at runtime.
+  This raises the cost of a bypass baked into that launch string but is **not** a
+  security boundary; the authoritative defences are the post-hoc containment gate
+  and the server-side CI re-check.
 - **Scoped LLM environment** — `AGENT_ENV_ALLOWLIST` restricts which parent env
   vars reach the seam; when set, **only the explicitly named vars** pass (no
   `AGENT_*` / `GIT_*` prefix carve-out, so prefixed secrets are not leaked), while
@@ -211,4 +217,9 @@ workload's contracts.
   `harness/runner_llm.py`; both `mutate()` (in `harness/runner_states.py`) and
   the fix step inside `autorepair()` (in `harness/runner_recovery.py`) funnel
   through it, and everything around those seams already handles isolation,
-  enforcement, classification, rollback, and reconcile.
+  enforcement, classification, rollback, and reconcile. `mutate()` runs **once**
+  per run (the initial implementation pass); each subsequent repair cycle is a
+  single `autorepair()` call that then re-enters **Enforce** — the loop never
+  re-runs `mutate()`, so a backend can distinguish the two phases via
+  `AGENT_PHASE` (`mutate` vs `autorepair`) and gets exactly one LLM call per
+  cycle.

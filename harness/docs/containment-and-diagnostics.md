@@ -229,7 +229,7 @@ sole line of defence:
 
 | Layer | Where it runs | Bypassable by the agent? | Role |
 |-------|---------------|--------------------------|------|
-| Command guard | before the LLM seam | yes (it only flags/strips) | raise the cost of an *accidental* bypass; penalise evasion (including a git commit/push, or the bypass flag itself, hidden behind command substitution / backticks / shell variables, combined short flags like `-nm`, dashed builtins like `git-commit`, alias indirection, or buried inside a `sh -c` / `bash -lc` / `cmd /c` / `python -c` / `perl -e` script) |
+| Command guard | before the LLM seam | yes (it only flags/strips) | raise the cost of an *accidental* bypass **baked into the `AGENT_LLM_CMD` launch string** (it never sees the agent's *runtime* commands); penalise evasion (including a git commit/push, or the bypass flag itself, hidden behind command substitution / backticks / shell variables, combined short flags like `-nm`, dashed builtins like `git-commit`, alias indirection, or buried inside a `sh -c` / `bash -lc` / `cmd /c` / `python -c` / `perl -e` script) |
 | Pre-commit lock + contract hooks | agent's machine | yes (`core.hooksPath`, plumbing, or dropping `AGENT_TASK_ID` / setting `SKIP_AGENT_HARNESS` in the agent's own git) | fast, local first line; transparent to humans |
 | **Post-hoc containment gate** | orchestrator, post-commit | no (inspects committed history) | authoritative local stop — **exit 4** |
 | **Server-side CI re-check** | trusted runner | no | authoritative remote stop before merge |

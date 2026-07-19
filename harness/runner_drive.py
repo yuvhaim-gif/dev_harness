@@ -66,19 +66,26 @@ def _first_abort(
 def run_drive(ctx: RunContext, model: DriveModel) -> int:
     """Run the mutate -> enforce -> autorepair/reconcile machine to a terminal code.
 
-    Transitions per iteration:
-      mutate -> (post-mutate aborts) -> enforce
+    Mutate runs exactly ONCE (the initial implementation pass). On a semantic
+    failure ``autorepair`` itself issues the repair LLM call, and the loop then
+    re-enters ENFORCE directly -- there is no second, context-free ``mutate``
+    invocation per repair cycle, so each cycle costs one LLM call, not two.
+
+    Transitions:
+      mutate -> (post-mutate aborts) -> [ enforce loop ]
         "dry-run"             -> reconcile (terminal)
         "mechanical"          -> enforce once more, then fall through
         "passed"              -> containment check, else reconcile (terminal)
-        "semantic"/mechanical -> autorepair; cap exit 1, else (post-repair aborts), loop
+        "semantic"/mechanical -> autorepair; cap exit 1, else (post-repair
+                                 aborts), re-enter enforce
     """
-    while True:
-        model.mutate(ctx)
-        code = _first_abort(ctx, model.post_mutate_aborts)
-        if code is not None:
-            return code
+    # Initial implementation pass: mutate once, before entering the enforce loop.
+    model.mutate(ctx)
+    code = _first_abort(ctx, model.post_mutate_aborts)
+    if code is not None:
+        return code
 
+    while True:
         status, log_text = model.enforce(ctx)
         if status == "dry-run":
             return model.reconcile(ctx)
@@ -90,7 +97,9 @@ def run_drive(ctx: RunContext, model: DriveModel) -> int:
                 return CONTAINMENT_ABORT_EXIT
             return model.reconcile(ctx)
 
-        # semantic (or still mechanical after the single retry) -> autorepair
+        # semantic (or still mechanical after the single retry) -> autorepair.
+        # autorepair applies the fix through its own repair LLM call; we then
+        # re-enter enforce rather than re-running mutate.
         ctx.last_hook_log = log_text
         ctx.last_status = status
         if not model.autorepair(ctx):

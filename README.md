@@ -37,7 +37,9 @@ CI — so nothing out of scope can reach a merged branch.
   branch — [minimal mode](harness/docs/containment-and-diagnostics.md#minimal-mode) collapses most of the machinery.
 - **It is not a sandbox.** It constrains what reaches a branch, not what the
   agent process can do to your machine — run untrusted backends in a
-  container / VM.
+  container / VM. In particular the command guard only inspects the configured
+  `AGENT_LLM_CMD` launch string, never the git commands the agent runs at
+  runtime; the post-commit containment gate is the boundary that catches those.
 
 ## Quick start
 

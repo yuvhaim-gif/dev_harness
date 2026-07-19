@@ -1210,6 +1210,30 @@ def test_f16h_containment_after_pass_exits_four() -> None:
     assert agent_runner.run_drive(_drive_ctx(), model) == agent_runner.CONTAINMENT_ABORT_EXIT
 
 
+def test_f16i_autorepair_reenters_enforce_without_remutate() -> None:
+    # After a semantic failure, autorepair applies the fix via its own LLM call
+    # and the loop must re-enter ENFORCE -- NOT re-run mutate. Guards against the
+    # redundant, context-free second mutate invocation per repair cycle.
+    calls = {"mutate": 0, "enforce": 0}
+
+    def mutate(ctx: object) -> None:
+        calls["mutate"] += 1
+
+    def enforce(ctx: object) -> tuple[str, str]:
+        calls["enforce"] += 1
+        return ("semantic", "boom") if calls["enforce"] == 1 else ("passed", "")
+
+    model = _drive_model(
+        mutate=mutate,
+        enforce=enforce,
+        autorepair=lambda ctx: True,
+        reconcile=lambda ctx: 0,
+    )
+    assert agent_runner.run_drive(_drive_ctx(), model) == 0
+    assert calls["mutate"] == 1  # not re-invoked after autorepair
+    assert calls["enforce"] == 2  # semantic, then a clean pass on re-enforce
+
+
 # --------------------------------------------------------------------------- #
 # F17. Opt-in CLI capabilities (CAP-1..4)
 # --------------------------------------------------------------------------- #

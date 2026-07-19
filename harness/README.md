@@ -19,8 +19,10 @@ This documentation describes what is actually implemented in the repository:
 - the **cross-agent coordination layer** — leases, handover journal, shared
   state ref, and staleness guard;
 - the **LLM-execution hardening layer** — token/cost budgeting, log
-  condensation, cache-ordered repair prompts, escape-hatch command interception,
-  the human override switch, and forensic post-mortem diagnostics; and
+  condensation, cache-ordered repair prompts, escape-hatch command interception
+  (scoped to the configured `AGENT_LLM_CMD` launch string, not the agent's
+  runtime commands), the human override switch, and forensic post-mortem
+  diagnostics; and
 - the **out-of-band containment defences** — a post-hoc commit gate, a
   `--doctor` health report, an optional minimal mode, and a server-side CI
   re-check that holds even when the local hooks are skipped.

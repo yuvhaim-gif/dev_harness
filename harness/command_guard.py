@@ -51,6 +51,17 @@ strip never sees the inner ``git``. The script argument cannot be safely
 rewritten in place, so its contents are scanned recursively and any bypass flag,
 plumbing subcommand, or hooks-path override found inside is *flagged* (and
 charged a penalty) rather than passed.
+
+**Scope.** This module inspects *only* the configured ``AGENT_LLM_CMD`` string,
+once, before the seam launches it (see ``runner_llm._run_llm``). It never
+observes -- and cannot observe -- the git commands the spawned agent process
+decides to run at runtime, so all of the obfuscation detection above matters
+only for a bypass baked into that launch string itself (e.g. an operator's
+wrapper). Against an agent that improvises a bypass *mid-session* the guard
+contributes nothing; the post-hoc containment gate
+(``runner_containment._containment_breach``) and the server-side CI re-check
+(``harness/ci_enforce.py``), which inspect *committed history*, are the
+authoritative defences there.
 """
 
 from __future__ import annotations
