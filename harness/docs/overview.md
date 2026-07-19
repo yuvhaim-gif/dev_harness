@@ -71,6 +71,7 @@ flowchart TD
     B["<b>2 · Isolate</b><br/>claim lease · create branch"]
     C["<b>3 · Mutate</b><br/>invoke AGENT_LLM_CMD"]
     G{"Post-step<br/>safety checks"}
+    H{"Post-repair<br/>safety checks"}
     D["<b>4 · Enforce</b><br/>scoped stage · gated commit"]
     P{"Containment gate<br/>base..HEAD"}
     S{"Staleness check<br/>vs shared ref"}
@@ -99,8 +100,11 @@ flowchart TD
     G -->|hook-bypass or<br/>out-of-scope commit| X4a
     D -->|mechanical fix| C2 --> D
     D -->|semantic failure| E
-    E -->|attempts left| D
+    E -->|attempts left| H
     E -->|cap exceeded| R1
+    H -->|clear| D
+    H -->|token/cost or<br/>time ceiling| X3
+    H -->|repeated<br/>git-bypass| X4a
     P -->|breach| X4b
     S -->|stale| R2
 
@@ -110,7 +114,7 @@ flowchart TD
     classDef abort fill:#da3633,stroke:#b62324,color:#ffffff;
 
     class A,B,C,D,E state;
-    class G,P,S decision;
+    class G,H,P,S decision;
     class F success;
     class R0,X3,X4a,X4b,R1,R2 abort;
 ```
