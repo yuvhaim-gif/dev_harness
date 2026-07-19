@@ -1234,6 +1234,20 @@ def test_f16i_autorepair_reenters_enforce_without_remutate() -> None:
     assert calls["enforce"] == 2  # semantic, then a clean pass on re-enforce
 
 
+def test_f16j_overview_diagram_pins_post_repair_aborts() -> None:
+    # Docs-regression guard: the five-state-loop diagram in overview.md must keep
+    # routing the autorepair "attempts left" edge through a post-repair safety
+    # gate that can still abort (budget/timeout -> exit 3, guard -> exit 4) --
+    # the behaviour pinned by F16d/e/g/h. This stops the picture from drifting
+    # back to a direct repair -> Enforce edge that hides those aborts.
+    diagram = (REPO_ROOT / "harness" / "docs" / "overview.md").read_text(encoding="utf-8")
+    assert "E -->|attempts left| H" in diagram
+    assert "Post-repair" in diagram
+    assert "H -->|clear| D" in diagram
+    assert "H -->|token/cost or<br/>time ceiling| X3" in diagram
+    assert "H -->|repeated<br/>git-bypass| X4a" in diagram
+
+
 # --------------------------------------------------------------------------- #
 # F17. Opt-in CLI capabilities (CAP-1..4)
 # --------------------------------------------------------------------------- #
