@@ -86,8 +86,8 @@ flowchart TD
     X3g(["<b>exit 3</b><br/>token/cost or timeout<br/>forensic + rollback"])
     X4g(["<b>exit 4</b><br/>bypass / out-of-scope<br/>forensic + rollback"])
     R1(["<b>exit 1</b><br/>escalated<br/>forensic + rollback"])
-    X3h(["<b>exit 3</b><br/>token/cost or timeout<br/>forensic + rollback"])
-    X4h(["<b>exit 4</b><br/>repeated git-bypass<br/>forensic + rollback"])
+    X3(["<b>exit 3</b><br/>token/cost or timeout<br/>forensic + rollback"])
+    X4a(["<b>exit 4</b><br/>repeated git-bypass<br/>forensic + rollback"])
     X4b(["<b>exit 4</b><br/>containment breach<br/>forensic + rollback"])
     R2(["<b>exit 1</b><br/>stale · refuse push"])
 
@@ -112,8 +112,8 @@ flowchart TD
     G -->|token/cost or<br/>time ceiling| X3g
     G -->|hook-bypass or<br/>out-of-scope commit| X4g
     E -->|cap exceeded| R1
-    H -->|token/cost or<br/>time ceiling| X3h
-    H -->|repeated<br/>git-bypass| X4h
+    H -->|token/cost or<br/>time ceiling| X3
+    H -->|repeated<br/>git-bypass| X4a
     P -->|breach| X4b
     S -->|stale| R2
 
@@ -125,7 +125,7 @@ flowchart TD
     class A,B,C,D,E state;
     class G,H,P,S decision;
     class F success;
-    class R0,X3g,X4g,X3h,X4h,X4b,R1,R2 abort;
+    class R0,X3g,X4g,X3,X4a,X4b,R1,R2 abort;
 ```
 
 **Exit codes.** The diagram shows the terminal states of the loop itself. The
