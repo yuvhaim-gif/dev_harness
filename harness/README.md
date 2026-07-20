@@ -10,6 +10,12 @@ This is the framework's own documentation hub. The deep reference is split into
 focused documents under [`docs/`](docs/); this page indexes them and captures the
 big-picture invariants.
 
+> **Built and verified by LLM agents.** The harness is itself coded with LLM
+> tools and verified by **independent** LLM agents — the agent that reviews and
+> tests a change is a separate one from the agent that wrote it — so the
+> framework is dogfooded by the very kind of automated agents it is built to
+> contain. See [Testing, the pre-commit pipeline & design notes](docs/testing-and-design.md).
+
 This documentation describes what is actually implemented in the repository:
 
 - the **orchestrator** and its five-state loop;

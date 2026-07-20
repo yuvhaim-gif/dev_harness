@@ -4,6 +4,11 @@ Thanks for your interest in improving the Agent Workflow Harness. This is a
 containment framework, so contributions are reviewed with an emphasis on never
 weakening an enforcement gate.
 
+The harness is itself coded with LLM tools and verified by **independent** LLM
+agents — the agent that reviews and tests a change is a separate one from the
+agent that authored it. Whether a change is written by a human or an agent, it
+must pass the deterministic gates below and an independent review before merge.
+
 ## Getting started
 
 ```bash

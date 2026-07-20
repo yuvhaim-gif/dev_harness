@@ -15,6 +15,12 @@ commit time. An agent may only touch the files a task explicitly declares;
 everything else is locked, and the orchestrator never leaves the repository in
 a half-broken state.
 
+> **How this harness is built and verified.** The harness is itself developed
+> with LLM coding tools and verified by **independent** LLM agents — a separate
+> agent from the one that produced a change reviews and tests it — so the
+> framework is dogfooded by the very kind of automated agents it is designed to
+> keep on the rails.
+
 ## The problem it solves
 
 **The problem.** An autonomous / LLM coding agent turned loose on your

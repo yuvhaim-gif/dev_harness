@@ -11,6 +11,13 @@
 
 ## Testing & verification
 
+> **Coded with LLM tools, tested by independent LLM agents.** The harness is
+> itself developed with LLM coding tools, and its changes are verified by
+> **independent** LLM agents — the agent that reviews and exercises a change is a
+> separate one from the agent that authored it, so no agent signs off on its own
+> work. The deterministic gates below (ruff, mypy, pytest) remain the objective
+> backstop that both the authoring and the reviewing agents must satisfy.
+
 Run everything:
 
 ```bash
