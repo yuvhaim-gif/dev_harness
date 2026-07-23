@@ -30,10 +30,16 @@ API, or leave the working tree half-broken when it fails mid-task.
 **The solution.** You declare, *per task*, exactly which files an agent may
 change. Everything else is locked. The rules are enforced three times — when the
 agent commits, again on the committed history right after, and a third time in
-CI — so nothing out of scope can reach a merged branch.
+CI on every pull request — so nothing out of scope reaches `main` through the
+review flow.
 
 > **The guarantee:** *nothing outside a task's declared allowlist reaches a
 > reviewed, pushed branch.*
+>
+> The CI re-check is authoritative on the pull request, *before* merge; it is
+> advisory on a direct `push` to `main`. Closing that requires a one-time
+> **branch-protection** setting so a direct push cannot skip the PR check — see
+> [Required GitHub branch protection](harness/docs/setup-and-usage.md).
 
 **Who this is for**
 

@@ -79,19 +79,24 @@ whose `harness-ci` check passed:
 # Forbid direct pushes to main and require the harness-ci `enforce` check on PRs.
 gh api -X PUT "repos/{owner}/{repo}/branches/main/protection" \
   -H "Accept: application/vnd.github+json" \
-  -f  "required_status_checks[strict]=true" \
-  -f  "required_status_checks[contexts][]=enforce" \
-  -f  "enforce_admins=true" \
-  -F  "required_pull_request_reviews[required_approving_review_count]=1" \
-  -f  "restrictions=" \
-  -F  "allow_force_pushes=false" \
-  -F  "allow_deletions=false"
+  -F "required_status_checks[strict]=true" \
+  -F "required_status_checks[contexts][]=enforce" \
+  -F "enforce_admins=true" \
+  -F "required_pull_request_reviews[required_approving_review_count]=1" \
+  -F "restrictions=null" \
+  -F "allow_force_pushes=false" \
+  -F "allow_deletions=false"
 ```
 
 > Replace `{owner}/{repo}` (or drop them — `gh` infers the current repo). The
 > `enforce_admins=true` clause is what stops an admin (or a leaked admin token)
 > from pushing straight to `main`. Verify with
 > `gh api "repos/{owner}/{repo}/branches/main/protection"`.
+>
+> Every field uses `-F` (typed), not `-f` (raw string): the API rejects
+> `strict` / `enforce_admins` sent as the string `"true"` and requires
+> `restrictions` to be `null` (not `""`), so `-F` — which coerces `true` /
+> `false` / `null` / integers to real JSON — is mandatory here.
 
 Without this, the *"nothing outside a task's allowlist reaches `main`"* guarantee
 does **not** hold on direct pushes; see
