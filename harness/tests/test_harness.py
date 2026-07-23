@@ -1008,6 +1008,7 @@ def test_f14j_ci_enforce_allows_declared_human_branch(harness_repo: Path) -> Non
 
     env = os.environ.copy()
     env["HARNESS_NON_AGENT_OK"] = "1"
+    env["GITHUB_EVENT_NAME"] = "pull_request"
     res = subprocess.run(
         [sys.executable, str(CI_ENFORCE), "--base", base, "--head", "HEAD"],
         cwd=str(harness_repo),
@@ -1017,6 +1018,41 @@ def test_f14j_ci_enforce_allows_declared_human_branch(harness_repo: Path) -> Non
     )
     assert res.returncode == 0, res.stdout + res.stderr
     assert "human-authored" in res.stdout
+    # A PR opt-out is not the push-to-main advisory path.
+    assert "WARN" not in res.stdout
+
+
+def test_f14l_ci_enforce_push_to_main_is_advisory_not_human_authored(
+    harness_repo: Path,
+) -> None:
+    # Red-team scenario: an out-of-scope change pushed *directly* to main (no PR)
+    # is seen by the CI re-check as a `push` event with the workflow-set
+    # HARNESS_NON_AGENT_OK=1. The re-check cannot enforce file scope on a push
+    # (base == head in real CI), so it must NOT mislabel the change as
+    # "human-authored"; it must emit an explicit advisory naming the
+    # branch-protection prerequisite that the guarantee actually depends on.
+    base = _seed_contract_lock(harness_repo)
+    with (harness_repo / "harness/example/src/billing/routes.py").open("a", encoding="utf-8") as fh:
+        fh.write("# out-of-scope change pushed straight to main\n")
+    _git(harness_repo, "add", "-A")
+    _git(harness_repo, "commit", "-m", "direct push to main")
+
+    env = os.environ.copy()
+    env["HARNESS_NON_AGENT_OK"] = "1"
+    env["GITHUB_EVENT_NAME"] = "push"
+    env.pop("AGENT_TASK_ID", None)
+    res = subprocess.run(
+        [sys.executable, str(CI_ENFORCE), "--base", base, "--head", "HEAD"],
+        cwd=str(harness_repo),
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert "WARN" in res.stdout
+    assert "BRANCH PROTECTION" in res.stdout
+    assert "advisory" in res.stdout
+    assert "human-authored" not in res.stdout
 
 
 def test_f14k_resolve_base_falls_back_to_origin(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -41,6 +41,14 @@ This documentation describes what is actually implemented in the repository:
 > (inspects committed history, aborts with **exit 4** on any breach) and a
 > **server-side CI re-check** (`harness/ci_enforce.py`) on a trusted runner. See
 > [Containment defences, operations & threat model](docs/containment-and-diagnostics.md).
+>
+> The CI re-check is authoritative on the **`pull_request`** event, *before* a
+> merge. It is **advisory on a `push` to `main`** (the diff range is then empty,
+> so file scope cannot be re-checked). The "nothing outside the allowlist reaches
+> `main`" guarantee therefore requires **GitHub branch protection** that forbids
+> direct pushes to `main` and requires this check to pass first — a one-time
+> repository setting the harness cannot configure for you. See
+> [Required GitHub branch protection](docs/setup-and-usage.md).
 
 ## Documentation
 

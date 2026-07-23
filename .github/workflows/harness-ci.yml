@@ -3,6 +3,14 @@ name: harness-ci
 # Authoritative, agent-proof enforcement: these checks run on a trusted runner
 # the agent cannot influence, so the file-lock and contract guarantees hold even
 # if the local pre-commit hooks were skipped during the run.
+#
+# IMPORTANT deployment prerequisite: the file-scope guarantee is authoritative on
+# the `pull_request` event *before* merge. On a `push` to `main` the diff range is
+# empty (base == head), so the re-check cannot run and is advisory only. You MUST
+# configure GitHub BRANCH PROTECTION on `main` to (a) forbid direct pushes and
+# (b) require this `harness-ci` check to pass before merge -- otherwise a direct
+# push bypasses enforcement entirely. See docs/setup-and-usage.md
+# ("Required GitHub branch protection").
 
 on:
   pull_request:
@@ -44,5 +52,10 @@ jobs:
         env:
           GITHUB_BASE_REF: ${{ github.event.pull_request.base.ref || 'origin/main' }}
           GITHUB_HEAD_REF: ${{ github.event.pull_request.head.ref || github.ref_name }}
+          # On `push` (only `main` triggers it) there is no PR branch to resolve a
+          # task from and the diff is empty, so opt out of the fail-closed file-scope
+          # gate to keep the post-merge job green. ci_enforce reads GITHUB_EVENT_NAME
+          # (a runner default) and prints an explicit advisory naming the branch-
+          # protection prerequisite instead of a misleading "human-authored" skip.
           HARNESS_NON_AGENT_OK: ${{ github.event_name == 'push' && '1' || '' }}
         run: python harness/ci_enforce.py

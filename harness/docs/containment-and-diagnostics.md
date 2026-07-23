@@ -79,6 +79,23 @@ shallow/detached checkout falls back to `origin/<name>` (fetched if needed), so
 the diff range is never silently empty. Run it locally with
 `python harness/ci_enforce.py --base <ref> --head <ref> [--task <id>]`.
 
+> **Where this gate is authoritative — and where it is not.** The file-scope
+> re-check is authoritative on the **`pull_request`** event, which runs *before*
+> a merge on the PR branch's real `base...head` diff. It is **advisory on a
+> `push` to `main`**: after checkout the pushed commit *is* `main` *and*
+> `origin/main`, so `base...head` is empty and there is nothing to re-check — the
+> workflow sets `HARNESS_NON_AGENT_OK=1` on push only to keep that (necessarily
+> empty) post-merge job green. `ci_enforce.py` detects the push via
+> `GITHUB_EVENT_NAME` and prints an explicit **`WARN`** naming the branch-
+> protection prerequisite rather than a misleading "human-authored" skip.
+> Consequently the guarantee that *nothing outside a task's allowlist reaches
+> `main`* holds **only if GitHub branch protection** forbids direct pushes to
+> `main` and requires this `harness-ci` check to pass first — otherwise a change
+> pushed straight to `main` (a leaked credential, or an agent with plain `git`)
+> never passes through any PR-time re-check. Branch protection is a one-time
+> repository setting the harness cannot script for you; see
+> [Required GitHub branch protection](setup-and-usage.md).
+
 ---
 
 ## Operations & diagnostics
@@ -264,6 +281,7 @@ a breach — **exit 4** — rather than a clean pass, mirroring the fail-safe us
 | Obfuscated bypass flag | `--no-verify`/`-n` hidden behind `$(...)`, backticks, `$GIT`, a bypass argument wrapped in a command substitution (`git commit -m x $(echo --no-verify)`) or routed through a shell variable (`FLAG=--no-verify; git commit … $FLAG`), a combined short flag (`-nm` == `-n -m`), a dashed builtin (`git-commit`), a `git -c alias.x=commit` indirection, or buried inside a `sh -c` / `bash -lc` / `cmd /c` / `python -c` / `perl -e` script so the stripper misses it | guard unpacks the combined-short/dashed forms and strips the `-n`, and flags what it cannot rewrite (`obfuscated git-bypass` / `indirected git-bypass` / `shell -c …` / `interpreter …` / `git alias override`), charging a `guard_penalties` hit; the post-hoc containment gate + CI re-check still catch any resulting commit |
 | Out-of-allowlist commit | agent commits a file it may not touch | post-hoc containment gate (exit 4) locally; `ci_enforce.py` rejects the branch remotely |
 | Branch-name allowlist dodge | agent pushes its work on a branch that does not match `agent/<task>/…` so the CI file-scope re-check finds no task | `ci_enforce.py` **fails closed** — the task id is trusted from `AGENT_TASK_ID`/`--task` first (the branch name only *locates* a task, never decides whether the check applies); an unresolved task rejects the branch unless the trusted, workflow-set `HARNESS_NON_AGENT_OK=1` opts a genuine human PR out |
+| Direct push to `main` (no PR) | a leaked credential or an agent with plain `git` pushes an out-of-scope change straight to `main`, so no PR-time re-check ever runs; the push-event CI job has an empty `base...head` and cannot inspect it | **not** closeable from inside CI — the pushed commit *is* both `base` and `head`. Requires **GitHub branch protection** (forbid direct pushes to `main` + require the `harness-ci` PR check) as a deployment prerequisite; `ci_enforce.py` prints an explicit `WARN` on push events naming it, and it is documented in [setup-and-usage.md](setup-and-usage.md) and the *Honest limitations* below |
 | Empty CI diff range | a bare `GITHUB_BASE_REF` (e.g. `main`) does not resolve in a shallow/detached checkout, silently emptying the diff and passing a rogue branch | `_resolve_base()` falls back bare → `origin/<name>` → shallow fetch before diffing, so the range is never silently empty |
 | Stranded rollback | a lingering file handle (Windows) pins the work tree and the final `git checkout` back to the original branch fails | retried once after `gc.collect()`; on final failure `rollback_ok` flips **False**, section 4 reports **NOT CONFIRMED**, and an `ERROR` names the stranded branch + manual-recovery command (not a swallowed warning) — containment (exit 4) is unaffected, being derived from *committed* state |
 | Symlink / gitlink lock bypass | an allowlisted path is flipped to a symlink (mode `120000`) aliasing a locked file, or to a gitlink (mode `160000`) smuggling out-of-band submodule content | every lock layer rejects any non-regular mode (`symlink_paths()` flags anything that is not `100644`/`100755`/deletion): pre-commit exit 1, containment gate exit 4, CI re-check fail |
@@ -311,6 +329,19 @@ a breach — **exit 4** — rather than a clean pass, mirroring the fail-safe us
   closed). For a tighter trust boundary, have the CI workflow set `AGENT_TASK_ID`
   from a trusted source (a PR label or an orchestrator-signed commit) rather than
   deriving it from the branch name.
+- **The CI file-scope re-check is authoritative on `pull_request`, not on a
+  `push` to `main`.** A push leaves `base` and `head` at the *same* commit, so the
+  re-check has an empty diff and cannot inspect what the push introduced; the
+  workflow sets `HARNESS_NON_AGENT_OK=1` on push purely to keep that empty
+  post-merge job green, and `ci_enforce.py` emits a `WARN` (via
+  `GITHUB_EVENT_NAME`) naming this. The guarantee that *nothing outside a task's
+  allowlist reaches `main`* therefore depends on a control the harness **cannot
+  configure itself**: **GitHub branch protection** must forbid direct pushes to
+  `main` and require the `harness-ci` check to pass on the PR *before* merge.
+  Without it, a change pushed straight to `main` (a leaked token, or an agent
+  with plain `git`) bypasses every re-check. The one-time setup — including a
+  scriptable `gh api` recipe — is in
+  [Required GitHub branch protection](setup-and-usage.md).
 - The complexity is real: ~18 harness modules, a YAML ledger, a shared ref,
   TTL'd leases, a journal, a hashed manifest, and a multi-stage pre-commit
   pipeline. `--doctor` exists specifically to make that surface debuggable; if

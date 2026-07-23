@@ -17,6 +17,16 @@ of a pushed branch, from a trusted CI runner the agent cannot influence:
 A human (non-agent) branch only gets the manifest check; its file scope and
 bound-test discipline are the reviewer's responsibility, not the harness's.
 
+On a ``push`` event to a protected branch (e.g. ``main``) the file-scope
+re-check cannot run at all: the checkout leaves ``base`` and ``head`` pointing
+at the *same* pushed commit, so there is nothing to diff. The authoritative
+gate for such content is the ``pull_request`` run *before* the merge -- which is
+only guaranteed to have happened if the GitHub repo forbids direct pushes to
+that branch and requires this check to pass first. This step is therefore
+**advisory on push events**; the guarantee that "nothing outside a task's
+allowlist reaches ``main``" holds only with **branch protection** configured
+(see ``docs/containment-and-diagnostics.md`` -> "Honest limitations").
+
 Usage:
     python harness/ci_enforce.py [--base <ref>] [--head <ref>] [--task <id>]
 
@@ -173,6 +183,21 @@ def main(argv: list[str] | None = None) -> int:
         # non-``agent/...`` branch name. A genuine human PR opts out explicitly
         # via a trusted, workflow-set flag the agent cannot influence.
         if env_flag(_NON_AGENT_OK_ENV):
+            # A push to a protected branch cannot be file-scope re-checked here
+            # (base == head on a push, so the diff is empty); the real gate is
+            # the pull_request run before merge, which only runs if branch
+            # protection forbids direct pushes. Say so plainly instead of
+            # claiming the branch was "human-authored".
+            if os.getenv("GITHUB_EVENT_NAME") == "push":
+                print(
+                    f"WARN: push event to '{head_branch}': the file-scope re-check "
+                    "is advisory here (base == head on a push leaves nothing to "
+                    "diff). Its guarantee depends on GitHub BRANCH PROTECTION "
+                    "forbidding direct pushes and requiring the pull_request "
+                    "harness-ci check to pass before merge -- configure it, this "
+                    "run does not enforce file scope."
+                )
+                return 1 if failed else 0
             print(
                 f"SKIP: '{head_branch}' declared human-authored "
                 f"({_NON_AGENT_OK_ENV} set); file-scope check skipped."

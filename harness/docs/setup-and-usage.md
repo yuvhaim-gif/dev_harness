@@ -55,6 +55,49 @@ python -m harness --init
 > harness itself, so the template-README warning is expected here; it clears in
 > any project that runs `--init`.
 
+## Required GitHub branch protection
+
+The bundled CI workflow (`.github/workflows/harness-ci.yml`) re-applies the
+file-lock + contract policy on a trusted runner. That re-check is **authoritative
+on the `pull_request` event, before a merge** — but it is only **advisory on a
+`push` to `main`**, because a push leaves `base` and `head` at the same commit
+and there is nothing to diff. The harness therefore **cannot, by itself,** stop a
+change pushed *directly* to `main` (a leaked token, or an agent invoking plain
+`git`): such a change never passes through the PR-time re-check.
+
+Closing that gap is a **one-time GitHub repository setting the harness cannot
+configure for you**. Protect `main` so that every change must arrive via a PR
+whose `harness-ci` check passed:
+
+- **UI:** *Settings → Branches → Add branch ruleset* (or *Add rule*) for `main` →
+  enable **Require a pull request before merging**, **Require status checks to
+  pass** (select the `enforce` job from `harness-ci`), and **Do not allow
+  bypassing the above settings** / block force pushes and deletions.
+- **Scripted (GitHub CLI):** requires `gh auth login` with admin on the repo.
+
+```bash
+# Forbid direct pushes to main and require the harness-ci `enforce` check on PRs.
+gh api -X PUT "repos/{owner}/{repo}/branches/main/protection" \
+  -H "Accept: application/vnd.github+json" \
+  -f  "required_status_checks[strict]=true" \
+  -f  "required_status_checks[contexts][]=enforce" \
+  -f  "enforce_admins=true" \
+  -F  "required_pull_request_reviews[required_approving_review_count]=1" \
+  -f  "restrictions=" \
+  -F  "allow_force_pushes=false" \
+  -F  "allow_deletions=false"
+```
+
+> Replace `{owner}/{repo}` (or drop them — `gh` infers the current repo). The
+> `enforce_admins=true` clause is what stops an admin (or a leaked admin token)
+> from pushing straight to `main`. Verify with
+> `gh api "repos/{owner}/{repo}/branches/main/protection"`.
+
+Without this, the *"nothing outside a task's allowlist reaches `main`"* guarantee
+does **not** hold on direct pushes; see
+[Containment defences, operations & threat model](containment-and-diagnostics.md)
+(the *Server-side CI re-check* note and *Honest limitations*).
+
 ## Running the orchestrator
 
 The framework is invoked as a module — `python -m harness` — which works both
